@@ -9,6 +9,7 @@ services:
       - "17284:17284"  # SOCKS5 Relaxed (SSL verification disabled)
       - "17285:17285"  # HTTP Strict (SSL verification enabled)
       - "17286:17286"  # HTTP Relaxed (SSL verification disabled)
+      - "17287:17287"  # Rotate control (force switch to next proxy)
     volumes:
       - ./config.yaml:/app/config.yaml:ro  # Mount config as read-only
     restart: unless-stopped

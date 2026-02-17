@@ -74,6 +74,7 @@ docker run -d \
   -p 17284:17284 \
   -p 17285:17285 \
   -p 17286:17286 \
+  -p 17287:17287 \
   -v $(pwd)/config.yaml:/app/config.yaml:ro \
   --restart unless-stopped \
   dynamic-proxy
@@ -102,6 +103,7 @@ The Docker image is built using multi-stage builds for minimal size:
   - 17284 (SOCKS5 Relaxed - SSL verification disabled)
   - 17285 (HTTP Strict - SSL verification enabled)
   - 17286 (HTTP Relaxed - SSL verification disabled)
+  - 17287 (Rotate Control - force switch to next proxy)
 - Config file can be mounted as a volume for easy updates
 
 ### Configuration
@@ -133,6 +135,7 @@ ports:
   socks5_relaxed: ":17284"   # SOCKS5 without SSL verification
   http_strict: ":17285"      # HTTP with SSL verification
   http_relaxed: ":17286"     # HTTP without SSL verification
+  rotate_control: ":17287"  # Access this port to force switch to next proxy
 
 # Optional proxy authentication (username/password must be set together)
 auth:
@@ -153,6 +156,7 @@ auth:
 | `ports.socks5_relaxed` | SOCKS5 server port (SSL verification disabled) | :17284 |
 | `ports.http_strict` | HTTP proxy server port (SSL verification enabled) | :17285 |
 | `ports.http_relaxed` | HTTP proxy server port (SSL verification disabled) | :17286 |
+| `ports.rotate_control` | Manual rotate control port (force switch to next proxy) | :17287 |
 | `auth.username` | Proxy auth username (optional) | empty |
 | `auth.password` | Proxy auth password (optional) | empty |
 
@@ -178,6 +182,9 @@ curl -x http://127.0.0.1:17285 -U username:password https://api.ipify.org
 
 # Test with authentication enabled (SOCKS5)
 curl --proxy socks5://username:password@127.0.0.1:17283 https://api.ipify.org
+
+# Force rotate to next proxy (both strict/relaxed pools)
+curl http://127.0.0.1:17287
 ```
 
 #### Browser Configuration
@@ -435,6 +442,7 @@ docker run -d \
   -p 17284:17284 \
   -p 17285:17285 \
   -p 17286:17286 \
+  -p 17287:17287 \
   -v $(pwd)/config.yaml:/app/config.yaml:ro \
   --restart unless-stopped \
   dynamic-proxy
@@ -463,6 +471,7 @@ Docker 镜像使用多阶段构建，体积最小化：
   - 17284 (SOCKS5 宽松模式 - 禁用SSL验证)
   - 17285 (HTTP 严格模式 - 启用SSL验证)
   - 17286 (HTTP 宽松模式 - 禁用SSL验证)
+  - 17287 (轮换控制端口 - 强制切换到下一个代理)
 - 配置文件可通过卷挂载，方便更新
 
 ### 配置说明
@@ -494,6 +503,7 @@ ports:
   socks5_relaxed: ":17284"   # SOCKS5 宽松模式（禁用SSL验证）
   http_strict: ":17285"      # HTTP 严格模式（启用SSL验证）
   http_relaxed: ":17286"     # HTTP 宽松模式（禁用SSL验证）
+  rotate_control: ":17287"  # 访问该端口强制切换到下一个代理
 
 # 可选代理认证（username/password 必须同时配置）
 auth:
@@ -514,6 +524,7 @@ auth:
 | `ports.socks5_relaxed` | SOCKS5服务器端口（禁用SSL验证） | :17284 |
 | `ports.http_strict` | HTTP代理服务器端口（启用SSL验证） | :17285 |
 | `ports.http_relaxed` | HTTP代理服务器端口（禁用SSL验证） | :17286 |
+| `ports.rotate_control` | 手动轮换控制端口（强制切换到下一个代理） | :17287 |
 | `auth.username` | 代理认证用户名（可选） | 空 |
 | `auth.password` | 代理认证密码（可选） | 空 |
 
@@ -539,6 +550,9 @@ curl -x http://127.0.0.1:17285 -U username:password https://api.ipify.org
 
 # 开启认证后的测试（SOCKS5）
 curl --proxy socks5://username:password@127.0.0.1:17283 https://api.ipify.org
+
+# Force rotate to next proxy (both strict/relaxed pools)
+curl http://127.0.0.1:17287
 ```
 
 #### 浏览器配置
