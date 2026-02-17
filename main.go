@@ -23,24 +23,26 @@ import (
 
 // Config represents the application configuration
 type Config struct {
-	ProxyListURLs              []string `yaml:"proxy_list_urls"`
-	SpecialProxyListUrls       []string `yaml:"special_proxy_list_urls"` // 支持复杂格式的代理URL列表
-	HealthCheckConcurrency     int      `yaml:"health_check_concurrency"`
-	UpdateIntervalMinutes      int      `yaml:"update_interval_minutes"`
-	HealthCheck                struct {
-		TotalTimeoutSeconds           int `yaml:"total_timeout_seconds"`
-		TLSHandshakeThresholdSeconds  int `yaml:"tls_handshake_threshold_seconds"`
+	ProxyListURLs          []string `yaml:"proxy_list_urls"`
+	SpecialProxyListUrls   []string `yaml:"special_proxy_list_urls"` // 支持复杂格式的代理URL列表
+	HealthCheckConcurrency int      `yaml:"health_check_concurrency"`
+	UpdateIntervalMinutes  int      `yaml:"update_interval_minutes"`
+	HealthCheck            struct {
+		TotalTimeoutSeconds          int `yaml:"total_timeout_seconds"`
+		TLSHandshakeThresholdSeconds int `yaml:"tls_handshake_threshold_seconds"`
 	} `yaml:"health_check"`
 	Ports struct {
-		SOCKS5Strict   string `yaml:"socks5_strict"`
-		SOCKS5Relaxed  string `yaml:"socks5_relaxed"`
-		HTTPStrict     string `yaml:"http_strict"`
-		HTTPRelaxed    string `yaml:"http_relaxed"`
+		SOCKS5Strict  string `yaml:"socks5_strict"`
+		SOCKS5Relaxed string `yaml:"socks5_relaxed"`
+		HTTPStrict    string `yaml:"http_strict"`
+		HTTPRelaxed   string `yaml:"http_relaxed"`
 	} `yaml:"ports"`
 }
 
 // Global config variable
 var config Config
+
+const proxySwitchInterval = 30 * time.Minute
 
 // Simple regex to extract ip:port from any format (used for special proxy lists)
 // Matches: [IP]:[port] and ignores any protocol prefixes or extra text
@@ -91,10 +93,12 @@ func loadConfig(filename string) (*Config, error) {
 }
 
 type ProxyPool struct {
-	proxies   []string
-	mu        sync.RWMutex
-	index     uint64
-	updating  int32 // atomic flag to prevent concurrent updates
+	proxies     []string
+	mu          sync.RWMutex
+	index       int
+	nextSwitch  time.Time
+	hasSelected bool
+	updating    int32 // atomic flag to prevent concurrent updates
 }
 
 func NewProxyPool() *ProxyPool {
@@ -109,22 +113,42 @@ func (p *ProxyPool) Update(proxies []string) {
 
 	oldCount := len(p.proxies)
 	p.proxies = proxies
-	// Reset index to 0 to avoid out-of-bounds issues
-	atomic.StoreUint64(&p.index, 0)
+	// Reset selection state so the first connection after update always uses proxy #1.
+	p.index = 0
+	p.nextSwitch = time.Time{}
+	p.hasSelected = false
 
 	log.Printf("Proxy pool updated: %d -> %d active proxies", oldCount, len(proxies))
 }
 
 func (p *ProxyPool) GetNext() (string, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	if len(p.proxies) == 0 {
 		return "", fmt.Errorf("no available proxies")
 	}
 
-	idx := atomic.AddUint64(&p.index, 1) % uint64(len(p.proxies))
-	return p.proxies[idx], nil
+	// First request after a pool update always uses proxy #1.
+	if !p.hasSelected {
+		p.index = 0
+		p.nextSwitch = time.Now().Add(proxySwitchInterval)
+		p.hasSelected = true
+		return p.proxies[p.index], nil
+	}
+
+	// Keep using the same proxy for 30 minutes, then switch to the next one.
+	now := time.Now()
+	if !p.nextSwitch.IsZero() && (now.After(p.nextSwitch) || now.Equal(p.nextSwitch)) {
+		p.index = (p.index + 1) % len(p.proxies)
+		p.nextSwitch = now.Add(proxySwitchInterval)
+	}
+
+	if p.index >= len(p.proxies) {
+		p.index = 0
+	}
+
+	return p.proxies[p.index], nil
 }
 
 func (p *ProxyPool) GetAll() []string {
