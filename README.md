@@ -61,6 +61,59 @@ go build -o dynamic-proxy
 
 #### Docker Deployment
 
+##### Step-by-step Docker Tutorial
+
+1. **Prepare config file**
+   ```bash
+   cp config.yaml config.prod.yaml
+   # Edit proxy sources / ports / auth in config.prod.yaml
+   ```
+
+2. **Build image**
+   ```bash
+   docker build -t dynamic-proxy:latest .
+   ```
+
+3. **Run container**
+   ```bash
+   docker run -d \
+     --name dynamic-proxy \
+     -p 17283:17283 \
+     -p 17284:17284 \
+     -p 17285:17285 \
+     -p 17286:17286 \
+     -p 18080:18080 \
+     -v $(pwd)/config.prod.yaml:/app/config.yaml:ro \
+     --restart unless-stopped \
+     dynamic-proxy:latest
+   ```
+
+4. **Check startup logs**
+   ```bash
+   docker logs -f dynamic-proxy
+   ```
+
+5. **Verify proxy connectivity**
+   ```bash
+   # HTTP strict
+   curl -x http://127.0.0.1:17285 https://api.ipify.org
+
+   # SOCKS5 strict
+   curl --proxy socks5://127.0.0.1:17283 https://api.ipify.org
+   ```
+
+6. **Common operations**
+   ```bash
+   # Restart
+   docker restart dynamic-proxy
+
+   # Update config (after editing config.prod.yaml)
+   docker restart dynamic-proxy
+
+   # Stop and remove
+   docker rm -f dynamic-proxy
+   ```
+
 **Using Docker:**
 
 ```bash
@@ -72,11 +125,12 @@ docker run -d \
   --name dynamic-proxy \
   -p 17283:17283 \
   -p 17284:17284 \
-  -p 17285:17285 \
-  -p 17286:17286 \
-  -v $(pwd)/config.yaml:/app/config.yaml:ro \
-  --restart unless-stopped \
-  dynamic-proxy
+     -p 17285:17285 \
+     -p 17286:17286 \
+     -p 18080:18080 \
+     -v $(pwd)/config.yaml:/app/config.yaml:ro \
+     --restart unless-stopped \
+     dynamic-proxy
 ```
 
 **Using Docker Compose:**
@@ -102,6 +156,7 @@ The Docker image is built using multi-stage builds for minimal size:
   - 17284 (SOCKS5 Relaxed - SSL verification disabled)
   - 17285 (HTTP Strict - SSL verification enabled)
   - 17286 (HTTP Relaxed - SSL verification disabled)
+  - 18080 (Rotate control port - access to force rotate proxy)
 - Config file can be mounted as a volume for easy updates
 
 ### Configuration
@@ -133,6 +188,16 @@ ports:
   socks5_relaxed: ":17284"   # SOCKS5 without SSL verification
   http_strict: ":17285"      # HTTP with SSL verification
   http_relaxed: ":17286"     # HTTP without SSL verification
+  rotate_control: ":18080"   # Access this port to force rotate to new proxy
+
+# Optional proxy authentication (username/password must be set together)
+auth:
+  username: ""
+  password: ""
+
+# Force rotate trigger URL (access this URL via HTTP proxy to immediately switch proxy)
+force_rotate:
+  trigger_url: "http://proxy.local/rotate"
 ```
 
 #### Configuration Options
@@ -148,6 +213,10 @@ ports:
 | `ports.socks5_relaxed` | SOCKS5 server port (SSL verification disabled) | :17284 |
 | `ports.http_strict` | HTTP proxy server port (SSL verification enabled) | :17285 |
 | `ports.http_relaxed` | HTTP proxy server port (SSL verification disabled) | :17286 |
+| `ports.rotate_control` | Control port for forced proxy rotation | :18080 |
+| `auth.username` | Proxy auth username (optional) | empty |
+| `auth.password` | Proxy auth password (optional) | empty |
+| `force_rotate.trigger_url` | URL that forces immediate proxy rotation | `http://proxy.local/rotate` |
 
 ### Usage
 
@@ -165,6 +234,18 @@ curl -x http://127.0.0.1:17285 https://api.ipify.org
 
 # Test with curl (HTTP Relaxed - SSL verification disabled)
 curl -x http://127.0.0.1:17286 https://api.ipify.org
+
+# Test with authentication enabled (HTTP)
+curl -x http://127.0.0.1:17285 -U username:password https://api.ipify.org
+
+# Test with authentication enabled (SOCKS5)
+curl --proxy socks5://username:password@127.0.0.1:17283 https://api.ipify.org
+
+# Force rotate to next healthy proxy (HTTP proxy)
+curl -x http://127.0.0.1:17285 http://proxy.local/rotate
+
+# Force rotate via dedicated control port
+curl http://127.0.0.1:18080
 ```
 
 #### Browser Configuration
@@ -409,6 +490,59 @@ go build -o dynamic-proxy
 
 #### Docker 部署
 
+##### Docker 部署教程（一步一步）
+
+1. **准备配置文件**
+   ```bash
+   cp config.yaml config.prod.yaml
+   # 按需编辑 config.prod.yaml（代理源/端口/认证）
+   ```
+
+2. **构建镜像**
+   ```bash
+   docker build -t dynamic-proxy:latest .
+   ```
+
+3. **启动容器**
+   ```bash
+   docker run -d \
+     --name dynamic-proxy \
+     -p 17283:17283 \
+     -p 17284:17284 \
+     -p 17285:17285 \
+     -p 17286:17286 \
+     -p 18080:18080 \
+     -v $(pwd)/config.prod.yaml:/app/config.yaml:ro \
+     --restart unless-stopped \
+     dynamic-proxy:latest
+   ```
+
+4. **查看启动日志**
+   ```bash
+   docker logs -f dynamic-proxy
+   ```
+
+5. **验证代理可用性**
+   ```bash
+   # HTTP 严格模式
+   curl -x http://127.0.0.1:17285 https://api.ipify.org
+
+   # SOCKS5 严格模式
+   curl --proxy socks5://127.0.0.1:17283 https://api.ipify.org
+   ```
+
+6. **常用运维命令**
+   ```bash
+   # 重启
+   docker restart dynamic-proxy
+
+   # 修改配置后重启生效
+   docker restart dynamic-proxy
+
+   # 停止并删除
+   docker rm -f dynamic-proxy
+   ```
+
 **使用 Docker:**
 
 ```bash
@@ -422,6 +556,7 @@ docker run -d \
   -p 17284:17284 \
   -p 17285:17285 \
   -p 17286:17286 \
+  -p 18080:18080 \
   -v $(pwd)/config.yaml:/app/config.yaml:ro \
   --restart unless-stopped \
   dynamic-proxy
@@ -450,6 +585,7 @@ Docker 镜像使用多阶段构建，体积最小化：
   - 17284 (SOCKS5 宽松模式 - 禁用SSL验证)
   - 17285 (HTTP 严格模式 - 启用SSL验证)
   - 17286 (HTTP 宽松模式 - 禁用SSL验证)
+  - 18080 (轮换控制端口 - 访问即强制切换代理)
 - 配置文件可通过卷挂载，方便更新
 
 ### 配置说明
@@ -481,6 +617,16 @@ ports:
   socks5_relaxed: ":17284"   # SOCKS5 宽松模式（禁用SSL验证）
   http_strict: ":17285"      # HTTP 严格模式（启用SSL验证）
   http_relaxed: ":17286"     # HTTP 宽松模式（禁用SSL验证）
+  rotate_control: ":18080"   # 访问该端口会强制切换到新代理
+
+# 可选代理认证（username/password 必须同时配置）
+auth:
+  username: ""
+  password: ""
+
+# 强制轮换触发URL（通过 HTTP 代理访问该 URL 会立即切换代理）
+force_rotate:
+  trigger_url: "http://proxy.local/rotate"
 ```
 
 #### 配置选项
@@ -496,6 +642,10 @@ ports:
 | `ports.socks5_relaxed` | SOCKS5服务器端口（禁用SSL验证） | :17284 |
 | `ports.http_strict` | HTTP代理服务器端口（启用SSL验证） | :17285 |
 | `ports.http_relaxed` | HTTP代理服务器端口（禁用SSL验证） | :17286 |
+| `ports.rotate_control` | 强制切换代理控制端口 | :18080 |
+| `auth.username` | 代理认证用户名（可选） | 空 |
+| `auth.password` | 代理认证密码（可选） | 空 |
+| `force_rotate.trigger_url` | 触发立即切换代理的 URL | `http://proxy.local/rotate` |
 
 ### 使用方法
 
@@ -513,6 +663,18 @@ curl -x http://127.0.0.1:17285 https://api.ipify.org
 
 # 使用curl测试（HTTP 宽松模式 - 禁用SSL验证）
 curl -x http://127.0.0.1:17286 https://api.ipify.org
+
+# 开启认证后的测试（HTTP）
+curl -x http://127.0.0.1:17285 -U username:password https://api.ipify.org
+
+# 开启认证后的测试（SOCKS5）
+curl --proxy socks5://username:password@127.0.0.1:17283 https://api.ipify.org
+
+# 强制切换到下一个健康代理（HTTP 代理）
+curl -x http://127.0.0.1:17285 http://proxy.local/rotate
+
+# 通过独立控制端口强制切换代理
+curl http://127.0.0.1:18080
 ```
 
 #### 浏览器配置
