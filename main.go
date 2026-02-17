@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -23,24 +24,30 @@ import (
 
 // Config represents the application configuration
 type Config struct {
-	ProxyListURLs              []string `yaml:"proxy_list_urls"`
-	SpecialProxyListUrls       []string `yaml:"special_proxy_list_urls"` // 支持复杂格式的代理URL列表
-	HealthCheckConcurrency     int      `yaml:"health_check_concurrency"`
-	UpdateIntervalMinutes      int      `yaml:"update_interval_minutes"`
-	HealthCheck                struct {
-		TotalTimeoutSeconds           int `yaml:"total_timeout_seconds"`
-		TLSHandshakeThresholdSeconds  int `yaml:"tls_handshake_threshold_seconds"`
+	ProxyListURLs          []string `yaml:"proxy_list_urls"`
+	SpecialProxyListUrls   []string `yaml:"special_proxy_list_urls"` // 支持复杂格式的代理URL列表
+	HealthCheckConcurrency int      `yaml:"health_check_concurrency"`
+	UpdateIntervalMinutes  int      `yaml:"update_interval_minutes"`
+	HealthCheck            struct {
+		TotalTimeoutSeconds          int `yaml:"total_timeout_seconds"`
+		TLSHandshakeThresholdSeconds int `yaml:"tls_handshake_threshold_seconds"`
 	} `yaml:"health_check"`
 	Ports struct {
-		SOCKS5Strict   string `yaml:"socks5_strict"`
-		SOCKS5Relaxed  string `yaml:"socks5_relaxed"`
-		HTTPStrict     string `yaml:"http_strict"`
-		HTTPRelaxed    string `yaml:"http_relaxed"`
+		SOCKS5Strict  string `yaml:"socks5_strict"`
+		SOCKS5Relaxed string `yaml:"socks5_relaxed"`
+		HTTPStrict    string `yaml:"http_strict"`
+		HTTPRelaxed   string `yaml:"http_relaxed"`
 	} `yaml:"ports"`
+	Auth struct {
+		Username string `yaml:"username"`
+		Password string `yaml:"password"`
+	} `yaml:"auth"`
 }
 
 // Global config variable
 var config Config
+
+const proxySwitchInterval = 30 * time.Minute
 
 // Simple regex to extract ip:port from any format (used for special proxy lists)
 // Matches: [IP]:[port] and ignores any protocol prefixes or extra text
@@ -87,14 +94,53 @@ func loadConfig(filename string) (*Config, error) {
 		cfg.Ports.HTTPRelaxed = ":8082"
 	}
 
+	if (cfg.Auth.Username == "") != (cfg.Auth.Password == "") {
+		return nil, fmt.Errorf("both auth.username and auth.password must be configured together")
+	}
+
 	return &cfg, nil
 }
 
+func isProxyAuthEnabled() bool {
+	return config.Auth.Username != "" && config.Auth.Password != ""
+}
+
+func requireHTTPProxyAuth(w http.ResponseWriter, mode string) {
+	w.Header().Set("Proxy-Authenticate", `Basic realm="Dynamic Proxy"`)
+	log.Printf("[HTTP-%s] Unauthorized request rejected", mode)
+	http.Error(w, "Proxy authentication required", http.StatusProxyAuthRequired)
+}
+
+func validateHTTPProxyAuth(r *http.Request) bool {
+	if !isProxyAuthEnabled() {
+		return true
+	}
+
+	authHeader := r.Header.Get("Proxy-Authorization")
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Basic ") {
+		return false
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(authHeader, "Basic "))
+	if err != nil {
+		return false
+	}
+
+	credentials := strings.SplitN(string(decoded), ":", 2)
+	if len(credentials) != 2 {
+		return false
+	}
+
+	return credentials[0] == config.Auth.Username && credentials[1] == config.Auth.Password
+}
+
 type ProxyPool struct {
-	proxies   []string
-	mu        sync.RWMutex
-	index     uint64
-	updating  int32 // atomic flag to prevent concurrent updates
+	proxies     []string
+	mu          sync.RWMutex
+	index       int
+	nextSwitch  time.Time
+	hasSelected bool
+	updating    int32 // atomic flag to prevent concurrent updates
 }
 
 func NewProxyPool() *ProxyPool {
@@ -109,22 +155,42 @@ func (p *ProxyPool) Update(proxies []string) {
 
 	oldCount := len(p.proxies)
 	p.proxies = proxies
-	// Reset index to 0 to avoid out-of-bounds issues
-	atomic.StoreUint64(&p.index, 0)
+	// Reset selection state so the first connection after update always uses proxy #1.
+	p.index = 0
+	p.nextSwitch = time.Time{}
+	p.hasSelected = false
 
 	log.Printf("Proxy pool updated: %d -> %d active proxies", oldCount, len(proxies))
 }
 
 func (p *ProxyPool) GetNext() (string, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	if len(p.proxies) == 0 {
 		return "", fmt.Errorf("no available proxies")
 	}
 
-	idx := atomic.AddUint64(&p.index, 1) % uint64(len(p.proxies))
-	return p.proxies[idx], nil
+	// First request after a pool update always uses proxy #1.
+	if !p.hasSelected {
+		p.index = 0
+		p.nextSwitch = time.Now().Add(proxySwitchInterval)
+		p.hasSelected = true
+		return p.proxies[p.index], nil
+	}
+
+	// Keep using the same proxy for 30 minutes, then switch to the next one.
+	now := time.Now()
+	if !p.nextSwitch.IsZero() && (now.After(p.nextSwitch) || now.Equal(p.nextSwitch)) {
+		p.index = (p.index + 1) % len(p.proxies)
+		p.nextSwitch = now.Add(proxySwitchInterval)
+	}
+
+	if p.index >= len(p.proxies) {
+		p.index = 0
+	}
+
+	return p.proxies[p.index], nil
 }
 
 func (p *ProxyPool) GetAll() []string {
@@ -587,6 +653,14 @@ func startSOCKS5Server(pool *ProxyPool, port string, mode string) error {
 		Logger: socks5Logger,
 	}
 
+	if isProxyAuthEnabled() {
+		conf.Credentials = socks5.StaticCredentials{
+			config.Auth.Username: config.Auth.Password,
+		}
+		conf.AuthMethods = []socks5.Authenticator{socks5.UserPassAuthenticator{Credentials: conf.Credentials}}
+		log.Printf("[%s] SOCKS5 authentication enabled", mode)
+	}
+
 	server, err := socks5.New(conf)
 	if err != nil {
 		return fmt.Errorf("failed to create SOCKS5 server: %w", err)
@@ -599,6 +673,11 @@ func startSOCKS5Server(pool *ProxyPool, port string, mode string) error {
 // HTTP Proxy Server
 func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode string) {
 	log.Printf("[HTTP-%s] Incoming request: %s %s from %s", mode, r.Method, r.URL.String(), r.RemoteAddr)
+
+	if !validateHTTPProxyAuth(r) {
+		requireHTTPProxyAuth(w, mode)
+		return
+	}
 
 	proxyAddr, err := pool.GetNext()
 	if err != nil {
@@ -645,6 +724,9 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 
 	// Copy headers
 	for key, values := range r.Header {
+		if strings.EqualFold(key, "Proxy-Authorization") {
+			continue
+		}
 		for _, value := range values {
 			proxyReq.Header.Add(key, value)
 		}
@@ -760,6 +842,11 @@ func main() {
 	log.Printf("  - SOCKS5 Relaxed port: %s", config.Ports.SOCKS5Relaxed)
 	log.Printf("  - HTTP Strict port: %s", config.Ports.HTTPStrict)
 	log.Printf("  - HTTP Relaxed port: %s", config.Ports.HTTPRelaxed)
+	if isProxyAuthEnabled() {
+		log.Printf("  - Proxy authentication: enabled (user: %s)", config.Auth.Username)
+	} else {
+		log.Printf("  - Proxy authentication: disabled")
+	}
 
 	// Create two proxy pools
 	strictPool := NewProxyPool()

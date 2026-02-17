@@ -133,6 +133,11 @@ ports:
   socks5_relaxed: ":17284"   # SOCKS5 without SSL verification
   http_strict: ":17285"      # HTTP with SSL verification
   http_relaxed: ":17286"     # HTTP without SSL verification
+
+# Optional proxy authentication (username/password must be set together)
+auth:
+  username: ""
+  password: ""
 ```
 
 #### Configuration Options
@@ -148,6 +153,8 @@ ports:
 | `ports.socks5_relaxed` | SOCKS5 server port (SSL verification disabled) | :17284 |
 | `ports.http_strict` | HTTP proxy server port (SSL verification enabled) | :17285 |
 | `ports.http_relaxed` | HTTP proxy server port (SSL verification disabled) | :17286 |
+| `auth.username` | Proxy auth username (optional) | empty |
+| `auth.password` | Proxy auth password (optional) | empty |
 
 ### Usage
 
@@ -165,6 +172,12 @@ curl -x http://127.0.0.1:17285 https://api.ipify.org
 
 # Test with curl (HTTP Relaxed - SSL verification disabled)
 curl -x http://127.0.0.1:17286 https://api.ipify.org
+
+# Test with authentication enabled (HTTP)
+curl -x http://127.0.0.1:17285 -U username:password https://api.ipify.org
+
+# Test with authentication enabled (SOCKS5)
+curl --proxy socks5://username:password@127.0.0.1:17283 https://api.ipify.org
 ```
 
 #### Browser Configuration
@@ -481,6 +494,11 @@ ports:
   socks5_relaxed: ":17284"   # SOCKS5 宽松模式（禁用SSL验证）
   http_strict: ":17285"      # HTTP 严格模式（启用SSL验证）
   http_relaxed: ":17286"     # HTTP 宽松模式（禁用SSL验证）
+
+# 可选代理认证（username/password 必须同时配置）
+auth:
+  username: ""
+  password: ""
 ```
 
 #### 配置选项
@@ -496,6 +514,8 @@ ports:
 | `ports.socks5_relaxed` | SOCKS5服务器端口（禁用SSL验证） | :17284 |
 | `ports.http_strict` | HTTP代理服务器端口（启用SSL验证） | :17285 |
 | `ports.http_relaxed` | HTTP代理服务器端口（禁用SSL验证） | :17286 |
+| `auth.username` | 代理认证用户名（可选） | 空 |
+| `auth.password` | 代理认证密码（可选） | 空 |
 
 ### 使用方法
 
@@ -513,6 +533,12 @@ curl -x http://127.0.0.1:17285 https://api.ipify.org
 
 # 使用curl测试（HTTP 宽松模式 - 禁用SSL验证）
 curl -x http://127.0.0.1:17286 https://api.ipify.org
+
+# 开启认证后的测试（HTTP）
+curl -x http://127.0.0.1:17285 -U username:password https://api.ipify.org
+
+# 开启认证后的测试（SOCKS5）
+curl --proxy socks5://username:password@127.0.0.1:17283 https://api.ipify.org
 ```
 
 #### 浏览器配置
