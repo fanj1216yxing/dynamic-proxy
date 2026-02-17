@@ -37,6 +37,7 @@ type Config struct {
 		SOCKS5Relaxed string `yaml:"socks5_relaxed"`
 		HTTPStrict    string `yaml:"http_strict"`
 		HTTPRelaxed   string `yaml:"http_relaxed"`
+		RotateControl string `yaml:"rotate_control"`
 	} `yaml:"ports"`
 	Auth struct {
 		Username string `yaml:"username"`
@@ -93,6 +94,9 @@ func loadConfig(filename string) (*Config, error) {
 	if cfg.Ports.HTTPRelaxed == "" {
 		cfg.Ports.HTTPRelaxed = ":8082"
 	}
+	if cfg.Ports.RotateControl == "" {
+		cfg.Ports.RotateControl = ":9090"
+	}
 
 	if (cfg.Auth.Username == "") != (cfg.Auth.Password == "") {
 		return nil, fmt.Errorf("both auth.username and auth.password must be configured together")
@@ -116,22 +120,55 @@ func validateHTTPProxyAuth(r *http.Request) bool {
 		return true
 	}
 
-	authHeader := r.Header.Get("Proxy-Authorization")
-	if authHeader == "" || !strings.HasPrefix(authHeader, "Basic ") {
+	user, pass, ok := decodeBasicCredentials(r.Header.Get("Proxy-Authorization"))
+	if !ok {
 		return false
 	}
 
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(authHeader, "Basic "))
+	return user == config.Auth.Username && pass == config.Auth.Password
+}
+
+func decodeBasicCredentials(headerValue string) (string, string, bool) {
+	if headerValue == "" || !strings.HasPrefix(headerValue, "Basic ") {
+		return "", "", false
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(headerValue, "Basic "))
 	if err != nil {
-		return false
+		return "", "", false
 	}
 
 	credentials := strings.SplitN(string(decoded), ":", 2)
 	if len(credentials) != 2 {
-		return false
+		return "", "", false
 	}
 
-	return credentials[0] == config.Auth.Username && credentials[1] == config.Auth.Password
+	return credentials[0], credentials[1], true
+}
+
+func validateControlAuth(r *http.Request) bool {
+	if !isProxyAuthEnabled() {
+		return true
+	}
+
+	user, pass, ok := decodeBasicCredentials(r.Header.Get("Authorization"))
+	if ok && user == config.Auth.Username && pass == config.Auth.Password {
+		return true
+	}
+
+	user, pass, ok = decodeBasicCredentials(r.Header.Get("Proxy-Authorization"))
+	if ok && user == config.Auth.Username && pass == config.Auth.Password {
+		return true
+	}
+
+	return false
+}
+
+func requireControlAuth(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="Dynamic Proxy Rotate Control"`)
+	w.Header().Set("Proxy-Authenticate", `Basic realm="Dynamic Proxy Rotate Control"`)
+	log.Printf("[ROTATE] Unauthorized control request rejected")
+	http.Error(w, "Authentication required", http.StatusUnauthorized)
 }
 
 type ProxyPool struct {
@@ -199,6 +236,25 @@ func (p *ProxyPool) GetAll() []string {
 	result := make([]string, len(p.proxies))
 	copy(result, p.proxies)
 	return result
+}
+
+func (p *ProxyPool) ForceRotate() (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.proxies) == 0 {
+		return "", fmt.Errorf("no available proxies")
+	}
+
+	if !p.hasSelected {
+		p.index = 0
+		p.hasSelected = true
+	} else {
+		p.index = (p.index + 1) % len(p.proxies)
+	}
+
+	p.nextSwitch = time.Now().Add(proxySwitchInterval)
+	return p.proxies[p.index], nil
 }
 
 // parseSpecialProxyURL 使用简单正则表达式从复杂格式中提取代理
@@ -817,6 +873,38 @@ func startHTTPServer(pool *ProxyPool, port string, mode string) error {
 	return server.ListenAndServe()
 }
 
+func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, port string) error {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !validateControlAuth(r) {
+			requireControlAuth(w)
+			return
+		}
+
+		strictProxy, strictErr := strictPool.ForceRotate()
+		relaxedProxy, relaxedErr := relaxedPool.ForceRotate()
+
+		if strictErr != nil && relaxedErr != nil {
+			log.Printf("[ROTATE] ERROR: rotate failed (strict=%v, relaxed=%v)", strictErr, relaxedErr)
+			http.Error(w, "Rotate failed: no available proxies", http.StatusServiceUnavailable)
+			return
+		}
+
+		log.Printf("[ROTATE] Manual rotate triggered from %s | strict=%s err=%v | relaxed=%s err=%v",
+			r.RemoteAddr, strictProxy, strictErr, relaxedProxy, relaxedErr)
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprintf(w, "rotate success\nstrict: %s\nrelaxed: %s\n", strictProxy, relaxedProxy)
+	})
+
+	server := &http.Server{
+		Addr:    port,
+		Handler: handler,
+	}
+
+	log.Printf("[ROTATE] Manual rotate control server listening on %s", port)
+	return server.ListenAndServe()
+}
+
 func main() {
 	log.Println("Starting Dynamic Proxy Server...")
 
@@ -873,9 +961,9 @@ func main() {
 		log.Printf("[RELAXED] Successfully loaded %d healthy proxies", relaxedCount)
 	}
 
-	// Start servers (4 servers total)
+	// Start servers (5 servers total)
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(5)
 
 	// SOCKS5 Strict
 	go func() {
@@ -909,9 +997,18 @@ func main() {
 		}
 	}()
 
+	// Rotate Control
+	go func() {
+		defer wg.Done()
+		if err := startRotateControlServer(strictPool, relaxedPool, config.Ports.RotateControl); err != nil {
+			log.Fatalf("[ROTATE] Control server error: %v", err)
+		}
+	}()
+
 	log.Println("All servers started successfully")
 	log.Println("  [STRICT] SOCKS5: " + config.Ports.SOCKS5Strict + " | HTTP: " + config.Ports.HTTPStrict)
 	log.Println("  [RELAXED] SOCKS5: " + config.Ports.SOCKS5Relaxed + " | HTTP: " + config.Ports.HTTPRelaxed)
+	log.Println("  [ROTATE] Control: " + config.Ports.RotateControl)
 	log.Printf("Proxy pools will update every %d minutes in background...", config.UpdateIntervalMinutes)
 	wg.Wait()
 }
