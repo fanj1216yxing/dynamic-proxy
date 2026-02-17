@@ -115,12 +115,25 @@ func requireHTTPProxyAuth(w http.ResponseWriter, mode string) {
 	http.Error(w, "Proxy authentication required", http.StatusProxyAuthRequired)
 }
 
+func requireBasicAuth(w http.ResponseWriter, mode string) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="Dynamic Proxy Rotate Control"`)
+	log.Printf("[%s] Unauthorized request rejected", mode)
+	http.Error(w, "Authentication required", http.StatusUnauthorized)
+}
+
 func validateHTTPProxyAuth(r *http.Request) bool {
+	return validateAuthHeader(r.Header.Get("Proxy-Authorization"))
+}
+
+func validateBasicAuth(r *http.Request) bool {
+	return validateAuthHeader(r.Header.Get("Authorization"))
+}
+
+func validateAuthHeader(authHeader string) bool {
 	if !isProxyAuthEnabled() {
 		return true
 	}
 
-	authHeader := r.Header.Get("Proxy-Authorization")
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Basic ") {
 		return false
 	}
@@ -842,8 +855,8 @@ func startHTTPServer(pool *ProxyPool, port string, mode string) error {
 
 func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, port string) error {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !validateHTTPProxyAuth(r) {
-			requireHTTPProxyAuth(w, "ROTATE")
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "ROTATE")
 			return
 		}
 
