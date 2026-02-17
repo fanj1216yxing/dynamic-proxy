@@ -42,6 +42,7 @@ ports:
   socks5_relaxed: ":17284"
   http_strict: ":17285"
   http_relaxed: ":17286"
+  rotate_control: ":17287" # 访问该端口会强制切换到下一个代理
 
 # 代理认证配置（可选）
 # 如果启用，username/password 必须同时设置
