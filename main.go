@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -37,6 +38,10 @@ type Config struct {
 		HTTPStrict    string `yaml:"http_strict"`
 		HTTPRelaxed   string `yaml:"http_relaxed"`
 	} `yaml:"ports"`
+	Auth struct {
+		Username string `yaml:"username"`
+		Password string `yaml:"password"`
+	} `yaml:"auth"`
 }
 
 // Global config variable
@@ -89,7 +94,44 @@ func loadConfig(filename string) (*Config, error) {
 		cfg.Ports.HTTPRelaxed = ":8082"
 	}
 
+	if (cfg.Auth.Username == "") != (cfg.Auth.Password == "") {
+		return nil, fmt.Errorf("both auth.username and auth.password must be configured together")
+	}
+
 	return &cfg, nil
+}
+
+func isProxyAuthEnabled() bool {
+	return config.Auth.Username != "" && config.Auth.Password != ""
+}
+
+func requireHTTPProxyAuth(w http.ResponseWriter, mode string) {
+	w.Header().Set("Proxy-Authenticate", `Basic realm="Dynamic Proxy"`)
+	log.Printf("[HTTP-%s] Unauthorized request rejected", mode)
+	http.Error(w, "Proxy authentication required", http.StatusProxyAuthRequired)
+}
+
+func validateHTTPProxyAuth(r *http.Request) bool {
+	if !isProxyAuthEnabled() {
+		return true
+	}
+
+	authHeader := r.Header.Get("Proxy-Authorization")
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Basic ") {
+		return false
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(authHeader, "Basic "))
+	if err != nil {
+		return false
+	}
+
+	credentials := strings.SplitN(string(decoded), ":", 2)
+	if len(credentials) != 2 {
+		return false
+	}
+
+	return credentials[0] == config.Auth.Username && credentials[1] == config.Auth.Password
 }
 
 type ProxyPool struct {
@@ -611,6 +653,14 @@ func startSOCKS5Server(pool *ProxyPool, port string, mode string) error {
 		Logger: socks5Logger,
 	}
 
+	if isProxyAuthEnabled() {
+		conf.Credentials = socks5.StaticCredentials{
+			config.Auth.Username: config.Auth.Password,
+		}
+		conf.AuthMethods = []socks5.Authenticator{socks5.UserPassAuthenticator{Credentials: conf.Credentials}}
+		log.Printf("[%s] SOCKS5 authentication enabled", mode)
+	}
+
 	server, err := socks5.New(conf)
 	if err != nil {
 		return fmt.Errorf("failed to create SOCKS5 server: %w", err)
@@ -623,6 +673,11 @@ func startSOCKS5Server(pool *ProxyPool, port string, mode string) error {
 // HTTP Proxy Server
 func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode string) {
 	log.Printf("[HTTP-%s] Incoming request: %s %s from %s", mode, r.Method, r.URL.String(), r.RemoteAddr)
+
+	if !validateHTTPProxyAuth(r) {
+		requireHTTPProxyAuth(w, mode)
+		return
+	}
 
 	proxyAddr, err := pool.GetNext()
 	if err != nil {
@@ -669,6 +724,9 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 
 	// Copy headers
 	for key, values := range r.Header {
+		if strings.EqualFold(key, "Proxy-Authorization") {
+			continue
+		}
 		for _, value := range values {
 			proxyReq.Header.Add(key, value)
 		}
@@ -784,6 +842,11 @@ func main() {
 	log.Printf("  - SOCKS5 Relaxed port: %s", config.Ports.SOCKS5Relaxed)
 	log.Printf("  - HTTP Strict port: %s", config.Ports.HTTPStrict)
 	log.Printf("  - HTTP Relaxed port: %s", config.Ports.HTTPRelaxed)
+	if isProxyAuthEnabled() {
+		log.Printf("  - Proxy authentication: enabled (user: %s)", config.Auth.Username)
+	} else {
+		log.Printf("  - Proxy authentication: disabled")
+	}
 
 	// Create two proxy pools
 	strictPool := NewProxyPool()
