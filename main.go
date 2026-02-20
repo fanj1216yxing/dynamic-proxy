@@ -375,9 +375,12 @@ func parseSpecialProxyURL(content string) ([]string, error) {
 
 type clashSubscription struct {
 	Proxies []struct {
-		Type   string `yaml:"type"`
-		Server string `yaml:"server"`
-		Port   int    `yaml:"port"`
+		Type     string `yaml:"type"`
+		Server   string `yaml:"server"`
+		Port     int    `yaml:"port"`
+		Username string `yaml:"username"`
+		Password string `yaml:"password"`
+		Cipher   string `yaml:"cipher"`
 	} `yaml:"proxies"`
 }
 
@@ -388,6 +391,8 @@ var mixedSupportedSchemes = map[string]bool{
 	"socks5h":   true,
 	"vmess":     true,
 	"vless":     true,
+	"ss":        true,
+	"trojan":    true,
 	"hy2":       true,
 	"hysteria2": true,
 }
@@ -402,9 +407,13 @@ var httpSocksMixedSchemes = map[string]bool{
 var mainstreamMixedSchemes = map[string]bool{
 	"vmess":     true,
 	"vless":     true,
+	"ss":        true,
+	"trojan":    true,
 	"hy2":       true,
 	"hysteria2": true,
 }
+
+const mainstreamMixedRelayPort = "17290"
 
 func parseClashSubscription(content string) ([]string, bool) {
 	var sub clashSubscription
@@ -504,7 +513,28 @@ func parseClashSubscriptionMixed(content string) ([]string, bool) {
 		if p.Server == "" || p.Port <= 0 {
 			continue
 		}
-		entry := fmt.Sprintf("%s://%s:%d", proxyType, p.Server, p.Port)
+		host := net.JoinHostPort(p.Server, strconv.Itoa(p.Port))
+		entry := ""
+		switch proxyType {
+		case "ss":
+			if p.Cipher == "" || p.Password == "" {
+				continue
+			}
+			entry = fmt.Sprintf("ss://%s:%s@%s", url.QueryEscape(p.Cipher), url.QueryEscape(p.Password), host)
+		case "trojan":
+			if p.Password == "" {
+				continue
+			}
+			entry = fmt.Sprintf("trojan://%s@%s", url.QueryEscape(p.Password), host)
+		case "http", "https", "socks5", "socks5h":
+			if p.Username != "" {
+				entry = fmt.Sprintf("%s://%s:%s@%s", proxyType, url.QueryEscape(p.Username), url.QueryEscape(p.Password), host)
+			} else {
+				entry = fmt.Sprintf("%s://%s", proxyType, host)
+			}
+		default:
+			entry = fmt.Sprintf("%s://%s", proxyType, host)
+		}
 		if !seen[entry] {
 			seen[entry] = true
 			result = append(result, entry)
@@ -571,6 +601,12 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 	}
 
 	if strings.Contains(line, "://") {
+		if strings.HasPrefix(strings.ToLower(line), "ss://") {
+			if normalized, ok := normalizeSSURI(line); ok {
+				return normalized, true
+			}
+		}
+
 		if strings.HasPrefix(strings.ToLower(line), "vmess://") {
 			if normalized, ok := normalizeVMESSURI(line); ok {
 				return normalized, true
@@ -623,12 +659,55 @@ func normalizeVMESSURI(raw string) (string, bool) {
 	return fmt.Sprintf("vmess://%s:%s", node.Add, node.Port), true
 }
 
-func getDialSchemeForMixed(scheme string) string {
-	// vmess/vless/hy2 节点通过 HTTP 混合入口时，按 HTTPS CONNECT 上游方式尝试连接。
-	if scheme == "vmess" || scheme == "vless" || scheme == "hy2" || scheme == "hysteria2" {
-		return "https"
+func normalizeSSURI(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", false
 	}
-	return scheme
+	if u.Host != "" && (u.User != nil || strings.Contains(u.Host, ":")) {
+		authority := u.Host
+		if u.User != nil {
+			authority = u.User.String() + "@" + authority
+		}
+		return "ss://" + authority, true
+	}
+
+	decoded, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(raw, "ss://"))
+	if err != nil {
+		decoded, err = base64.StdEncoding.DecodeString(strings.TrimPrefix(raw, "ss://"))
+		if err != nil {
+			return "", false
+		}
+	}
+
+	decodedURL, err := url.Parse("ss://" + string(decoded))
+	if err != nil || decodedURL.Host == "" {
+		return "", false
+	}
+	authority := decodedURL.Host
+	if decodedURL.User != nil {
+		authority = decodedURL.User.String() + "@" + authority
+	}
+	return "ss://" + authority, true
+}
+
+func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dialAddr string, useAuth bool) {
+	switch scheme {
+	case "vmess", "vless", "hy2", "hysteria2", "trojan":
+		return "https", overridePort(addr, mainstreamMixedRelayPort), false
+	case "ss":
+		return "socks5", overridePort(addr, mainstreamMixedRelayPort), false
+	default:
+		return scheme, addr, true
+	}
+}
+
+func overridePort(addr string, newPort string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return net.JoinHostPort(host, newPort)
 }
 
 func parseSpecialProxyURLMixed(content string) []string {
@@ -900,11 +979,15 @@ func checkCloudflareBypassMixed(proxyEntry string) bool {
 	}
 
 	timeout := time.Duration(config.CFChallengeCheck.TimeoutSeconds) * time.Second
-	dialScheme := getDialSchemeForMixed(scheme)
+	dialScheme, dialAddr, useAuth := resolveMixedDialTarget(scheme, addr)
+	if !useAuth {
+		auth = nil
+		httpAuthHeader = ""
+	}
 	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 
 	if dialScheme == "socks5" || dialScheme == "socks5h" {
-		dialer, dialErr := proxy.SOCKS5("tcp", addr, auth, proxy.Direct)
+		dialer, dialErr := proxy.SOCKS5("tcp", dialAddr, auth, proxy.Direct)
 		if dialErr != nil {
 			return false
 		}
@@ -912,7 +995,7 @@ func checkCloudflareBypassMixed(proxyEntry string) bool {
 			return dialer.Dial(network, targetAddr)
 		}
 	} else {
-		proxyURL := &url.URL{Scheme: dialScheme, Host: addr}
+		proxyURL := &url.URL{Scheme: dialScheme, Host: dialAddr}
 		if auth != nil {
 			proxyURL.User = url.UserPassword(auth.User, auth.Password)
 		}
@@ -969,12 +1052,15 @@ func checkMixedProxyHealth(proxyEntry string, strictMode bool) bool {
 	if scheme == "socks5" || scheme == "socks5h" {
 		return checkProxyHealth(addr, strictMode)
 	}
-	dialScheme := getDialSchemeForMixed(scheme)
+	dialScheme, dialAddr, useAuth := resolveMixedDialTarget(scheme, addr)
+	if !useAuth {
+		auth = nil
+	}
 
 	threshold := time.Duration(config.HealthCheck.TLSHandshakeThresholdSeconds) * time.Second
 	totalTimeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
 
-	proxyURL := &url.URL{Scheme: dialScheme, Host: addr}
+	proxyURL := &url.URL{Scheme: dialScheme, Host: dialAddr}
 	if auth != nil {
 		proxyURL.User = url.UserPassword(auth.User, auth.Password)
 	}
@@ -1574,9 +1660,13 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 
 	// Handle CONNECT method for HTTPS
 	if r.Method == http.MethodConnect {
-		dialScheme := getDialSchemeForMixed(scheme)
+		dialScheme, dialAddr, useAuth := resolveMixedDialTarget(scheme, upstreamAddr)
+		if !useAuth {
+			upstreamAuth = nil
+			upstreamHTTPAuthHeader = ""
+		}
 		if dialScheme == "socks5" || dialScheme == "socks5h" {
-			dialer, dialErr := proxy.SOCKS5("tcp", upstreamAddr, upstreamAuth, proxy.Direct)
+			dialer, dialErr := proxy.SOCKS5("tcp", dialAddr, upstreamAuth, proxy.Direct)
 			if dialErr != nil {
 				log.Printf("[HTTP-%s] ERROR: Failed to create dialer for proxy %s: %v", mode, proxyAddr, dialErr)
 				http.Error(w, "Failed to create proxy dialer", http.StatusInternalServerError)
@@ -1589,7 +1679,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 		}
 
 		handleHTTPSProxy(w, r, func(target string) (net.Conn, error) {
-			return dialTargetThroughHTTPProxy(dialScheme, upstreamAddr, upstreamHTTPAuthHeader, target)
+			return dialTargetThroughHTTPProxy(dialScheme, dialAddr, upstreamHTTPAuthHeader, target)
 		}, proxyAddr, mode)
 		return
 	}
@@ -1600,9 +1690,12 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 		},
 	}
 
-	dialScheme := getDialSchemeForMixed(scheme)
+	dialScheme, dialAddr, useAuth := resolveMixedDialTarget(scheme, upstreamAddr)
+	if !useAuth {
+		upstreamAuth = nil
+	}
 	if dialScheme == "socks5" || dialScheme == "socks5h" {
-		dialer, dialErr := proxy.SOCKS5("tcp", upstreamAddr, upstreamAuth, proxy.Direct)
+		dialer, dialErr := proxy.SOCKS5("tcp", dialAddr, upstreamAuth, proxy.Direct)
 		if dialErr != nil {
 			log.Printf("[HTTP-%s] ERROR: Failed to create dialer for proxy %s: %v", mode, proxyAddr, dialErr)
 			http.Error(w, "Failed to create proxy dialer", http.StatusInternalServerError)
@@ -1610,7 +1703,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 		}
 		transport.Dial = dialer.Dial
 	} else {
-		proxyURL := &url.URL{Scheme: dialScheme, Host: upstreamAddr}
+		proxyURL := &url.URL{Scheme: dialScheme, Host: dialAddr}
 		if upstreamAuth != nil {
 			proxyURL.User = url.UserPassword(upstreamAuth.User, upstreamAuth.Password)
 		}

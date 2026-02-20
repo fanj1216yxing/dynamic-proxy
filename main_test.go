@@ -115,3 +115,50 @@ func TestFilterMixedProxiesByScheme(t *testing.T) {
 		t.Fatalf("expected 2 mainstream entries, got %d (%v)", len(mainstream), mainstream)
 	}
 }
+
+func TestParseClashSubscriptionMixed_SupportsSSAndTrojan(t *testing.T) {
+	content := `proxies:
+  - type: ss
+    server: 1.2.3.4
+    port: 443
+    cipher: aes-128-gcm
+    password: secret
+  - type: trojan
+    server: 5.6.7.8
+    port: 8443
+    password: token
+`
+
+	proxies, ok := parseClashSubscriptionMixed(content)
+	if !ok {
+		t.Fatalf("expected clash mixed parsing to succeed")
+	}
+
+	if len(proxies) != 2 {
+		t.Fatalf("expected 2 proxies, got %d (%v)", len(proxies), proxies)
+	}
+}
+
+func TestNormalizeMixedProxyEntry_SSBase64(t *testing.T) {
+	entry := "ss://YWVzLTEyOC1nY206c2VjcmV0QDEuMi4zLjQ6NDQz"
+	got, ok := normalizeMixedProxyEntry(entry)
+	if !ok {
+		t.Fatalf("expected normalization success")
+	}
+	if got != "ss://aes-128-gcm:secret@1.2.3.4:443" {
+		t.Fatalf("unexpected normalized ss entry: %s", got)
+	}
+}
+
+func TestResolveMixedDialTarget_NonHTTPSocksUse17290(t *testing.T) {
+	dialScheme, dialAddr, useAuth := resolveMixedDialTarget("trojan", "8.8.8.8:443")
+	if dialScheme != "https" {
+		t.Fatalf("expected https dial scheme, got %s", dialScheme)
+	}
+	if dialAddr != "8.8.8.8:17290" {
+		t.Fatalf("expected 17290 relay port, got %s", dialAddr)
+	}
+	if useAuth {
+		t.Fatalf("expected relay mode to disable upstream auth")
+	}
+}
