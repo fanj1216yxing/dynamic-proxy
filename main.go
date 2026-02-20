@@ -1495,6 +1495,7 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 
 	httpSocksHealthy := filterMixedProxiesByScheme(result.Healthy, httpSocksMixedSchemes)
 	mainstreamHealthy := filterMixedProxiesByScheme(result.Healthy, mainstreamMixedSchemes)
+	log.Printf("[MIXED] Health check split result: total_healthy=%d http_socks=%d mainstream=%d", len(result.Healthy), len(httpSocksHealthy), len(mainstreamHealthy))
 
 	if len(httpSocksHealthy) > 0 {
 		mixedPool.Update(httpSocksHealthy)
@@ -1508,6 +1509,9 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy mainstream mixed proxies (vmess/vless/ss/trojan/hy2/hysteria2)", len(mainstreamHealthy))
 	} else {
 		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy mainstream mixed proxies (vmess/vless/ss/trojan/hy2/hysteria2) found, keeping existing pool")
+		if len(httpSocksHealthy) > 0 {
+			log.Printf("[HTTP-MAINSTREAM-MIXED] Fallback available: %d healthy HTTP/SOCKS proxies can serve :17290 when mainstream pool is empty", len(httpSocksHealthy))
+		}
 	}
 
 	if config.CFChallengeCheck.Enabled {
@@ -1654,13 +1658,13 @@ func startSOCKS5Server(pool *ProxyPool, port string, mode string) error {
 }
 
 // HTTP Proxy Server
-func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode string) {
+func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fallbackPool *ProxyPool, mode string) {
 	if r.URL.Path == "/list" {
-		if !validateHTTPProxyAuth(r) {
-			requireHTTPProxyAuth(w, mode)
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "HTTP-"+mode)
 			return
 		}
-		writePoolListResponse(w, pool, mode)
+		writePoolListResponse(w, pool, fallbackPool, mode)
 		return
 	}
 
@@ -1672,6 +1676,14 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 	}
 
 	proxyAddr, err := pool.GetNext()
+	if err != nil && fallbackPool != nil {
+		fallbackProxy, fallbackErr := fallbackPool.GetNext()
+		if fallbackErr == nil {
+			log.Printf("[HTTP-%s] Primary pool unavailable, fallback proxy selected from MIXED pool: %s", mode, fallbackProxy)
+			proxyAddr = fallbackProxy
+			err = nil
+		}
+	}
 	if err != nil {
 		log.Printf("[HTTP-%s] ERROR: No proxy available for %s %s: %v", mode, r.Method, r.URL.String(), err)
 		http.Error(w, "No available proxies", http.StatusServiceUnavailable)
@@ -1783,19 +1795,25 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 	io.Copy(w, resp.Body)
 }
 
-func writePoolListResponse(w http.ResponseWriter, pool *ProxyPool, mode string) {
+func writePoolListResponse(w http.ResponseWriter, pool *ProxyPool, fallbackPool *ProxyPool, mode string) {
 	proxies := pool.GetAll()
 	current, ok := pool.GetCurrent()
 	if !ok {
 		current = ""
 	}
 
+	fallbackCount := 0
+	if fallbackPool != nil {
+		fallbackCount = len(fallbackPool.GetAll())
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"mode":          mode,
-		"proxy_count":   len(proxies),
-		"current_proxy": current,
-		"proxies":       proxies,
+		"mode":                 mode,
+		"proxy_count":          len(proxies),
+		"current_proxy":        current,
+		"proxies":              proxies,
+		"fallback_proxy_count": fallbackCount,
 	})
 }
 
@@ -1900,9 +1918,9 @@ func dialTargetThroughHTTPProxy(proxyScheme string, proxyAddr string, proxyAuthH
 	return conn, nil
 }
 
-func startHTTPServer(pool *ProxyPool, port string, mode string) error {
+func startHTTPServer(pool *ProxyPool, fallbackPool *ProxyPool, port string, mode string) error {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handleHTTPProxy(w, r, pool, mode)
+		handleHTTPProxy(w, r, pool, fallbackPool, mode)
 	})
 
 	server := &http.Server{
@@ -2121,7 +2139,7 @@ func main() {
 	// HTTP Strict
 	go func() {
 		defer wg.Done()
-		if err := startHTTPServer(strictPool, config.Ports.HTTPStrict, "STRICT"); err != nil {
+		if err := startHTTPServer(strictPool, nil, config.Ports.HTTPStrict, "STRICT"); err != nil {
 			log.Fatalf("[STRICT] HTTP server error: %v", err)
 		}
 	}()
@@ -2129,7 +2147,7 @@ func main() {
 	// HTTP Relaxed
 	go func() {
 		defer wg.Done()
-		if err := startHTTPServer(relaxedPool, config.Ports.HTTPRelaxed, "RELAXED"); err != nil {
+		if err := startHTTPServer(relaxedPool, nil, config.Ports.HTTPRelaxed, "RELAXED"); err != nil {
 			log.Fatalf("[RELAXED] HTTP server error: %v", err)
 		}
 	}()
@@ -2145,7 +2163,7 @@ func main() {
 	// HTTP Mixed (HTTP/SOCKS5 upstream)
 	go func() {
 		defer wg.Done()
-		if err := startHTTPServer(mixedHTTPPool, config.Ports.HTTPMixed, "MIXED"); err != nil {
+		if err := startHTTPServer(mixedHTTPPool, nil, config.Ports.HTTPMixed, "MIXED"); err != nil {
 			log.Fatalf("[MIXED] HTTP server error: %v", err)
 		}
 	}()
@@ -2153,7 +2171,7 @@ func main() {
 	// HTTP Mixed CF-pass
 	go func() {
 		defer wg.Done()
-		if err := startHTTPServer(cfMixedHTTPPool, config.Ports.HTTPCFMixed, "CF-MIXED"); err != nil {
+		if err := startHTTPServer(cfMixedHTTPPool, nil, config.Ports.HTTPCFMixed, "CF-MIXED"); err != nil {
 			log.Fatalf("[CF-MIXED] HTTP server error: %v", err)
 		}
 	}()
@@ -2161,7 +2179,7 @@ func main() {
 	// HTTP Mainstream Mixed (VMESS/VLESS/HY2 upstream)
 	go func() {
 		defer wg.Done()
-		if err := startHTTPServer(mainstreamMixedHTTPPool, config.Ports.HTTPMainstreamMix, "MAINSTREAM-MIXED"); err != nil {
+		if err := startHTTPServer(mainstreamMixedHTTPPool, mixedHTTPPool, config.Ports.HTTPMainstreamMix, "MAINSTREAM-MIXED"); err != nil {
 			log.Fatalf("[MAINSTREAM-MIXED] HTTP server error: %v", err)
 		}
 	}()
