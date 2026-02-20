@@ -67,6 +67,9 @@ type Config struct {
 var config Config
 
 const connectivityCheckInterval = 10 * time.Second
+const defaultMixedHealthCheckURL = "https://www.google.com"
+
+var mixedHealthCheckURL = defaultMixedHealthCheckURL
 
 // Simple regex to extract ip:port from any format (used for special proxy lists)
 // Matches: [IP]:[port] and ignores any protocol prefixes or extra text
@@ -380,6 +383,7 @@ type clashSubscription struct {
 		Port     int    `yaml:"port"`
 		Username string `yaml:"username"`
 		Password string `yaml:"password"`
+		UUID     string `yaml:"uuid"`
 		Cipher   string `yaml:"cipher"`
 	} `yaml:"proxies"`
 }
@@ -521,6 +525,16 @@ func parseClashSubscriptionMixed(content string) ([]string, bool) {
 				continue
 			}
 			entry = fmt.Sprintf("ss://%s:%s@%s", url.QueryEscape(p.Cipher), url.QueryEscape(p.Password), host)
+		case "vless":
+			if p.UUID == "" {
+				continue
+			}
+			entry = fmt.Sprintf("vless://%s@%s", url.QueryEscape(p.UUID), host)
+		case "hy2", "hysteria2":
+			if p.Password == "" {
+				continue
+			}
+			entry = fmt.Sprintf("%s://%s@%s", proxyType, url.QueryEscape(p.Password), host)
 		case "trojan":
 			if p.Password == "" {
 				continue
@@ -694,9 +708,9 @@ func normalizeSSURI(raw string) (string, bool) {
 func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dialAddr string, useAuth bool) {
 	switch scheme {
 	case "vmess":
-		return "https", overridePort(addr, mainstreamMixedRelayPort), false
+		return "http", overridePort(addr, mainstreamMixedRelayPort), false
 	case "vless", "hy2", "hysteria2", "trojan":
-		return "https", overridePort(addr, mainstreamMixedRelayPort), true
+		return "http", overridePort(addr, mainstreamMixedRelayPort), true
 	case "ss":
 		return "socks5", overridePort(addr, mainstreamMixedRelayPort), false
 	default:
@@ -1080,7 +1094,7 @@ func checkMixedProxyHealth(proxyEntry string, strictMode bool) bool {
 
 	client := &http.Client{Transport: transport, Timeout: totalTimeout}
 	start := time.Now()
-	resp, err := client.Get("https://www.google.com")
+	resp, err := client.Get(mixedHealthCheckURL)
 	if err != nil {
 		return false
 	}
