@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -321,6 +322,17 @@ type clashSubscription struct {
 	} `yaml:"proxies"`
 }
 
+var mixedSupportedSchemes = map[string]bool{
+	"http":      true,
+	"https":     true,
+	"socks5":    true,
+	"socks5h":   true,
+	"vmess":     true,
+	"vless":     true,
+	"hy2":       true,
+	"hysteria2": true,
+}
+
 func parseClashSubscription(content string) ([]string, bool) {
 	var sub clashSubscription
 	if err := yaml.Unmarshal([]byte(content), &sub); err != nil || len(sub.Proxies) == 0 {
@@ -370,12 +382,8 @@ func parseRegularProxyContent(content string) ([]string, string) {
 }
 
 func parseRegularProxyContentMixed(content string) ([]string, string) {
-	if clashProxies, ok := parseClashSubscription(content); ok {
-		result := make([]string, 0, len(clashProxies))
-		for _, p := range clashProxies {
-			result = append(result, "socks5://"+p)
-		}
-		return result, "clash"
+	if clashProxies, ok := parseClashSubscriptionMixed(content); ok {
+		return clashProxies, "clash"
 	}
 
 	proxies := make([]string, 0)
@@ -395,6 +403,32 @@ func parseRegularProxyContentMixed(content string) ([]string, string) {
 	return proxies, "plain"
 }
 
+func parseClashSubscriptionMixed(content string) ([]string, bool) {
+	var sub clashSubscription
+	if err := yaml.Unmarshal([]byte(content), &sub); err != nil || len(sub.Proxies) == 0 {
+		return nil, false
+	}
+
+	result := make([]string, 0, len(sub.Proxies))
+	seen := make(map[string]bool)
+	for _, p := range sub.Proxies {
+		proxyType := strings.ToLower(strings.TrimSpace(p.Type))
+		if !mixedSupportedSchemes[proxyType] {
+			continue
+		}
+		if p.Server == "" || p.Port <= 0 {
+			continue
+		}
+		entry := fmt.Sprintf("%s://%s:%d", proxyType, p.Server, p.Port)
+		if !seen[entry] {
+			seen[entry] = true
+			result = append(result, entry)
+		}
+	}
+
+	return result, len(result) > 0
+}
+
 func normalizeMixedProxyEntry(raw string) (string, bool) {
 	line := strings.TrimSpace(raw)
 	if line == "" {
@@ -402,18 +436,60 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 	}
 
 	if strings.Contains(line, "://") {
+		if strings.HasPrefix(strings.ToLower(line), "vmess://") {
+			if normalized, ok := normalizeVMESSURI(line); ok {
+				return normalized, true
+			}
+		}
+
 		u, err := url.Parse(line)
 		if err != nil || u.Host == "" {
 			return "", false
 		}
 		scheme := strings.ToLower(u.Scheme)
-		if scheme != "http" && scheme != "https" && scheme != "socks5" && scheme != "socks5h" {
+		if !mixedSupportedSchemes[scheme] {
 			return "", false
 		}
 		return fmt.Sprintf("%s://%s", scheme, u.Host), true
 	}
 
 	return "socks5://" + line, true
+}
+
+func normalizeVMESSURI(raw string) (string, bool) {
+	encoded := strings.TrimSpace(strings.TrimPrefix(raw, "vmess://"))
+	if encoded == "" {
+		return "", false
+	}
+
+	payload, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		payload, err = base64.RawStdEncoding.DecodeString(encoded)
+		if err != nil {
+			return "", false
+		}
+	}
+
+	var node struct {
+		Add  string `json:"add"`
+		Port string `json:"port"`
+	}
+	if err := json.Unmarshal(payload, &node); err != nil {
+		return "", false
+	}
+	if node.Add == "" || node.Port == "" {
+		return "", false
+	}
+
+	return fmt.Sprintf("vmess://%s:%s", node.Add, node.Port), true
+}
+
+func getDialSchemeForMixed(scheme string) string {
+	// vmess/vless/hy2 节点通过 HTTP 混合入口时，按 HTTPS CONNECT 上游方式尝试连接。
+	if scheme == "vmess" || scheme == "vless" || scheme == "hy2" || scheme == "hysteria2" {
+		return "https"
+	}
+	return scheme
 }
 
 func parseSpecialProxyURLMixed(content string) []string {
@@ -443,6 +519,14 @@ func parseSpecialProxyURLMixed(content string) []string {
 			scheme = "socks5h"
 		case strings.Contains(lowerLine, "socks5://"):
 			scheme = "socks5"
+		case strings.Contains(lowerLine, "vmess://"):
+			scheme = "vmess"
+		case strings.Contains(lowerLine, "vless://"):
+			scheme = "vless"
+		case strings.Contains(lowerLine, "hy2://"):
+			scheme = "hy2"
+		case strings.Contains(lowerLine, "hysteria2://"):
+			scheme = "hysteria2"
 		}
 
 		entry := fmt.Sprintf("%s://%s:%s", scheme, matches[1], matches[2])
@@ -645,7 +729,7 @@ func parseMixedProxy(entry string) (scheme string, addr string, err error) {
 			return "", "", fmt.Errorf("invalid proxy entry: %s", entry)
 		}
 		s := strings.ToLower(u.Scheme)
-		if s != "socks5" && s != "socks5h" && s != "http" && s != "https" {
+		if !mixedSupportedSchemes[s] {
 			return "", "", fmt.Errorf("unsupported proxy scheme: %s", s)
 		}
 		return s, u.Host, nil
@@ -665,9 +749,10 @@ func checkCloudflareBypassMixed(proxyEntry string) bool {
 	}
 
 	timeout := time.Duration(config.CFChallengeCheck.TimeoutSeconds) * time.Second
+	dialScheme := getDialSchemeForMixed(scheme)
 	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 
-	if scheme == "socks5" || scheme == "socks5h" {
+	if dialScheme == "socks5" || dialScheme == "socks5h" {
 		dialer, dialErr := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
 		if dialErr != nil {
 			return false
@@ -676,7 +761,7 @@ func checkCloudflareBypassMixed(proxyEntry string) bool {
 			return dialer.Dial(network, targetAddr)
 		}
 	} else {
-		proxyURL, parseErr := url.Parse(fmt.Sprintf("%s://%s", scheme, addr))
+		proxyURL, parseErr := url.Parse(fmt.Sprintf("%s://%s", dialScheme, addr))
 		if parseErr != nil {
 			return false
 		}
@@ -730,11 +815,12 @@ func checkMixedProxyHealth(proxyEntry string, strictMode bool) bool {
 	if scheme == "socks5" || scheme == "socks5h" {
 		return checkProxyHealth(addr, strictMode)
 	}
+	dialScheme := getDialSchemeForMixed(scheme)
 
 	threshold := time.Duration(config.HealthCheck.TLSHandshakeThresholdSeconds) * time.Second
 	totalTimeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
 
-	proxyURL, err := url.Parse(fmt.Sprintf("%s://%s", scheme, addr))
+	proxyURL, err := url.Parse(fmt.Sprintf("%s://%s", dialScheme, addr))
 	if err != nil {
 		return false
 	}
@@ -1242,7 +1328,8 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 
 	// Handle CONNECT method for HTTPS
 	if r.Method == http.MethodConnect {
-		if scheme == "socks5" || scheme == "socks5h" {
+		dialScheme := getDialSchemeForMixed(scheme)
+		if dialScheme == "socks5" || dialScheme == "socks5h" {
 			dialer, dialErr := proxy.SOCKS5("tcp", upstreamAddr, nil, proxy.Direct)
 			if dialErr != nil {
 				log.Printf("[HTTP-%s] ERROR: Failed to create dialer for proxy %s: %v", mode, proxyAddr, dialErr)
@@ -1256,7 +1343,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 		}
 
 		handleHTTPSProxy(w, r, func(target string) (net.Conn, error) {
-			return dialTargetThroughHTTPProxy(scheme, upstreamAddr, target)
+			return dialTargetThroughHTTPProxy(dialScheme, upstreamAddr, target)
 		}, proxyAddr, mode)
 		return
 	}
@@ -1267,7 +1354,8 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 		},
 	}
 
-	if scheme == "socks5" || scheme == "socks5h" {
+	dialScheme := getDialSchemeForMixed(scheme)
+	if dialScheme == "socks5" || dialScheme == "socks5h" {
 		dialer, dialErr := proxy.SOCKS5("tcp", upstreamAddr, nil, proxy.Direct)
 		if dialErr != nil {
 			log.Printf("[HTTP-%s] ERROR: Failed to create dialer for proxy %s: %v", mode, proxyAddr, dialErr)
@@ -1276,7 +1364,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 		}
 		transport.Dial = dialer.Dial
 	} else {
-		proxyURL, parseErr := url.Parse(fmt.Sprintf("%s://%s", scheme, upstreamAddr))
+		proxyURL, parseErr := url.Parse(fmt.Sprintf("%s://%s", dialScheme, upstreamAddr))
 		if parseErr != nil {
 			log.Printf("[HTTP-%s] ERROR: Invalid upstream HTTP proxy %s: %v", mode, proxyAddr, parseErr)
 			http.Error(w, "Invalid upstream proxy", http.StatusInternalServerError)
