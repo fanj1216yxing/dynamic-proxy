@@ -125,6 +125,7 @@ health_check_concurrency: 200
 
 # 更新间隔（分钟）
 update_interval_minutes: 5
+proxy_switch_interval_min: 30          # 自动轮换间隔（分钟），填 now 表示每次请求都轮换
 
 # 健康检查超时设置
 health_check:
@@ -154,6 +155,7 @@ auth:
 | `proxy_list_urls` | 代理源URL列表 | 2个源 |
 | `health_check_concurrency` | 并发健康检查数 | 200 |
 | `update_interval_minutes` | 代理池刷新间隔 | 5分钟 |
+| `proxy_switch_interval_min` | 自动轮换间隔（单位: 分钟）；支持 `now`（每次请求轮换） | 30分钟 |
 | `total_timeout_seconds` | 健康检查总超时 | 8秒 |
 | `tls_handshake_threshold_seconds` | 最大TLS握手时间 | 5秒 |
 | `ports.socks5_strict` | SOCKS5服务器端口（启用SSL验证） | :17283 |
