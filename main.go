@@ -396,9 +396,14 @@ var mixedSupportedSchemes = map[string]bool{
 	"vmess":     true,
 	"vless":     true,
 	"ss":        true,
+	"ssr":       true,
 	"trojan":    true,
+	"hysteria":  true,
 	"hy2":       true,
 	"hysteria2": true,
+	"tuic":      true,
+	"wg":        true,
+	"wireguard": true,
 }
 
 var httpSocksMixedSchemes = map[string]bool{
@@ -609,14 +614,27 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 	}
 
 	if strings.Contains(line, "://") {
-		if strings.HasPrefix(strings.ToLower(line), "ss://") {
+		lowerLine := strings.ToLower(line)
+		if strings.HasPrefix(lowerLine, "ss://") {
 			if normalized, ok := normalizeSSURI(line); ok {
 				return normalized, true
 			}
 		}
 
-		if strings.HasPrefix(strings.ToLower(line), "vmess://") {
+		if strings.HasPrefix(lowerLine, "vmess://") {
 			if normalized, ok := normalizeVMESSURI(line); ok {
+				return normalized, true
+			}
+		}
+
+		if strings.HasPrefix(lowerLine, "ssr://") {
+			if normalized, ok := normalizeSSRURI(line); ok {
+				return normalized, true
+			}
+		}
+
+		if strings.HasPrefix(lowerLine, "wg://") || strings.HasPrefix(lowerLine, "wireguard://") {
+			if normalized, ok := normalizeWireGuardURI(line); ok {
 				return normalized, true
 			}
 		}
@@ -629,11 +647,21 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 		if !mixedSupportedSchemes[scheme] {
 			return "", false
 		}
+		if !validateMainstreamURI(scheme, u) {
+			return "", false
+		}
 		authority := u.Host
 		if u.User != nil {
 			authority = u.User.String() + "@" + authority
 		}
-		return fmt.Sprintf("%s://%s", scheme, authority), true
+		normalized := fmt.Sprintf("%s://%s", scheme, authority)
+		if u.RawQuery != "" {
+			normalized += "?" + u.RawQuery
+		}
+		if u.Fragment != "" {
+			normalized += "#" + u.Fragment
+		}
+		return normalized, true
 	}
 
 	return "socks5://" + line, true
@@ -641,11 +669,93 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 
 func normalizeVMESSURI(raw string) (string, bool) {
 	encoded := strings.TrimSpace(strings.TrimPrefix(raw, "vmess://"))
+	if idx := strings.IndexAny(encoded, "?#"); idx >= 0 {
+		encoded = encoded[:idx]
+	}
 	if encoded == "" {
 		return "", false
 	}
 
-	payload, err := base64.StdEncoding.DecodeString(encoded)
+	decoders := []func(string) ([]byte, error){
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawURLEncoding.DecodeString,
+	}
+	var payload []byte
+	var err error
+	decodedOK := false
+	for _, decode := range decoders {
+		payload, err = decode(encoded)
+		if err == nil {
+			decodedOK = true
+			break
+		}
+	}
+	if !decodedOK {
+		return "", false
+	}
+
+	var node struct {
+		Add  string      `json:"add"`
+		Port interface{} `json:"port"`
+		ID   string      `json:"id"`
+		Net  string      `json:"net"`
+		Host string      `json:"host"`
+		Path string      `json:"path"`
+		TLS  string      `json:"tls"`
+		SNI  string      `json:"sni"`
+		Aid  interface{} `json:"aid"`
+	}
+	if err := json.Unmarshal(payload, &node); err != nil {
+		return "", false
+	}
+	port := strings.TrimSpace(fmt.Sprintf("%v", node.Port))
+	if node.Add == "" || port == "" || port == "<nil>" {
+		return "", false
+	}
+	host := net.JoinHostPort(node.Add, port)
+	query := url.Values{}
+	if node.ID != "" {
+		query.Set("id", node.ID)
+	}
+	if node.Net != "" {
+		query.Set("type", node.Net)
+	}
+	if node.Host != "" {
+		query.Set("host", node.Host)
+	}
+	if node.Path != "" {
+		query.Set("path", node.Path)
+	}
+	if node.TLS != "" {
+		query.Set("security", node.TLS)
+	}
+	if node.SNI != "" {
+		query.Set("sni", node.SNI)
+	}
+	aid := strings.TrimSpace(fmt.Sprintf("%v", node.Aid))
+	if aid != "" && aid != "<nil>" {
+		query.Set("aid", aid)
+	}
+
+	if encodedQuery := query.Encode(); encodedQuery != "" {
+		return fmt.Sprintf("vmess://%s?%s", host, encodedQuery), true
+	}
+
+	return fmt.Sprintf("vmess://%s", host), true
+}
+
+func normalizeSSRURI(raw string) (string, bool) {
+	encoded := strings.TrimSpace(strings.TrimPrefix(raw, "ssr://"))
+	if idx := strings.Index(encoded, "#"); idx >= 0 {
+		encoded = encoded[:idx]
+	}
+	if encoded == "" {
+		return "", false
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
 		payload, err = base64.RawStdEncoding.DecodeString(encoded)
 		if err != nil {
@@ -653,18 +763,93 @@ func normalizeVMESSURI(raw string) (string, bool) {
 		}
 	}
 
-	var node struct {
-		Add  string `json:"add"`
-		Port string `json:"port"`
-	}
-	if err := json.Unmarshal(payload, &node); err != nil {
+	parts := strings.SplitN(string(payload), "/?", 2)
+	segments := strings.Split(parts[0], ":")
+	if len(segments) < 6 {
 		return "", false
 	}
-	if node.Add == "" || node.Port == "" {
+	host, port, passwordEnc := segments[0], segments[1], segments[5]
+	if host == "" || port == "" || passwordEnc == "" {
 		return "", false
 	}
 
-	return fmt.Sprintf("vmess://%s:%s", node.Add, node.Port), true
+	passwordRaw, err := base64.RawURLEncoding.DecodeString(passwordEnc)
+	if err != nil {
+		passwordRaw, err = base64.RawStdEncoding.DecodeString(passwordEnc)
+		if err != nil {
+			return "", false
+		}
+	}
+
+	return fmt.Sprintf("ssr://%s@%s", url.QueryEscape(string(passwordRaw)), net.JoinHostPort(host, port)), true
+}
+
+func normalizeWireGuardURI(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	encoded := strings.TrimPrefix(strings.TrimPrefix(trimmed, "wg://"), "wireguard://")
+	if idx := strings.Index(encoded, "#"); idx >= 0 {
+		encoded = encoded[:idx]
+	}
+	if encoded == "" {
+		return "", false
+	}
+	payload, err := base64.RawStdEncoding.DecodeString(encoded)
+	if err != nil {
+		payload, err = base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return "", false
+		}
+	}
+	decoded := string(payload)
+	if !strings.Contains(decoded, "PrivateKey") || !strings.Contains(decoded, "PublicKey") {
+		return "", false
+	}
+	endpoint := ""
+	privateKey := ""
+	for _, line := range strings.Split(decoded, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Endpoint") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				endpoint = strings.TrimSpace(parts[1])
+			}
+		}
+		if strings.HasPrefix(line, "PrivateKey") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				privateKey = strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	if endpoint == "" {
+		return "", false
+	}
+	return fmt.Sprintf("wg://%s@%s", url.QueryEscape(privateKey), endpoint), true
+}
+
+func validateMainstreamURI(scheme string, u *url.URL) bool {
+	query := u.Query()
+	switch scheme {
+	case "vless":
+		if u.User == nil || strings.TrimSpace(u.User.Username()) == "" {
+			return false
+		}
+		return strings.EqualFold(strings.TrimSpace(query.Get("encryption")), "none")
+	case "trojan", "hy2", "hysteria2":
+		return u.User != nil && strings.TrimSpace(u.User.Username()) != ""
+	case "hysteria":
+		return strings.TrimSpace(query.Get("auth")) != ""
+	case "tuic":
+		if u.User == nil || strings.TrimSpace(u.User.Username()) == "" {
+			return false
+		}
+		password, ok := u.User.Password()
+		return ok && strings.TrimSpace(password) != ""
+	default:
+		return true
+	}
+
+	return true
 }
 
 func normalizeSSURI(raw string) (string, bool) {
@@ -703,7 +888,7 @@ func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dial
 	switch scheme {
 	case "vmess":
 		return "http", addr, false
-	case "vless", "hy2", "hysteria2", "trojan":
+	case "vless", "hy2", "hysteria", "hysteria2", "trojan", "ss", "ssr", "tuic", "wg", "wireguard":
 		return "http", addr, true
 	default:
 		return scheme, addr, true
@@ -712,7 +897,7 @@ func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dial
 
 func isMainstreamMixedScheme(scheme string) bool {
 	switch scheme {
-	case "vmess", "vless", "trojan", "hy2", "hysteria2":
+	case "vmess", "vless", "trojan", "ss", "ssr", "hy2", "hysteria", "hysteria2", "tuic", "wg", "wireguard":
 		return true
 	default:
 		return false
@@ -721,7 +906,7 @@ func isMainstreamMixedScheme(scheme string) bool {
 
 func hasRequiredMainstreamAuth(scheme string, auth *proxy.Auth) bool {
 	switch scheme {
-	case "vless", "trojan", "hy2", "hysteria2":
+	case "vless", "trojan", "ss", "ssr", "hy2", "hysteria", "hysteria2", "tuic":
 		return auth != nil && strings.TrimSpace(auth.User) != ""
 	default:
 		return true
@@ -771,16 +956,24 @@ func parseSpecialProxyURLMixed(content string) []string {
 			scheme = "socks5"
 		case strings.Contains(lowerLine, "ss://"):
 			scheme = "ss"
+		case strings.Contains(lowerLine, "ssr://"):
+			scheme = "ssr"
 		case strings.Contains(lowerLine, "trojan://"):
 			scheme = "trojan"
 		case strings.Contains(lowerLine, "vmess://"):
 			scheme = "vmess"
 		case strings.Contains(lowerLine, "vless://"):
 			scheme = "vless"
+		case strings.Contains(lowerLine, "tuic://"):
+			scheme = "tuic"
+		case strings.Contains(lowerLine, "hysteria://"):
+			scheme = "hysteria"
 		case strings.Contains(lowerLine, "hy2://"):
 			scheme = "hy2"
 		case strings.Contains(lowerLine, "hysteria2://"):
 			scheme = "hysteria2"
+		case strings.Contains(lowerLine, "wg://"):
+			scheme = "wg"
 		}
 
 		entry := fmt.Sprintf("%s://%s:%s", scheme, matches[1], matches[2])
@@ -995,6 +1188,12 @@ func parseMixedProxy(entry string) (scheme string, addr string, auth *proxy.Auth
 			if username != "" {
 				socksAuth = &proxy.Auth{User: username, Password: password}
 				httpHeader = "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
+			}
+		}
+		if socksAuth == nil && s == "hysteria" {
+			authQuery := strings.TrimSpace(u.Query().Get("auth"))
+			if authQuery != "" {
+				socksAuth = &proxy.Auth{User: authQuery}
 			}
 		}
 
