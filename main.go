@@ -407,8 +407,10 @@ var mixedSupportedSchemes = map[string]bool{
 }
 
 var httpSocksMixedSchemes = map[string]bool{
-	"http":   true,
-	"socks5": true,
+	"http":    true,
+	"https":   true,
+	"socks5":  true,
+	"socks5h": true,
 }
 
 var mainstreamMixedExcludedSchemes = map[string]bool{
@@ -1770,9 +1772,9 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 
 	if len(httpSocksHealthy) > 0 {
 		mixedPool.Update(httpSocksHealthy)
-		log.Printf("[HTTP-MIXED] Pool updated with %d healthy HTTP/SOCKS mixed proxies", len(httpSocksHealthy))
+		log.Printf("[HTTP-MIXED] Pool updated with %d healthy HTTP/HTTPS/SOCKS mixed proxies", len(httpSocksHealthy))
 	} else {
-		log.Println("[HTTP-MIXED] Warning: No healthy HTTP/SOCKS mixed proxies found, keeping existing pool")
+		log.Println("[HTTP-MIXED] Warning: No healthy HTTP/HTTPS/SOCKS mixed proxies found, keeping existing pool")
 	}
 
 	if len(mainstreamHealthy) > 0 {
@@ -2383,7 +2385,7 @@ func main() {
 	log.Printf("  - SOCKS5 Relaxed port: %s", config.Ports.SOCKS5Relaxed)
 	log.Printf("  - HTTP Strict port: %s", config.Ports.HTTPStrict)
 	log.Printf("  - HTTP Relaxed port: %s", config.Ports.HTTPRelaxed)
-	log.Printf("  - HTTP Mixed port (HTTP/SOCKS): %s", config.Ports.HTTPMixed)
+	log.Printf("  - HTTP Mixed port (HTTP/HTTPS/SOCKS): %s", config.Ports.HTTPMixed)
 	log.Printf("  - HTTP Mixed port (VMESS/VLESS/HY2): %s", config.Ports.HTTPMainstreamMix)
 	log.Printf("  - HTTP Mixed CF-pass port: %s", config.Ports.HTTPCFMixed)
 	if isProxyAuthEnabled() {
@@ -2482,7 +2484,7 @@ func main() {
 		}
 	}()
 
-	// HTTP Mixed (HTTP/SOCKS5 upstream)
+	// HTTP Mixed (HTTP/HTTPS/SOCKS5 upstream)
 	go func() {
 		defer wg.Done()
 		if err := startHTTPServer(mixedHTTPPool, nil, config.Ports.HTTPMixed, "MIXED"); err != nil {
@@ -2517,7 +2519,7 @@ func main() {
 	log.Println("All servers started successfully")
 	log.Println("  [STRICT] SOCKS5: " + config.Ports.SOCKS5Strict + " | HTTP: " + config.Ports.HTTPStrict)
 	log.Println("  [RELAXED] SOCKS5: " + config.Ports.SOCKS5Relaxed + " | HTTP: " + config.Ports.HTTPRelaxed)
-	log.Println("  [MIXED] HTTP (HTTP/SOCKS upstream): " + config.Ports.HTTPMixed)
+	log.Println("  [MIXED] HTTP (HTTP/HTTPS/SOCKS upstream): " + config.Ports.HTTPMixed)
 	log.Println("  [MAINSTREAM-MIXED] HTTP (all non-http/socks5 upstream): " + config.Ports.HTTPMainstreamMix)
 	log.Println("  [CF-MIXED] HTTP (CF-pass SOCKS5/HTTP upstream): " + config.Ports.HTTPCFMixed)
 	log.Println("  [ROTATE] Control: " + config.Ports.RotateControl)
