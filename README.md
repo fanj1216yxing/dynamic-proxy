@@ -17,6 +17,7 @@
 - 🎯 **智能过滤**: 自动移除慢速和不可靠的代理
 - 🔁 **自动更新**: 定期刷新代理池（可配置间隔）
 - 🔐 **双模式**: 严格模式（启用SSL验证）和宽松模式（禁用SSL验证）
+- 🧩 **混合协议识别**: HTTP Mixed 入口可识别 socks5/socks5h/http/https/vmess/vless/hy2（后3者按 HTTPS CONNECT 兼容模式接入）
 
 ### 快速开始
 
@@ -115,7 +116,7 @@ Docker 镜像使用多阶段构建，体积最小化：
 proxy_list_urls:
   - "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt"
   - "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/socks5/raw/all.txt"
-  # 也支持 Clash 订阅（YAML），会自动识别并提取 socks5/socks5h 节点
+  # 也支持 Clash 订阅（YAML），会自动识别并提取 socks5/socks5h/http/https/vmess/vless/hy2 节点
   # 添加更多源
   # - "https://example.com/proxy-list.txt"
 
@@ -137,7 +138,7 @@ ports:
   http_strict: ":17285"      # HTTP 严格模式（启用SSL验证）
   http_relaxed: ":17286"     # HTTP 宽松模式（禁用SSL验证）
   rotate_control: ":17287"  # 访问该端口随机切换到一个新的健康代理
-  http_mixed: ":17288"      # HTTP混合入口（自动选择 HTTP 或 SOCKS5 上游）
+  http_mixed: ":17288"      # HTTP混合入口（自动选择 HTTP/SOCKS5/VMESS/VLESS/HY2 上游）
   http_cf_mixed: ":17289"   # HTTP混合入口（仅使用可通过CF挑战的上游）
 
 # 可选代理认证（username/password 必须同时配置）
@@ -160,7 +161,7 @@ auth:
 | `ports.http_strict` | HTTP代理服务器端口（启用SSL验证） | :17285 |
 | `ports.http_relaxed` | HTTP代理服务器端口（禁用SSL验证） | :17286 |
 | `ports.rotate_control` | 手动轮换控制端口（随机切换到一个新的健康代理） | :17287 |
-| `ports.http_mixed` | HTTP混合入口（自动选择 HTTP 或 SOCKS5 上游） | :17288 |
+| `ports.http_mixed` | HTTP混合入口（自动选择 HTTP/SOCKS5/VMESS/VLESS/HY2 上游） | :17288 |
 | `ports.http_cf_mixed` | HTTP混合入口（仅使用可通过CF挑战的上游） | :17289 |
 | `auth.username` | 代理认证用户名（可选） | 空 |
 | `auth.password` | 代理认证密码（可选） | 空 |
@@ -191,10 +192,10 @@ curl --proxy socks5://username:password@127.0.0.1:17283 https://api.ipify.org
 # Force rotate to a random healthy proxy (both strict/relaxed pools)
 curl http://127.0.0.1:17287
 
-# HTTP混合入口（自动使用 HTTP 或 SOCKS5 上游代理）
+# HTTP混合入口（自动使用 HTTP/SOCKS5/VMESS/VLESS/HY2 上游代理）
 curl -x http://127.0.0.1:17288 https://api.ipify.org
 
-# HTTP CF混合入口（自动使用可通过CF挑战的 HTTP 或 SOCKS5 上游代理）
+# HTTP CF混合入口（自动使用可通过CF挑战的混合协议上游代理）
 curl -x http://127.0.0.1:17289 https://api.ipify.org
 
 # 查看当前可自动通过 CF 挑战的代理列表（需在 config 中启用 cf_challenge_check）
