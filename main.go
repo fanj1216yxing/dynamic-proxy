@@ -20,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/armon/go-socks5"
 	"golang.org/x/net/proxy"
@@ -364,6 +366,12 @@ func parseRegularProxyContent(content string) ([]string, string) {
 		return clashProxies, "clash"
 	}
 
+	if decoded, ok := decodeBase64ProxySubscription(content); ok {
+		if decodedProxies, decodedFormat := parseRegularProxyContent(decoded); len(decodedProxies) > 0 {
+			return decodedProxies, "base64+" + decodedFormat
+		}
+	}
+
 	proxies := make([]string, 0)
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	for scanner.Scan() {
@@ -384,6 +392,12 @@ func parseRegularProxyContent(content string) ([]string, string) {
 func parseRegularProxyContentMixed(content string) ([]string, string) {
 	if clashProxies, ok := parseClashSubscriptionMixed(content); ok {
 		return clashProxies, "clash"
+	}
+
+	if decoded, ok := decodeBase64ProxySubscription(content); ok {
+		if decodedProxies, decodedFormat := parseRegularProxyContentMixed(decoded); len(decodedProxies) > 0 {
+			return decodedProxies, "base64+" + decodedFormat
+		}
 	}
 
 	proxies := make([]string, 0)
@@ -427,6 +441,56 @@ func parseClashSubscriptionMixed(content string) ([]string, bool) {
 	}
 
 	return result, len(result) > 0
+}
+
+func decodeBase64ProxySubscription(content string) (string, bool) {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return "", false
+	}
+
+	compact := strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, trimmed)
+
+	if len(compact) < 32 {
+		return "", false
+	}
+
+	for _, ch := range compact {
+		if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '+' || ch == '/' || ch == '=' || ch == '-' || ch == '_' {
+			continue
+		}
+		return "", false
+	}
+
+	decoders := []func(string) ([]byte, error){
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawURLEncoding.DecodeString,
+	}
+
+	for _, decode := range decoders {
+		payload, err := decode(compact)
+		if err != nil || len(payload) == 0 || !utf8.Valid(payload) {
+			continue
+		}
+
+		decoded := strings.TrimSpace(string(payload))
+		if decoded == "" || decoded == trimmed {
+			continue
+		}
+
+		if strings.Contains(decoded, "://") || strings.Contains(strings.ToLower(decoded), "proxies:") || simpleProxyRegex.MatchString(decoded) {
+			return decoded, true
+		}
+	}
+
+	return "", false
 }
 
 func normalizeMixedProxyEntry(raw string) (string, bool) {
