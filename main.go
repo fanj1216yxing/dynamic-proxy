@@ -67,6 +67,9 @@ type Config struct {
 var config Config
 
 const connectivityCheckInterval = 10 * time.Second
+const defaultMixedHealthCheckURL = "https://www.google.com"
+
+var mixedHealthCheckURL = defaultMixedHealthCheckURL
 
 // Simple regex to extract ip:port from any format (used for special proxy lists)
 // Matches: [IP]:[port] and ignores any protocol prefixes or extra text
@@ -380,6 +383,7 @@ type clashSubscription struct {
 		Port     int    `yaml:"port"`
 		Username string `yaml:"username"`
 		Password string `yaml:"password"`
+		UUID     string `yaml:"uuid"`
 		Cipher   string `yaml:"cipher"`
 	} `yaml:"proxies"`
 }
@@ -521,6 +525,16 @@ func parseClashSubscriptionMixed(content string) ([]string, bool) {
 				continue
 			}
 			entry = fmt.Sprintf("ss://%s:%s@%s", url.QueryEscape(p.Cipher), url.QueryEscape(p.Password), host)
+		case "vless":
+			if p.UUID == "" {
+				continue
+			}
+			entry = fmt.Sprintf("vless://%s@%s", url.QueryEscape(p.UUID), host)
+		case "hy2", "hysteria2":
+			if p.Password == "" {
+				continue
+			}
+			entry = fmt.Sprintf("%s://%s@%s", proxyType, url.QueryEscape(p.Password), host)
 		case "trojan":
 			if p.Password == "" {
 				continue
@@ -694,9 +708,9 @@ func normalizeSSURI(raw string) (string, bool) {
 func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dialAddr string, useAuth bool) {
 	switch scheme {
 	case "vmess":
-		return "https", overridePort(addr, mainstreamMixedRelayPort), false
+		return "http", overridePort(addr, mainstreamMixedRelayPort), false
 	case "vless", "hy2", "hysteria2", "trojan":
-		return "https", overridePort(addr, mainstreamMixedRelayPort), true
+		return "http", overridePort(addr, mainstreamMixedRelayPort), true
 	case "ss":
 		return "socks5", overridePort(addr, mainstreamMixedRelayPort), false
 	default:
@@ -1080,7 +1094,7 @@ func checkMixedProxyHealth(proxyEntry string, strictMode bool) bool {
 
 	client := &http.Client{Transport: transport, Timeout: totalTimeout}
 	start := time.Now()
-	resp, err := client.Get("https://www.google.com")
+	resp, err := client.Get(mixedHealthCheckURL)
 	if err != nil {
 		return false
 	}
@@ -1641,6 +1655,15 @@ func startSOCKS5Server(pool *ProxyPool, port string, mode string) error {
 
 // HTTP Proxy Server
 func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode string) {
+	if r.URL.Path == "/list" {
+		if !validateHTTPProxyAuth(r) {
+			requireHTTPProxyAuth(w, mode)
+			return
+		}
+		writePoolListResponse(w, pool, mode)
+		return
+	}
+
 	log.Printf("[HTTP-%s] Incoming request: %s %s from %s", mode, r.Method, r.URL.String(), r.RemoteAddr)
 
 	if !validateHTTPProxyAuth(r) {
@@ -1758,6 +1781,22 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+func writePoolListResponse(w http.ResponseWriter, pool *ProxyPool, mode string) {
+	proxies := pool.GetAll()
+	current, ok := pool.GetCurrent()
+	if !ok {
+		current = ""
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"mode":          mode,
+		"proxy_count":   len(proxies),
+		"current_proxy": current,
+		"proxies":       proxies,
+	})
 }
 
 func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetDial func(string) (net.Conn, error), proxyAddr string, mode string) {
@@ -1905,6 +1944,21 @@ func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfP
 			for _, proxyAddr := range proxies {
 				fmt.Fprintln(w, proxyAddr)
 			}
+		case "/list":
+			strictProxies := strictPool.GetAll()
+			relaxedProxies := relaxedPool.GetAll()
+			cfProxies := cfPool.GetAll()
+			strictCurrent, _ := strictPool.GetCurrent()
+			relaxedCurrent, _ := relaxedPool.GetCurrent()
+
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"strict_proxy_count":    len(strictProxies),
+				"strict_current_proxy":  strictCurrent,
+				"relaxed_proxy_count":   len(relaxedProxies),
+				"relaxed_current_proxy": relaxedCurrent,
+				"cf_proxy_count":        len(cfProxies),
+			})
 		default:
 			http.NotFound(w, r)
 		}
