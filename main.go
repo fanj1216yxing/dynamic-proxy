@@ -406,7 +406,12 @@ var httpSocksMixedSchemes = map[string]bool{
 	"socks5": true,
 }
 
-var mainstreamMixedExcludedSchemes = map[string]bool{"http": true, "socks5": true}
+var mainstreamMixedExcludedSchemes = map[string]bool{
+	"http":    true,
+	"https":   true,
+	"socks5":  true,
+	"socks5h": true,
+}
 
 const mainstreamMixedRelayPort = "17290"
 
@@ -2023,7 +2028,7 @@ func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool
 			"cf_mixed_current_proxy":        cfMixedCurrent,
 			"mainstream_listen_port":        config.Ports.HTTPMainstreamMix,
 			"status_listen_addr":            port,
-			"mainstream_excluded_protocols": []string{"http", "socks5"},
+			"mainstream_excluded_protocols": []string{"http", "https", "socks5", "socks5h"},
 		})
 	})
 
