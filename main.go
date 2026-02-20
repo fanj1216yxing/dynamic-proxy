@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -39,6 +41,8 @@ type Config struct {
 		SOCKS5Relaxed string `yaml:"socks5_relaxed"`
 		HTTPStrict    string `yaml:"http_strict"`
 		HTTPRelaxed   string `yaml:"http_relaxed"`
+		HTTPMixed     string `yaml:"http_mixed"`
+		HTTPCFMixed   string `yaml:"http_cf_mixed"`
 		RotateControl string `yaml:"rotate_control"`
 	} `yaml:"ports"`
 	Auth struct {
@@ -102,6 +106,12 @@ func loadConfig(filename string) (*Config, error) {
 	}
 	if cfg.Ports.HTTPRelaxed == "" {
 		cfg.Ports.HTTPRelaxed = ":8082"
+	}
+	if cfg.Ports.HTTPMixed == "" {
+		cfg.Ports.HTTPMixed = ":8083"
+	}
+	if cfg.Ports.HTTPCFMixed == "" {
+		cfg.Ports.HTTPCFMixed = ":8084"
 	}
 	if cfg.Ports.RotateControl == "" {
 		cfg.Ports.RotateControl = ":9090"
@@ -360,6 +370,197 @@ func parseRegularProxyContent(content string) ([]string, string) {
 	return proxies, "plain"
 }
 
+func parseRegularProxyContentMixed(content string) ([]string, string) {
+	if clashProxies, ok := parseClashSubscriptionMixed(content); ok {
+		return clashProxies, "clash"
+	}
+
+	proxies := make([]string, 0)
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		normalized, ok := normalizeMixedProxyEntry(line)
+		if ok {
+			proxies = append(proxies, normalized)
+		}
+	}
+
+	return proxies, "plain"
+}
+
+func normalizeMixedProxyEntry(raw string) (string, bool) {
+	line := strings.TrimSpace(raw)
+	if line == "" {
+		return "", false
+	}
+
+	if strings.Contains(line, "://") {
+		u, err := url.Parse(line)
+		if err != nil || u.Host == "" {
+			if parsed, ok := normalizeVmessLikeEntry(line); ok {
+				return parsed, true
+			}
+			return "", false
+		}
+		scheme := normalizeMixedScheme(u.Scheme)
+		if !isSupportedMixedScheme(scheme) {
+			if parsed, ok := normalizeVmessLikeEntry(line); ok {
+				return parsed, true
+			}
+			return "", false
+		}
+		if scheme == "hysteria2" {
+			scheme = "hy2"
+		}
+		return fmt.Sprintf("%s://%s", scheme, u.Host), true
+	}
+
+	return "socks5://" + line, true
+}
+
+func parseClashSubscriptionMixed(content string) ([]string, bool) {
+	var sub clashSubscription
+	if err := yaml.Unmarshal([]byte(content), &sub); err != nil || len(sub.Proxies) == 0 {
+		return nil, false
+	}
+
+	result := make([]string, 0, len(sub.Proxies))
+	seen := make(map[string]bool)
+	for _, p := range sub.Proxies {
+		proxyType := normalizeMixedScheme(p.Type)
+		if !isSupportedMixedScheme(proxyType) {
+			continue
+		}
+		if proxyType == "hysteria2" {
+			proxyType = "hy2"
+		}
+		if p.Server == "" || p.Port <= 0 {
+			continue
+		}
+		entry := fmt.Sprintf("%s://%s:%d", proxyType, p.Server, p.Port)
+		if !seen[entry] {
+			seen[entry] = true
+			result = append(result, entry)
+		}
+	}
+
+	return result, len(result) > 0
+}
+
+func normalizeMixedScheme(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "vmiss":
+		return "vmess"
+	case "vliss":
+		return "vless"
+	default:
+		return strings.ToLower(strings.TrimSpace(s))
+	}
+}
+
+func isSupportedMixedScheme(s string) bool {
+	switch s {
+	case "http", "https", "socks5", "socks5h", "vmess", "vless", "hy2", "hysteria2":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeVmessLikeEntry(line string) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(line))
+	if strings.HasPrefix(lower, "vmess://") || strings.HasPrefix(lower, "vmiss://") {
+		payload := strings.TrimSpace(line[strings.Index(line, "://")+3:])
+		decoded, err := base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			decoded, err = base64.RawStdEncoding.DecodeString(payload)
+		}
+		if err != nil {
+			return "", false
+		}
+		var vm struct {
+			Add  string `json:"add"`
+			Host string `json:"host"`
+			Port string `json:"port"`
+		}
+		if err := json.Unmarshal(decoded, &vm); err != nil {
+			return "", false
+		}
+		host := strings.TrimSpace(vm.Add)
+		if host == "" {
+			host = strings.TrimSpace(vm.Host)
+		}
+		port := strings.TrimSpace(vm.Port)
+		if host == "" || port == "" {
+			return "", false
+		}
+		return fmt.Sprintf("vmess://%s:%s", host, port), true
+	}
+
+	if strings.HasPrefix(lower, "vless://") || strings.HasPrefix(lower, "vliss://") || strings.HasPrefix(lower, "hy2://") || strings.HasPrefix(lower, "hysteria2://") {
+		u, err := url.Parse(line)
+		if err != nil || u.Host == "" {
+			return "", false
+		}
+		scheme := normalizeMixedScheme(u.Scheme)
+		if scheme == "hysteria2" {
+			scheme = "hy2"
+		}
+		return fmt.Sprintf("%s://%s", scheme, u.Host), true
+	}
+
+	return "", false
+}
+
+func parseSpecialProxyURLMixed(content string) []string {
+	proxies := make([]string, 0)
+	proxySet := make(map[string]bool)
+
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		matches := simpleProxyRegex.FindStringSubmatch(line)
+		if len(matches) < 3 {
+			continue
+		}
+
+		scheme := "socks5"
+		lowerLine := strings.ToLower(line)
+		switch {
+		case strings.Contains(lowerLine, "https://"):
+			scheme = "https"
+		case strings.Contains(lowerLine, "http://"):
+			scheme = "http"
+		case strings.Contains(lowerLine, "vmess://") || strings.Contains(lowerLine, "vmiss://"):
+			scheme = "vmess"
+		case strings.Contains(lowerLine, "vless://") || strings.Contains(lowerLine, "vliss://"):
+			scheme = "vless"
+		case strings.Contains(lowerLine, "hysteria2://") || strings.Contains(lowerLine, "hy2://"):
+			scheme = "hy2"
+		case strings.Contains(lowerLine, "socks5h://"):
+			scheme = "socks5h"
+		case strings.Contains(lowerLine, "socks5://"):
+			scheme = "socks5"
+		}
+
+		entry := fmt.Sprintf("%s://%s:%s", scheme, matches[1], matches[2])
+		if !proxySet[entry] {
+			proxySet[entry] = true
+			proxies = append(proxies, entry)
+		}
+	}
+
+	return proxies
+}
+
 func fetchProxyList() ([]string, error) {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
@@ -460,6 +661,245 @@ func fetchProxyList() ([]string, error) {
 
 	log.Printf("Total unique proxies fetched: %d", len(allProxies))
 	return allProxies, nil
+}
+
+func fetchMixedProxyList() ([]string, error) {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	allProxies := make([]string, 0)
+	proxySet := make(map[string]bool)
+
+	for _, sourceURL := range config.ProxyListURLs {
+		log.Printf("Fetching mixed proxy list from regular URL: %s", sourceURL)
+		resp, err := client.Get(sourceURL)
+		if err != nil {
+			log.Printf("Warning: Failed to fetch from %s: %v", sourceURL, err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("Warning: Unexpected status code %d from %s", resp.StatusCode, sourceURL)
+			resp.Body.Close()
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Printf("Warning: Error reading body from %s: %v", sourceURL, err)
+			continue
+		}
+
+		parsedProxies, format := parseRegularProxyContentMixed(string(body))
+		count := 0
+		for _, parsed := range parsedProxies {
+			if !proxySet[parsed] {
+				proxySet[parsed] = true
+				allProxies = append(allProxies, parsed)
+				count++
+			}
+		}
+		log.Printf("Fetched %d mixed proxies from regular URL %s (format=%s)", count, sourceURL, format)
+	}
+
+	for _, sourceURL := range config.SpecialProxyListUrls {
+		log.Printf("Fetching mixed proxy list from special URL: %s", sourceURL)
+		resp, err := client.Get(sourceURL)
+		if err != nil {
+			log.Printf("Warning: Failed to fetch from special URL %s: %v", sourceURL, err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("Warning: Unexpected status code %d from special URL %s", resp.StatusCode, sourceURL)
+			resp.Body.Close()
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Printf("Warning: Error reading body from special URL %s: %v", sourceURL, err)
+			continue
+		}
+
+		specialProxies := parseSpecialProxyURLMixed(string(body))
+		count := 0
+		for _, parsed := range specialProxies {
+			if !proxySet[parsed] {
+				proxySet[parsed] = true
+				allProxies = append(allProxies, parsed)
+				count++
+			}
+		}
+		log.Printf("Fetched %d mixed proxies from special URL %s", count, sourceURL)
+	}
+
+	if len(allProxies) == 0 {
+		return nil, fmt.Errorf("no mixed proxies fetched from any source")
+	}
+
+	log.Printf("Total unique mixed proxies fetched: %d", len(allProxies))
+	return allProxies, nil
+}
+
+func parseMixedProxy(entry string) (scheme string, addr string, err error) {
+	if strings.Contains(entry, "://") {
+		u, parseErr := url.Parse(entry)
+		if parseErr != nil || u.Host == "" {
+			return "", "", fmt.Errorf("invalid proxy entry: %s", entry)
+		}
+		s := normalizeMixedScheme(u.Scheme)
+		if s == "hysteria2" {
+			s = "hy2"
+		}
+		if !isSupportedMixedScheme(s) {
+			return "", "", fmt.Errorf("unsupported proxy scheme: %s", s)
+		}
+		return s, u.Host, nil
+	}
+
+	return "socks5", entry, nil
+}
+
+func checkCloudflareBypassMixed(proxyEntry string) bool {
+	if !config.CFChallengeCheck.Enabled {
+		return false
+	}
+
+	scheme, addr, err := parseMixedProxy(proxyEntry)
+	if err != nil {
+		return false
+	}
+
+	timeout := time.Duration(config.CFChallengeCheck.TimeoutSeconds) * time.Second
+	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+
+	if scheme == "socks5" || scheme == "socks5h" {
+		dialer, dialErr := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
+		if dialErr != nil {
+			return false
+		}
+		transport.DialContext = func(ctx context.Context, network, targetAddr string) (net.Conn, error) {
+			return dialer.Dial(network, targetAddr)
+		}
+	} else if scheme == "http" || scheme == "https" {
+		proxyURL, parseErr := url.Parse(fmt.Sprintf("%s://%s", scheme, addr))
+		if parseErr != nil {
+			return false
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+	} else {
+		return checkStreamProxyCFBypass(addr)
+	}
+
+	client := &http.Client{Transport: transport, Timeout: timeout}
+	req, err := http.NewRequest(http.MethodGet, config.CFChallengeCheck.URL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 DynamicProxy/1.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	allowed := false
+	for _, code := range config.CFChallengeCheck.ExpectedStatuses {
+		if resp.StatusCode == code {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return false
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return false
+	}
+	content := strings.ToLower(string(body))
+	for _, indicator := range config.CFChallengeCheck.BlockIndicators {
+		if indicator != "" && strings.Contains(content, strings.ToLower(indicator)) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func checkMixedProxyHealth(proxyEntry string, strictMode bool) bool {
+	scheme, addr, err := parseMixedProxy(proxyEntry)
+	if err != nil {
+		return false
+	}
+
+	if scheme == "socks5" || scheme == "socks5h" {
+		return checkProxyHealth(addr, strictMode)
+	}
+	if scheme == "vmess" || scheme == "vless" || scheme == "hy2" {
+		return checkStreamProxyTLSHealth(addr, strictMode)
+	}
+
+	threshold := time.Duration(config.HealthCheck.TLSHandshakeThresholdSeconds) * time.Second
+	totalTimeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
+
+	proxyURL, err := url.Parse(fmt.Sprintf("%s://%s", scheme, addr))
+	if err != nil {
+		return false
+	}
+
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: !strictMode,
+		},
+	}
+
+	client := &http.Client{Transport: transport, Timeout: totalTimeout}
+	start := time.Now()
+	resp, err := client.Get("https://www.google.com")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 500 {
+		return false
+	}
+
+	if time.Since(start) > threshold {
+		return false
+	}
+
+	return true
+}
+
+func checkStreamProxyTLSHealth(addr string, strictMode bool) bool {
+	totalTimeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
+	threshold := time.Duration(config.HealthCheck.TLSHandshakeThresholdSeconds) * time.Second
+
+	dialer := &net.Dialer{Timeout: totalTimeout}
+	start := time.Now()
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{InsecureSkipVerify: !strictMode})
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	if time.Since(start) > threshold {
+		return false
+	}
+
+	return true
+}
+
+func checkStreamProxyCFBypass(addr string) bool {
+	return checkStreamProxyTLSHealth(addr, false)
 }
 
 func checkCloudflareBypass(proxyAddr string) bool {
@@ -737,11 +1177,54 @@ func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *Prox
 	}
 }
 
-func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, initialSync bool) {
+func updateMixedProxyPool(mixedPool *ProxyPool, cfMixedPool *ProxyPool) {
+	if !atomic.CompareAndSwapInt32(&mixedPool.updating, 0, 1) {
+		log.Println("Mixed proxy update already in progress, skipping...")
+		return
+	}
+	defer atomic.StoreInt32(&mixedPool.updating, 0)
+
+	log.Println("Fetching mixed proxy list...")
+	proxies, err := fetchMixedProxyList()
+	if err != nil {
+		log.Printf("Error fetching mixed proxy list: %v", err)
+		return
+	}
+
+	mixedHealthy := make([]string, 0)
+	cfPassHealthy := make([]string, 0)
+	for _, proxyEntry := range proxies {
+		if checkMixedProxyHealth(proxyEntry, false) {
+			mixedHealthy = append(mixedHealthy, proxyEntry)
+			if config.CFChallengeCheck.Enabled && checkCloudflareBypassMixed(proxyEntry) {
+				cfPassHealthy = append(cfPassHealthy, proxyEntry)
+			}
+		}
+	}
+
+	if len(mixedHealthy) > 0 {
+		mixedPool.Update(mixedHealthy)
+		log.Printf("[HTTP-MIXED] Pool updated with %d healthy mixed proxies", len(mixedHealthy))
+	} else {
+		log.Println("[HTTP-MIXED] Warning: No healthy mixed proxies found, keeping existing pool")
+	}
+
+	if config.CFChallengeCheck.Enabled {
+		if len(cfPassHealthy) > 0 {
+			cfMixedPool.Update(cfPassHealthy)
+			log.Printf("[HTTP-CF-MIXED] Pool updated with %d CF-pass mixed proxies", len(cfPassHealthy))
+		} else {
+			log.Println("[HTTP-CF-MIXED] Warning: No CF-pass mixed proxies found, keeping existing pool")
+		}
+	}
+}
+
+func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, cfMixedPool *ProxyPool, initialSync bool) {
 	if initialSync {
 		// Initial update synchronously to ensure we have proxies before starting servers
 		log.Println("Performing initial proxy update...")
 		updateProxyPool(strictPool, relaxedPool, cfPool)
+		updateMixedProxyPool(mixedPool, cfMixedPool)
 	}
 
 	// Periodic updates - each update runs in its own goroutine to avoid blocking
@@ -750,6 +1233,7 @@ func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *Pr
 	go func() {
 		for range ticker.C {
 			go updateProxyPool(strictPool, relaxedPool, cfPool)
+			go updateMixedProxyPool(mixedPool, cfMixedPool)
 		}
 	}()
 }
@@ -886,26 +1370,65 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 
 	log.Printf("[HTTP-%s] Using proxy %s for %s %s", mode, proxyAddr, r.Method, r.URL.String())
 
-	// Create SOCKS5 dialer
-	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
+	scheme, upstreamAddr, err := parseMixedProxy(proxyAddr)
 	if err != nil {
-		log.Printf("[HTTP-%s] ERROR: Failed to create dialer for proxy %s: %v", mode, proxyAddr, err)
-		http.Error(w, "Failed to create proxy dialer", http.StatusInternalServerError)
+		log.Printf("[HTTP-%s] ERROR: Invalid proxy entry %s: %v", mode, proxyAddr, err)
+		http.Error(w, "Invalid upstream proxy", http.StatusInternalServerError)
 		return
 	}
 
 	// Handle CONNECT method for HTTPS
 	if r.Method == http.MethodConnect {
-		handleHTTPSProxy(w, r, dialer, proxyAddr, mode)
+		if scheme == "socks5" || scheme == "socks5h" {
+			dialer, dialErr := proxy.SOCKS5("tcp", upstreamAddr, nil, proxy.Direct)
+			if dialErr != nil {
+				log.Printf("[HTTP-%s] ERROR: Failed to create dialer for proxy %s: %v", mode, proxyAddr, dialErr)
+				http.Error(w, "Failed to create proxy dialer", http.StatusInternalServerError)
+				return
+			}
+			handleHTTPSProxy(w, r, func(target string) (net.Conn, error) {
+				return dialer.Dial("tcp", target)
+			}, proxyAddr, mode)
+			return
+		}
+		if scheme == "vmess" || scheme == "vless" || scheme == "hy2" {
+			log.Printf("[HTTP-%s] ERROR: Upstream %s is recognized but requires a dedicated client implementation", mode, scheme)
+			http.Error(w, "Recognized upstream protocol requires dedicated client implementation", http.StatusBadGateway)
+			return
+		}
+
+		handleHTTPSProxy(w, r, func(target string) (net.Conn, error) {
+			return dialTargetThroughHTTPProxy(scheme, upstreamAddr, target)
+		}, proxyAddr, mode)
 		return
 	}
 
-	// Handle regular HTTP requests
 	transport := &http.Transport{
-		Dial: dialer.Dial,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true, // Disable certificate verification
 		},
+	}
+
+	if scheme == "socks5" || scheme == "socks5h" {
+		dialer, dialErr := proxy.SOCKS5("tcp", upstreamAddr, nil, proxy.Direct)
+		if dialErr != nil {
+			log.Printf("[HTTP-%s] ERROR: Failed to create dialer for proxy %s: %v", mode, proxyAddr, dialErr)
+			http.Error(w, "Failed to create proxy dialer", http.StatusInternalServerError)
+			return
+		}
+		transport.Dial = dialer.Dial
+	} else if scheme == "http" || scheme == "https" {
+		proxyURL, parseErr := url.Parse(fmt.Sprintf("%s://%s", scheme, upstreamAddr))
+		if parseErr != nil {
+			log.Printf("[HTTP-%s] ERROR: Invalid upstream HTTP proxy %s: %v", mode, proxyAddr, parseErr)
+			http.Error(w, "Invalid upstream proxy", http.StatusInternalServerError)
+			return
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+	} else {
+		log.Printf("[HTTP-%s] ERROR: Upstream %s is recognized but requires a dedicated client implementation", mode, scheme)
+		http.Error(w, "Recognized upstream protocol requires dedicated client implementation", http.StatusBadGateway)
+		return
 	}
 
 	client := &http.Client{
@@ -952,11 +1475,11 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 	io.Copy(w, resp.Body)
 }
 
-func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, proxyAddr string, mode string) {
+func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetDial func(string) (net.Conn, error), proxyAddr string, mode string) {
 	log.Printf("[HTTPS-%s] Connecting to %s via proxy %s", mode, r.Host, proxyAddr)
 
-	// Connect to target through SOCKS5 proxy
-	targetConn, err := dialer.Dial("tcp", r.Host)
+	// Connect to target through upstream proxy
+	targetConn, err := targetDial(r.Host)
 	if err != nil {
 		log.Printf("[HTTPS-%s] ERROR: Failed to connect to %s via proxy %s: %v", mode, r.Host, proxyAddr, err)
 		http.Error(w, "Failed to connect to target", http.StatusBadGateway)
@@ -999,6 +1522,55 @@ func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, dialer proxy.Diale
 	}()
 
 	wg.Wait()
+}
+
+func dialTargetThroughHTTPProxy(proxyScheme string, proxyAddr string, targetHost string) (net.Conn, error) {
+	connectAddr := proxyAddr
+	if !strings.Contains(connectAddr, ":") {
+		if proxyScheme == "https" {
+			connectAddr += ":443"
+		} else {
+			connectAddr += ":80"
+		}
+	}
+
+	var conn net.Conn
+	var err error
+	if proxyScheme == "https" {
+		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", connectAddr, &tls.Config{InsecureSkipVerify: true})
+	} else {
+		conn, err = net.DialTimeout("tcp", connectAddr, 10*time.Second)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	connectReq := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: targetHost},
+		Host:   targetHost,
+		Header: make(http.Header),
+	}
+
+	if err := connectReq.Write(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, connectReq)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		conn.Close()
+		return nil, fmt.Errorf("http proxy CONNECT failed with status %s", resp.Status)
+	}
+
+	return conn, nil
 }
 
 func startHTTPServer(pool *ProxyPool, port string, mode string) error {
@@ -1094,9 +1666,11 @@ func main() {
 	strictPool := NewProxyPool()
 	relaxedPool := NewProxyPool()
 	cfPool := NewProxyPool()
+	mixedHTTPPool := NewProxyPool()
+	cfMixedHTTPPool := NewProxyPool()
 
 	// Start proxy updater with initial synchronous update
-	startProxyUpdater(strictPool, relaxedPool, cfPool, true)
+	startProxyUpdater(strictPool, relaxedPool, cfPool, mixedHTTPPool, cfMixedHTTPPool, true)
 
 	// Check proxy pool status
 	strictCount := len(strictPool.GetAll())
@@ -1116,9 +1690,9 @@ func main() {
 		log.Printf("[RELAXED] Successfully loaded %d healthy proxies", relaxedCount)
 	}
 
-	// Start servers (5 servers total)
+	// Start servers
 	var wg sync.WaitGroup
-	wg.Add(5)
+	wg.Add(7)
 
 	// SOCKS5 Strict
 	go func() {
@@ -1160,9 +1734,27 @@ func main() {
 		}
 	}()
 
+	// HTTP Mixed (HTTP/SOCKS5 upstream)
+	go func() {
+		defer wg.Done()
+		if err := startHTTPServer(mixedHTTPPool, config.Ports.HTTPMixed, "MIXED"); err != nil {
+			log.Fatalf("[MIXED] HTTP server error: %v", err)
+		}
+	}()
+
+	// HTTP Mixed CF-pass
+	go func() {
+		defer wg.Done()
+		if err := startHTTPServer(cfMixedHTTPPool, config.Ports.HTTPCFMixed, "CF-MIXED"); err != nil {
+			log.Fatalf("[CF-MIXED] HTTP server error: %v", err)
+		}
+	}()
+
 	log.Println("All servers started successfully")
 	log.Println("  [STRICT] SOCKS5: " + config.Ports.SOCKS5Strict + " | HTTP: " + config.Ports.HTTPStrict)
 	log.Println("  [RELAXED] SOCKS5: " + config.Ports.SOCKS5Relaxed + " | HTTP: " + config.Ports.HTTPRelaxed)
+	log.Println("  [MIXED] HTTP (SOCKS5/HTTP upstream): " + config.Ports.HTTPMixed)
+	log.Println("  [CF-MIXED] HTTP (CF-pass SOCKS5/HTTP upstream): " + config.Ports.HTTPCFMixed)
 	log.Println("  [ROTATE] Control: " + config.Ports.RotateControl)
 	log.Printf("Proxy pools will update every %d minutes in background...", config.UpdateIntervalMinutes)
 	wg.Wait()
