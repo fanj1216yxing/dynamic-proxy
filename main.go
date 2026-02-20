@@ -668,12 +668,42 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 }
 
 func normalizeVMESSURI(raw string) (string, bool) {
-	encoded := strings.TrimSpace(strings.TrimPrefix(raw, "vmess://"))
-	if idx := strings.IndexAny(encoded, "?#"); idx >= 0 {
-		encoded = encoded[:idx]
-	}
-	if encoded == "" {
+	node, ok := parseVMESSNode(raw)
+	if !ok {
 		return "", false
+	}
+	payload, err := json.Marshal(node)
+	if err != nil {
+		return "", false
+	}
+	return "vmess://" + base64.StdEncoding.EncodeToString(payload), true
+}
+
+type vmessNode struct {
+	V    string `json:"v,omitempty"`
+	Ps   string `json:"ps,omitempty"`
+	Add  string `json:"add,omitempty"`
+	Port string `json:"port,omitempty"`
+	ID   string `json:"id,omitempty"`
+	Aid  string `json:"aid,omitempty"`
+	Net  string `json:"net,omitempty"`
+	Type string `json:"type,omitempty"`
+	Host string `json:"host,omitempty"`
+	Path string `json:"path,omitempty"`
+	TLS  string `json:"tls,omitempty"`
+	SNI  string `json:"sni,omitempty"`
+}
+
+func parseVMESSNode(raw string) (vmessNode, bool) {
+	var node vmessNode
+	trimmed := strings.TrimSpace(raw)
+	if !strings.HasPrefix(strings.ToLower(trimmed), "vmess://") {
+		return node, false
+	}
+
+	encoded := strings.TrimSpace(strings.TrimPrefix(trimmed, "vmess://"))
+	if idx := strings.Index(encoded, "#"); idx >= 0 {
+		encoded = encoded[:idx]
 	}
 
 	decoders := []func(string) ([]byte, error){
@@ -682,68 +712,68 @@ func normalizeVMESSURI(raw string) (string, bool) {
 		base64.URLEncoding.DecodeString,
 		base64.RawURLEncoding.DecodeString,
 	}
-	var payload []byte
-	var err error
-	decodedOK := false
 	for _, decode := range decoders {
-		payload, err = decode(encoded)
-		if err == nil {
-			decodedOK = true
-			break
+		payload, err := decode(encoded)
+		if err != nil {
+			continue
+		}
+		if jsonErr := json.Unmarshal(payload, &node); jsonErr == nil {
+			node.Add = strings.TrimSpace(node.Add)
+			node.Port = strings.TrimSpace(node.Port)
+			if node.Add != "" && node.Port != "" {
+				if node.V == "" {
+					node.V = "2"
+				}
+				if node.Type == "" {
+					node.Type = "none"
+				}
+				return node, true
+			}
 		}
 	}
-	if !decodedOK {
-		return "", false
-	}
 
-	var node struct {
-		Add  string      `json:"add"`
-		Port interface{} `json:"port"`
-		ID   string      `json:"id"`
-		Net  string      `json:"net"`
-		Host string      `json:"host"`
-		Path string      `json:"path"`
-		TLS  string      `json:"tls"`
-		SNI  string      `json:"sni"`
-		Aid  interface{} `json:"aid"`
+	u, err := url.Parse(trimmed)
+	if err != nil || u.Host == "" {
+		return node, false
 	}
-	if err := json.Unmarshal(payload, &node); err != nil {
-		return "", false
+	host := u.Hostname()
+	port := u.Port()
+	if host == "" || port == "" {
+		return node, false
 	}
-	port := strings.TrimSpace(fmt.Sprintf("%v", node.Port))
-	if node.Add == "" || port == "" || port == "<nil>" {
-		return "", false
+	q := u.Query()
+	node = vmessNode{
+		V:    "2",
+		Add:  host,
+		Port: port,
+		ID:   strings.TrimSpace(q.Get("id")),
+		Aid:  strings.TrimSpace(q.Get("aid")),
+		Net:  strings.TrimSpace(q.Get("net")),
+		Type: strings.TrimSpace(q.Get("type")),
+		Host: strings.TrimSpace(q.Get("host")),
+		Path: strings.TrimSpace(q.Get("path")),
+		TLS:  strings.TrimSpace(q.Get("tls")),
+		SNI:  strings.TrimSpace(q.Get("sni")),
 	}
-	host := net.JoinHostPort(node.Add, port)
-	query := url.Values{}
-	if node.ID != "" {
-		query.Set("id", node.ID)
+	if node.Net == "" {
+		node.Net = strings.TrimSpace(q.Get("network"))
 	}
-	if node.Net != "" {
-		query.Set("type", node.Net)
+	if node.Net == "" {
+		node.Net = strings.TrimSpace(q.Get("type"))
 	}
-	if node.Host != "" {
-		query.Set("host", node.Host)
+	if node.Type == "" {
+		node.Type = "none"
 	}
-	if node.Path != "" {
-		query.Set("path", node.Path)
+	if node.TLS == "" {
+		node.TLS = strings.TrimSpace(q.Get("security"))
 	}
-	if node.TLS != "" {
-		query.Set("security", node.TLS)
+	if node.TLS == "" && strings.EqualFold(strings.TrimSpace(q.Get("security")), "tls") {
+		node.TLS = "tls"
 	}
-	if node.SNI != "" {
-		query.Set("sni", node.SNI)
+	if node.Add == "" || node.Port == "" {
+		return vmessNode{}, false
 	}
-	aid := strings.TrimSpace(fmt.Sprintf("%v", node.Aid))
-	if aid != "" && aid != "<nil>" {
-		query.Set("aid", aid)
-	}
-
-	if encodedQuery := query.Encode(); encodedQuery != "" {
-		return fmt.Sprintf("vmess://%s?%s", host, encodedQuery), true
-	}
-
-	return fmt.Sprintf("vmess://%s", host), true
+	return node, true
 }
 
 func normalizeSSRURI(raw string) (string, bool) {
@@ -1171,6 +1201,14 @@ func fetchMixedProxyList() ([]string, error) {
 
 func parseMixedProxy(entry string) (scheme string, addr string, auth *proxy.Auth, httpAuthHeader string, err error) {
 	if strings.Contains(entry, "://") {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(entry)), "vmess://") {
+			node, ok := parseVMESSNode(entry)
+			if !ok {
+				return "", "", nil, "", fmt.Errorf("invalid vmess entry: %s", entry)
+			}
+			return "vmess", net.JoinHostPort(node.Add, node.Port), nil, "", nil
+		}
+
 		u, parseErr := url.Parse(entry)
 		if parseErr != nil || u.Host == "" {
 			return "", "", nil, "", fmt.Errorf("invalid proxy entry: %s", entry)
@@ -2162,7 +2200,7 @@ func startHTTPServer(pool *ProxyPool, fallbackPool *ProxyPool, port string, mode
 	return server.ListenAndServe()
 }
 
-func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, port string) error {
+func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool, port string) error {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !validateBasicAuth(r) {
 			requireBasicAuth(w, "ROTATE")
@@ -2173,18 +2211,21 @@ func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfP
 		case "/", "/rotate":
 			strictProxy, strictErr := strictPool.ForceRotate()
 			relaxedProxy, relaxedErr := relaxedPool.ForceRotate()
+			mixedProxy, mixedErr := mixedPool.ForceRotate()
+			mainstreamProxy, mainstreamErr := mainstreamMixedPool.ForceRotate()
+			cfMixedProxy, cfMixedErr := cfMixedPool.ForceRotate()
 
-			if strictErr != nil && relaxedErr != nil {
-				log.Printf("[ROTATE] ERROR: rotate failed (strict=%v, relaxed=%v)", strictErr, relaxedErr)
+			if strictErr != nil && relaxedErr != nil && mixedErr != nil && mainstreamErr != nil && cfMixedErr != nil {
+				log.Printf("[ROTATE] ERROR: rotate failed (strict=%v, relaxed=%v, mixed=%v, mainstream=%v, cf_mixed=%v)", strictErr, relaxedErr, mixedErr, mainstreamErr, cfMixedErr)
 				http.Error(w, "Rotate failed: no available proxies", http.StatusServiceUnavailable)
 				return
 			}
 
-			log.Printf("[ROTATE] Manual rotate triggered from %s | strict=%s err=%v | relaxed=%s err=%v",
-				r.RemoteAddr, strictProxy, strictErr, relaxedProxy, relaxedErr)
+			log.Printf("[ROTATE] Manual rotate triggered from %s | strict=%s err=%v | relaxed=%s err=%v | mixed=%s err=%v | mainstream=%s err=%v | cf_mixed=%s err=%v",
+				r.RemoteAddr, strictProxy, strictErr, relaxedProxy, relaxedErr, mixedProxy, mixedErr, mainstreamProxy, mainstreamErr, cfMixedProxy, cfMixedErr)
 
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			fmt.Fprintf(w, "rotate success\nstrict: %s\nrelaxed: %s\n", strictProxy, relaxedProxy)
+			fmt.Fprintf(w, "rotate success\nstrict: %s\nrelaxed: %s\nmixed: %s\nmainstream: %s\ncf_mixed: %s\n", strictProxy, relaxedProxy, mixedProxy, mainstreamProxy, cfMixedProxy)
 		case "/cf-proxies":
 			proxies := cfPool.GetAll()
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -2196,16 +2237,28 @@ func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfP
 			strictProxies := strictPool.GetAll()
 			relaxedProxies := relaxedPool.GetAll()
 			cfProxies := cfPool.GetAll()
+			mixedProxies := mixedPool.GetAll()
+			mainstreamProxies := mainstreamMixedPool.GetAll()
+			cfMixedProxies := cfMixedPool.GetAll()
 			strictCurrent, _ := strictPool.GetCurrent()
 			relaxedCurrent, _ := relaxedPool.GetCurrent()
+			mixedCurrent, _ := mixedPool.GetCurrent()
+			mainstreamCurrent, _ := mainstreamMixedPool.GetCurrent()
+			cfMixedCurrent, _ := cfMixedPool.GetCurrent()
 
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"strict_proxy_count":    len(strictProxies),
-				"strict_current_proxy":  strictCurrent,
-				"relaxed_proxy_count":   len(relaxedProxies),
-				"relaxed_current_proxy": relaxedCurrent,
-				"cf_proxy_count":        len(cfProxies),
+				"strict_proxy_count":       len(strictProxies),
+				"strict_current_proxy":     strictCurrent,
+				"relaxed_proxy_count":      len(relaxedProxies),
+				"relaxed_current_proxy":    relaxedCurrent,
+				"cf_proxy_count":           len(cfProxies),
+				"mixed_proxy_count":        len(mixedProxies),
+				"mixed_current_proxy":      mixedCurrent,
+				"mainstream_proxy_count":   len(mainstreamProxies),
+				"mainstream_current_proxy": mainstreamCurrent,
+				"cf_mixed_proxy_count":     len(cfMixedProxies),
+				"cf_mixed_current_proxy":   cfMixedCurrent,
 			})
 		default:
 			http.NotFound(w, r)
@@ -2424,7 +2477,7 @@ func main() {
 	// Rotate Control
 	go func() {
 		defer wg.Done()
-		if err := startRotateControlServer(strictPool, relaxedPool, cfPool, config.Ports.RotateControl); err != nil {
+		if err := startRotateControlServer(strictPool, relaxedPool, cfPool, mixedHTTPPool, mainstreamMixedHTTPPool, cfMixedHTTPPool, config.Ports.RotateControl); err != nil {
 			log.Fatalf("[ROTATE] Control server error: %v", err)
 		}
 	}()
