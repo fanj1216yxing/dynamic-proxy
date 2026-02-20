@@ -693,8 +693,10 @@ func normalizeSSURI(raw string) (string, bool) {
 
 func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dialAddr string, useAuth bool) {
 	switch scheme {
-	case "vmess", "vless", "hy2", "hysteria2", "trojan":
+	case "vmess":
 		return "https", overridePort(addr, mainstreamMixedRelayPort), false
+	case "vless", "hy2", "hysteria2", "trojan":
+		return "https", overridePort(addr, mainstreamMixedRelayPort), true
 	case "ss":
 		return "socks5", overridePort(addr, mainstreamMixedRelayPort), false
 	default:
@@ -737,6 +739,10 @@ func parseSpecialProxyURLMixed(content string) []string {
 			scheme = "socks5h"
 		case strings.Contains(lowerLine, "socks5://"):
 			scheme = "socks5"
+		case strings.Contains(lowerLine, "ss://"):
+			scheme = "ss"
+		case strings.Contains(lowerLine, "trojan://"):
+			scheme = "trojan"
 		case strings.Contains(lowerLine, "vmess://"):
 			scheme = "vmess"
 		case strings.Contains(lowerLine, "vless://"):
@@ -1485,9 +1491,9 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 
 	if len(mainstreamHealthy) > 0 {
 		mainstreamMixedPool.Update(mainstreamHealthy)
-		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy VMESS/VLESS/HY2 mixed proxies", len(mainstreamHealthy))
+		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy mainstream mixed proxies (vmess/vless/ss/trojan/hy2/hysteria2)", len(mainstreamHealthy))
 	} else {
-		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy VMESS/VLESS/HY2 mixed proxies found, keeping existing pool")
+		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy mainstream mixed proxies (vmess/vless/ss/trojan/hy2/hysteria2) found, keeping existing pool")
 	}
 
 	if config.CFChallengeCheck.Enabled {

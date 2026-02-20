@@ -151,14 +151,65 @@ func TestNormalizeMixedProxyEntry_SSBase64(t *testing.T) {
 }
 
 func TestResolveMixedDialTarget_NonHTTPSocksUse17290(t *testing.T) {
-	dialScheme, dialAddr, useAuth := resolveMixedDialTarget("trojan", "8.8.8.8:443")
+	dialScheme, dialAddr, useAuth := resolveMixedDialTarget("vless", "8.8.8.8:443")
 	if dialScheme != "https" {
 		t.Fatalf("expected https dial scheme, got %s", dialScheme)
 	}
 	if dialAddr != "8.8.8.8:17290" {
 		t.Fatalf("expected 17290 relay port, got %s", dialAddr)
 	}
+	if !useAuth {
+		t.Fatalf("expected relay mode to preserve upstream auth for vless")
+	}
+}
+
+func TestParseSpecialProxyURLMixed_RecognizesMainstreamSchemes(t *testing.T) {
+	content := strings.Join([]string{
+		"trojan://password@1.2.3.4:443 # trojan node",
+		"ss://5.6.7.8:443 # ss node",
+	}, "\n")
+
+	proxies := parseSpecialProxyURLMixed(content)
+	if len(proxies) != 2 {
+		t.Fatalf("expected 2 parsed proxies, got %d (%v)", len(proxies), proxies)
+	}
+
+	mainstream := filterMixedProxiesByScheme(proxies, mainstreamMixedSchemes)
+	if len(mainstream) != 2 {
+		t.Fatalf("expected 2 mainstream proxies, got %d (%v)", len(mainstream), mainstream)
+	}
+}
+
+func TestResolveMixedDialTarget_VMesseRelayDisablesAuth(t *testing.T) {
+	dialScheme, dialAddr, useAuth := resolveMixedDialTarget("vmess", "8.8.4.4:443")
+	if dialScheme != "https" {
+		t.Fatalf("expected https dial scheme, got %s", dialScheme)
+	}
+	if dialAddr != "8.8.4.4:17290" {
+		t.Fatalf("expected 17290 relay port, got %s", dialAddr)
+	}
 	if useAuth {
-		t.Fatalf("expected relay mode to disable upstream auth")
+		t.Fatalf("expected vmess relay mode to disable upstream auth")
+	}
+}
+
+func TestParseMixedProxy_VLESSAuthPreservedForRelay(t *testing.T) {
+	scheme, addr, auth, httpAuthHeader, err := parseMixedProxy("vless://uuid-123@9.9.9.9:443")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if scheme != "vless" || addr != "9.9.9.9:443" {
+		t.Fatalf("unexpected parsed proxy: %s %s", scheme, addr)
+	}
+	if auth == nil || auth.User != "uuid-123" {
+		t.Fatalf("expected vless uuid to be captured as auth user, got %#v", auth)
+	}
+	if httpAuthHeader == "" {
+		t.Fatalf("expected Proxy-Authorization header to be generated")
+	}
+
+	_, _, useAuth := resolveMixedDialTarget(scheme, addr)
+	if !useAuth {
+		t.Fatalf("expected vless relay path to keep auth")
 	}
 }
