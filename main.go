@@ -413,8 +413,6 @@ var mainstreamMixedExcludedSchemes = map[string]bool{
 	"socks5h": true,
 }
 
-const mainstreamMixedRelayPort = "17290"
-
 func parseClashSubscription(content string) ([]string, bool) {
 	var sub clashSubscription
 	if err := yaml.Unmarshal([]byte(content), &sub); err != nil || len(sub.Proxies) == 0 {
@@ -704,11 +702,9 @@ func normalizeSSURI(raw string) (string, bool) {
 func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dialAddr string, useAuth bool) {
 	switch scheme {
 	case "vmess":
-		return "http", overridePort(addr, mainstreamMixedRelayPort), false
+		return "http", addr, false
 	case "vless", "hy2", "hysteria2", "trojan":
-		return "http", overridePort(addr, mainstreamMixedRelayPort), true
-	case "ss":
-		return "socks5", overridePort(addr, mainstreamMixedRelayPort), false
+		return "http", addr, true
 	default:
 		return scheme, addr, true
 	}
@@ -716,7 +712,7 @@ func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dial
 
 func isMainstreamMixedScheme(scheme string) bool {
 	switch scheme {
-	case "vmess", "vless", "ss", "trojan", "hy2", "hysteria2":
+	case "vmess", "vless", "trojan", "hy2", "hysteria2":
 		return true
 	default:
 		return false
@@ -725,7 +721,7 @@ func isMainstreamMixedScheme(scheme string) bool {
 
 func hasRequiredMainstreamAuth(scheme string, auth *proxy.Auth) bool {
 	switch scheme {
-	case "vless", "ss", "trojan", "hy2", "hysteria2":
+	case "vless", "trojan", "hy2", "hysteria2":
 		return auth != nil && strings.TrimSpace(auth.User) != ""
 	default:
 		return true
@@ -744,14 +740,6 @@ func checkMainstreamProxyHealth(scheme string, addr string, auth *proxy.Auth) bo
 	}
 	_ = conn.Close()
 	return true
-}
-
-func overridePort(addr string, newPort string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr
-	}
-	return net.JoinHostPort(host, newPort)
 }
 
 func parseSpecialProxyURLMixed(content string) []string {
