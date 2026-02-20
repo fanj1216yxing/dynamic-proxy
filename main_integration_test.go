@@ -150,6 +150,18 @@ func TestIntegration_NonStandardConfigAndMainstreamPool(t *testing.T) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+
+	mainstreamEntries := mainstreamPool.GetAll()
+	joinedMainstream := strings.Join(mainstreamEntries, "\n")
+	if !strings.Contains(joinedMainstream, "vmess://127.0.0.1:18080") {
+		t.Fatalf("missing vmess in mainstream pool: %v", mainstreamEntries)
+	}
+	if !strings.Contains(joinedMainstream, "vless://22222222-2222-2222-2222-222222222222@127.0.0.1:18081") {
+		t.Fatalf("missing vless in mainstream pool: %v", mainstreamEntries)
+	}
+	if !strings.Contains(joinedMainstream, "hy2://hy2-secret@127.0.0.1:18082") {
+		t.Fatalf("missing hy2 in mainstream pool: %v", mainstreamEntries)
+	}
 }
 
 func TestIntegration_VlessHy2AuthRequired(t *testing.T) {
@@ -243,6 +255,69 @@ func TestListEndpointForHTTPProxyPool(t *testing.T) {
 	}
 	if payload["current_proxy"].(string) == "" {
 		t.Fatalf("current_proxy should not be empty: %+v", payload)
+	}
+}
+
+func TestPoolStatusEndpointSchemeCounts(t *testing.T) {
+	cfg := Config{}
+	config = cfg
+
+	strictPool := NewProxyPool(time.Minute, false)
+	relaxedPool := NewProxyPool(time.Minute, false)
+	cfPool := NewProxyPool(time.Minute, false)
+	httpSocksPool := NewProxyPool(time.Minute, false)
+	mainstreamPool := NewProxyPool(time.Minute, false)
+	cfMixedPool := NewProxyPool(time.Minute, false)
+
+	httpSocksPool.Update([]string{"http://127.0.0.1:18080", "socks5://127.0.0.1:18081"})
+	mainstreamPool.Update([]string{"vmess://127.0.0.1:18082", "vless://u:p@127.0.0.1:18083", "https://127.0.0.1:18084"})
+
+	req := httptest.NewRequest(http.MethodGet, "http://local/list", nil)
+	rr := httptest.NewRecorder()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/list" {
+			http.NotFound(w, r)
+			return
+		}
+		strictCurrent, _ := strictPool.GetCurrent()
+		relaxedCurrent, _ := relaxedPool.GetCurrent()
+		cfCurrent, _ := cfPool.GetCurrent()
+		httpSocksCurrent, _ := httpSocksPool.GetCurrent()
+		mainstreamCurrent, _ := mainstreamPool.GetCurrent()
+		cfMixedCurrent, _ := cfMixedPool.GetCurrent()
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"strict_proxy_count":       len(strictPool.GetAll()),
+			"strict_current_proxy":     strictCurrent,
+			"relaxed_proxy_count":      len(relaxedPool.GetAll()),
+			"relaxed_current_proxy":    relaxedCurrent,
+			"cf_proxy_count":           len(cfPool.GetAll()),
+			"cf_current_proxy":         cfCurrent,
+			"http_socks_proxy_count":   len(httpSocksPool.GetAll()),
+			"http_socks_current_proxy": httpSocksCurrent,
+			"mainstream_proxy_count":   len(mainstreamPool.GetAll()),
+			"mainstream_current_proxy": mainstreamCurrent,
+			"cf_mixed_proxy_count":     len(cfMixedPool.GetAll()),
+			"cf_mixed_current_proxy":   cfMixedCurrent,
+			"http_socks_scheme_count":  countMixedProxySchemes(httpSocksPool.GetAll()),
+			"mainstream_scheme_count":  countMixedProxySchemes(mainstreamPool.GetAll()),
+		})
+	})
+
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	mainstreamSchemes := payload["mainstream_scheme_count"].(map[string]interface{})
+	if int(mainstreamSchemes["vmess"].(float64)) != 1 || int(mainstreamSchemes["vless"].(float64)) != 1 {
+		t.Fatalf("unexpected mainstream scheme counts: %+v", mainstreamSchemes)
 	}
 }
 

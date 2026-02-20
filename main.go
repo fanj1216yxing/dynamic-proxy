@@ -402,20 +402,11 @@ var mixedSupportedSchemes = map[string]bool{
 }
 
 var httpSocksMixedSchemes = map[string]bool{
-	"http":    true,
-	"https":   true,
-	"socks5":  true,
-	"socks5h": true,
+	"http":   true,
+	"socks5": true,
 }
 
-var mainstreamMixedSchemes = map[string]bool{
-	"vmess":     true,
-	"vless":     true,
-	"ss":        true,
-	"trojan":    true,
-	"hy2":       true,
-	"hysteria2": true,
-}
+var mainstreamMixedExcludedSchemes = map[string]bool{"http": true, "socks5": true}
 
 const mainstreamMixedRelayPort = "17290"
 
@@ -1462,6 +1453,19 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 	return MixedHealthCheckResult{Healthy: mixedHealthy, CFPass: cfPassHealthy}
 }
 
+func countMixedProxySchemes(entries []string) map[string]int {
+	counts := make(map[string]int)
+	for _, entry := range entries {
+		scheme, _, _, _, err := parseMixedProxy(entry)
+		if err != nil {
+			counts["invalid"]++
+			continue
+		}
+		counts[scheme]++
+	}
+	return counts
+}
+
 func filterMixedProxiesByScheme(entries []string, allowed map[string]bool) []string {
 	filtered := make([]string, 0, len(entries))
 	for _, entry := range entries {
@@ -1470,6 +1474,20 @@ func filterMixedProxiesByScheme(entries []string, allowed map[string]bool) []str
 			continue
 		}
 		if allowed[scheme] {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+func filterMixedProxiesByExcludedScheme(entries []string, excluded map[string]bool) []string {
+	filtered := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		scheme, _, _, _, err := parseMixedProxy(entry)
+		if err != nil {
+			continue
+		}
+		if !excluded[scheme] {
 			filtered = append(filtered, entry)
 		}
 	}
@@ -1491,11 +1509,15 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 	}
 
 	log.Printf("Fetched %d mixed proxies, starting health check...", len(proxies))
+	log.Printf("[MIXED] Source scheme distribution: %+v", countMixedProxySchemes(proxies))
 	result := healthCheckMixedProxies(proxies)
 
 	httpSocksHealthy := filterMixedProxiesByScheme(result.Healthy, httpSocksMixedSchemes)
-	mainstreamHealthy := filterMixedProxiesByScheme(result.Healthy, mainstreamMixedSchemes)
+	mainstreamHealthy := filterMixedProxiesByExcludedScheme(result.Healthy, mainstreamMixedExcludedSchemes)
+	log.Printf("[MIXED] Healthy scheme distribution: %+v", countMixedProxySchemes(result.Healthy))
 	log.Printf("[MIXED] Health check split result: total_healthy=%d http_socks=%d mainstream=%d", len(result.Healthy), len(httpSocksHealthy), len(mainstreamHealthy))
+	log.Printf("[HTTP-MIXED] Scheme distribution: %+v", countMixedProxySchemes(httpSocksHealthy))
+	log.Printf("[HTTP-MAINSTREAM-MIXED] Scheme distribution: %+v", countMixedProxySchemes(mainstreamHealthy))
 
 	if len(httpSocksHealthy) > 0 {
 		mixedPool.Update(httpSocksHealthy)
@@ -1506,12 +1528,9 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 
 	if len(mainstreamHealthy) > 0 {
 		mainstreamMixedPool.Update(mainstreamHealthy)
-		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy mainstream mixed proxies (vmess/vless/ss/trojan/hy2/hysteria2)", len(mainstreamHealthy))
+		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy non-http/socks5 mixed proxies", len(mainstreamHealthy))
 	} else {
-		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy mainstream mixed proxies (vmess/vless/ss/trojan/hy2/hysteria2) found, keeping existing pool")
-		if len(httpSocksHealthy) > 0 {
-			log.Printf("[HTTP-MAINSTREAM-MIXED] Fallback available: %d healthy HTTP/SOCKS proxies can serve :17290 when mainstream pool is empty", len(httpSocksHealthy))
-		}
+		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy non-http/socks5 mixed proxies found, keeping existing pool")
 	}
 
 	if config.CFChallengeCheck.Enabled {
@@ -1991,6 +2010,55 @@ func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfP
 	return server.ListenAndServe()
 }
 
+func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool, port string) error {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/list" {
+			http.NotFound(w, r)
+			return
+		}
+
+		strictCurrent, _ := strictPool.GetCurrent()
+		relaxedCurrent, _ := relaxedPool.GetCurrent()
+		cfCurrent, _ := cfPool.GetCurrent()
+		mixedCurrent, _ := mixedPool.GetCurrent()
+		mainstreamCurrent, _ := mainstreamMixedPool.GetCurrent()
+		cfMixedCurrent, _ := cfMixedPool.GetCurrent()
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		strictAll := strictPool.GetAll()
+		relaxedAll := relaxedPool.GetAll()
+		cfAll := cfPool.GetAll()
+		httpSocksAll := mixedPool.GetAll()
+		mainstreamAll := mainstreamMixedPool.GetAll()
+		cfMixedAll := cfMixedPool.GetAll()
+
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"strict_proxy_count":            len(strictAll),
+			"strict_current_proxy":          strictCurrent,
+			"relaxed_proxy_count":           len(relaxedAll),
+			"relaxed_current_proxy":         relaxedCurrent,
+			"cf_proxy_count":                len(cfAll),
+			"cf_current_proxy":              cfCurrent,
+			"http_socks_proxy_count":        len(httpSocksAll),
+			"http_socks_current_proxy":      mixedCurrent,
+			"mainstream_proxy_count":        len(mainstreamAll),
+			"mainstream_current_proxy":      mainstreamCurrent,
+			"cf_mixed_proxy_count":          len(cfMixedAll),
+			"cf_mixed_current_proxy":        cfMixedCurrent,
+			"http_socks_scheme_count":       countMixedProxySchemes(httpSocksAll),
+			"mainstream_scheme_count":       countMixedProxySchemes(mainstreamAll),
+			"cf_mixed_scheme_count":         countMixedProxySchemes(cfMixedAll),
+			"mainstream_listen_port":        config.Ports.HTTPMainstreamMix,
+			"status_listen_addr":            port,
+			"mainstream_excluded_protocols": []string{"http", "socks5"},
+		})
+	})
+
+	server := &http.Server{Addr: port, Handler: handler}
+	log.Printf("[STATUS] Pool status server listening on %s", port)
+	return server.ListenAndServe()
+}
+
 func startProxyConnectivityMonitor(pool *ProxyPool, mode string, interval time.Duration, checker func(string) bool) {
 	if interval <= 0 {
 		interval = connectivityCheckInterval
@@ -2118,7 +2186,7 @@ func main() {
 
 	// Start servers
 	var wg sync.WaitGroup
-	wg.Add(8)
+	wg.Add(9)
 
 	// SOCKS5 Strict
 	go func() {
@@ -2179,8 +2247,16 @@ func main() {
 	// HTTP Mainstream Mixed (VMESS/VLESS/HY2 upstream)
 	go func() {
 		defer wg.Done()
-		if err := startHTTPServer(mainstreamMixedHTTPPool, mixedHTTPPool, config.Ports.HTTPMainstreamMix, "MAINSTREAM-MIXED"); err != nil {
+		if err := startHTTPServer(mainstreamMixedHTTPPool, nil, config.Ports.HTTPMainstreamMix, "MAINSTREAM-MIXED"); err != nil {
 			log.Fatalf("[MAINSTREAM-MIXED] HTTP server error: %v", err)
+		}
+	}()
+
+	// Pool status endpoint
+	go func() {
+		defer wg.Done()
+		if err := startPoolStatusServer(strictPool, relaxedPool, cfPool, mixedHTTPPool, mainstreamMixedHTTPPool, cfMixedHTTPPool, ":17233"); err != nil {
+			log.Fatalf("[STATUS] Server error: %v", err)
 		}
 	}()
 
@@ -2188,9 +2264,10 @@ func main() {
 	log.Println("  [STRICT] SOCKS5: " + config.Ports.SOCKS5Strict + " | HTTP: " + config.Ports.HTTPStrict)
 	log.Println("  [RELAXED] SOCKS5: " + config.Ports.SOCKS5Relaxed + " | HTTP: " + config.Ports.HTTPRelaxed)
 	log.Println("  [MIXED] HTTP (HTTP/SOCKS upstream): " + config.Ports.HTTPMixed)
-	log.Println("  [MAINSTREAM-MIXED] HTTP (VMESS/VLESS/HY2 upstream): " + config.Ports.HTTPMainstreamMix)
+	log.Println("  [MAINSTREAM-MIXED] HTTP (all non-http/socks5 upstream): " + config.Ports.HTTPMainstreamMix)
 	log.Println("  [CF-MIXED] HTTP (CF-pass SOCKS5/HTTP upstream): " + config.Ports.HTTPCFMixed)
 	log.Println("  [ROTATE] Control: " + config.Ports.RotateControl)
+	log.Println("  [STATUS] Pool list: :17233/list")
 	log.Printf("Proxy pools will update every %d minutes in background...", config.UpdateIntervalMinutes)
 	log.Printf("Auto connectivity monitor enabled: checks every %s and rotates unhealthy current proxy", connectivityCheckInterval)
 	wg.Wait()
