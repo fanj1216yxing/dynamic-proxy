@@ -49,6 +49,7 @@ type Config struct {
 		HTTPMainstreamMix string `yaml:"http_mainstream_mixed"`
 		HTTPCFMixed       string `yaml:"http_cf_mixed"`
 		RotateControl     string `yaml:"rotate_control"`
+		StatusControl     string `yaml:"status_control"`
 	} `yaml:"ports"`
 	Auth struct {
 		Username string `yaml:"username"`
@@ -67,6 +68,9 @@ type Config struct {
 var config Config
 
 const connectivityCheckInterval = 10 * time.Second
+const defaultMixedHealthCheckURL = "https://www.google.com"
+
+var mixedHealthCheckURL = defaultMixedHealthCheckURL
 
 // Simple regex to extract ip:port from any format (used for special proxy lists)
 // Matches: [IP]:[port] and ignores any protocol prefixes or extra text
@@ -127,6 +131,9 @@ func loadConfig(filename string) (*Config, error) {
 	if cfg.Ports.RotateControl == "" {
 		cfg.Ports.RotateControl = ":9090"
 	}
+	if cfg.Ports.StatusControl == "" {
+		cfg.Ports.StatusControl = ":17920"
+	}
 
 	if cfg.CFChallengeCheck.Enabled {
 		if cfg.CFChallengeCheck.URL == "" {
@@ -178,6 +185,12 @@ func requireHTTPProxyAuth(w http.ResponseWriter, mode string) {
 func requireBasicAuth(w http.ResponseWriter, mode string) {
 	w.Header().Set("WWW-Authenticate", `Basic realm="Dynamic Proxy Rotate Control"`)
 	log.Printf("[%s] Unauthorized request rejected", mode)
+	http.Error(w, "Authentication required", http.StatusUnauthorized)
+}
+
+func requireListBasicAuth(w http.ResponseWriter, mode string) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="Dynamic Proxy List"`)
+	log.Printf("[%s] /list unauthorized request rejected", mode)
 	http.Error(w, "Authentication required", http.StatusUnauthorized)
 }
 
@@ -380,6 +393,7 @@ type clashSubscription struct {
 		Port     int    `yaml:"port"`
 		Username string `yaml:"username"`
 		Password string `yaml:"password"`
+		UUID     string `yaml:"uuid"`
 		Cipher   string `yaml:"cipher"`
 	} `yaml:"proxies"`
 }
@@ -521,6 +535,16 @@ func parseClashSubscriptionMixed(content string) ([]string, bool) {
 				continue
 			}
 			entry = fmt.Sprintf("ss://%s:%s@%s", url.QueryEscape(p.Cipher), url.QueryEscape(p.Password), host)
+		case "vless":
+			if p.UUID == "" {
+				continue
+			}
+			entry = fmt.Sprintf("vless://%s@%s", url.QueryEscape(p.UUID), host)
+		case "hy2", "hysteria2":
+			if p.Password == "" {
+				continue
+			}
+			entry = fmt.Sprintf("%s://%s@%s", proxyType, url.QueryEscape(p.Password), host)
 		case "trojan":
 			if p.Password == "" {
 				continue
@@ -694,9 +718,9 @@ func normalizeSSURI(raw string) (string, bool) {
 func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dialAddr string, useAuth bool) {
 	switch scheme {
 	case "vmess":
-		return "https", overridePort(addr, mainstreamMixedRelayPort), false
+		return "http", overridePort(addr, mainstreamMixedRelayPort), false
 	case "vless", "hy2", "hysteria2", "trojan":
-		return "https", overridePort(addr, mainstreamMixedRelayPort), true
+		return "http", overridePort(addr, mainstreamMixedRelayPort), true
 	case "ss":
 		return "socks5", overridePort(addr, mainstreamMixedRelayPort), false
 	default:
@@ -1080,7 +1104,7 @@ func checkMixedProxyHealth(proxyEntry string, strictMode bool) bool {
 
 	client := &http.Client{Transport: transport, Timeout: totalTimeout}
 	start := time.Now()
-	resp, err := client.Get("https://www.google.com")
+	resp, err := client.Get(mixedHealthCheckURL)
 	if err != nil {
 		return false
 	}
@@ -1481,6 +1505,7 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 
 	httpSocksHealthy := filterMixedProxiesByScheme(result.Healthy, httpSocksMixedSchemes)
 	mainstreamHealthy := filterMixedProxiesByScheme(result.Healthy, mainstreamMixedSchemes)
+	log.Printf("[MIXED-DEBUG] healthy_total=%d, http_socks=%d, mainstream=%d", len(result.Healthy), len(httpSocksHealthy), len(mainstreamHealthy))
 
 	if len(httpSocksHealthy) > 0 {
 		mixedPool.Update(httpSocksHealthy)
@@ -1641,6 +1666,15 @@ func startSOCKS5Server(pool *ProxyPool, port string, mode string) error {
 
 // HTTP Proxy Server
 func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode string) {
+	if r.URL.Path == "/list" {
+		if !validateBasicAuth(r) {
+			requireListBasicAuth(w, "HTTP-"+mode)
+			return
+		}
+		writePoolListResponse(w, pool, mode)
+		return
+	}
+
 	log.Printf("[HTTP-%s] Incoming request: %s %s from %s", mode, r.Method, r.URL.String(), r.RemoteAddr)
 
 	if !validateHTTPProxyAuth(r) {
@@ -1758,6 +1792,22 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+func writePoolListResponse(w http.ResponseWriter, pool *ProxyPool, mode string) {
+	proxies := pool.GetAll()
+	current, ok := pool.GetCurrent()
+	if !ok {
+		current = ""
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"mode":          mode,
+		"proxy_count":   len(proxies),
+		"current_proxy": current,
+		"proxies":       proxies,
+	})
 }
 
 func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetDial func(string) (net.Conn, error), proxyAddr string, mode string) {
@@ -1905,6 +1955,21 @@ func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfP
 			for _, proxyAddr := range proxies {
 				fmt.Fprintln(w, proxyAddr)
 			}
+		case "/list":
+			strictProxies := strictPool.GetAll()
+			relaxedProxies := relaxedPool.GetAll()
+			cfProxies := cfPool.GetAll()
+			strictCurrent, _ := strictPool.GetCurrent()
+			relaxedCurrent, _ := relaxedPool.GetCurrent()
+
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"strict_proxy_count":    len(strictProxies),
+				"strict_current_proxy":  strictCurrent,
+				"relaxed_proxy_count":   len(relaxedProxies),
+				"relaxed_current_proxy": relaxedCurrent,
+				"cf_proxy_count":        len(cfProxies),
+			})
 		default:
 			http.NotFound(w, r)
 		}
@@ -1916,6 +1981,60 @@ func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfP
 	}
 
 	log.Printf("[ROTATE] Manual rotate control server listening on %s", port)
+	return server.ListenAndServe()
+}
+
+func startStatusControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, mixedPool *ProxyPool, mainstreamPool *ProxyPool, cfMixedPool *ProxyPool, port string) error {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !validateBasicAuth(r) {
+			requireListBasicAuth(w, "STATUS")
+			return
+		}
+
+		if r.URL.Path != "/list" {
+			http.NotFound(w, r)
+			return
+		}
+
+		strictCurrent, _ := strictPool.GetCurrent()
+		relaxedCurrent, _ := relaxedPool.GetCurrent()
+		mixedCurrent, _ := mixedPool.GetCurrent()
+		mainstreamCurrent, _ := mainstreamPool.GetCurrent()
+		cfMixedCurrent, _ := cfMixedPool.GetCurrent()
+
+		strictProxies := strictPool.GetAll()
+		relaxedProxies := relaxedPool.GetAll()
+		mixedProxies := mixedPool.GetAll()
+		mainstreamProxies := mainstreamPool.GetAll()
+		cfMixedProxies := cfMixedPool.GetAll()
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"strict": map[string]interface{}{
+				"proxy_count":   len(strictProxies),
+				"current_proxy": strictCurrent,
+			},
+			"relaxed": map[string]interface{}{
+				"proxy_count":   len(relaxedProxies),
+				"current_proxy": relaxedCurrent,
+			},
+			"mixed": map[string]interface{}{
+				"proxy_count":   len(mixedProxies),
+				"current_proxy": mixedCurrent,
+			},
+			"mainstream_mixed": map[string]interface{}{
+				"proxy_count":   len(mainstreamProxies),
+				"current_proxy": mainstreamCurrent,
+			},
+			"cf_mixed": map[string]interface{}{
+				"proxy_count":   len(cfMixedProxies),
+				"current_proxy": cfMixedCurrent,
+			},
+		})
+	})
+
+	server := &http.Server{Addr: port, Handler: handler}
+	log.Printf("[STATUS] Status control server listening on %s", port)
 	return server.ListenAndServe()
 }
 
@@ -1992,6 +2111,7 @@ func main() {
 	log.Printf("  - HTTP Mixed port (HTTP/SOCKS): %s", config.Ports.HTTPMixed)
 	log.Printf("  - HTTP Mixed port (VMESS/VLESS/HY2): %s", config.Ports.HTTPMainstreamMix)
 	log.Printf("  - HTTP Mixed CF-pass port: %s", config.Ports.HTTPCFMixed)
+	log.Printf("  - Status control port: %s", config.Ports.StatusControl)
 	if isProxyAuthEnabled() {
 		log.Printf("  - Proxy authentication: enabled (user: %s)", config.Auth.Username)
 	} else {
@@ -2046,7 +2166,7 @@ func main() {
 
 	// Start servers
 	var wg sync.WaitGroup
-	wg.Add(8)
+	wg.Add(9)
 
 	// SOCKS5 Strict
 	go func() {
@@ -2112,6 +2232,14 @@ func main() {
 		}
 	}()
 
+	// Status Control
+	go func() {
+		defer wg.Done()
+		if err := startStatusControlServer(strictPool, relaxedPool, mixedHTTPPool, mainstreamMixedHTTPPool, cfMixedHTTPPool, config.Ports.StatusControl); err != nil {
+			log.Fatalf("[STATUS] Control server error: %v", err)
+		}
+	}()
+
 	log.Println("All servers started successfully")
 	log.Println("  [STRICT] SOCKS5: " + config.Ports.SOCKS5Strict + " | HTTP: " + config.Ports.HTTPStrict)
 	log.Println("  [RELAXED] SOCKS5: " + config.Ports.SOCKS5Relaxed + " | HTTP: " + config.Ports.HTTPRelaxed)
@@ -2119,6 +2247,7 @@ func main() {
 	log.Println("  [MAINSTREAM-MIXED] HTTP (VMESS/VLESS/HY2 upstream): " + config.Ports.HTTPMainstreamMix)
 	log.Println("  [CF-MIXED] HTTP (CF-pass SOCKS5/HTTP upstream): " + config.Ports.HTTPCFMixed)
 	log.Println("  [ROTATE] Control: " + config.Ports.RotateControl)
+	log.Println("  [STATUS] Control: " + config.Ports.StatusControl)
 	log.Printf("Proxy pools will update every %d minutes in background...", config.UpdateIntervalMinutes)
 	log.Printf("Auto connectivity monitor enabled: checks every %s and rotates unhealthy current proxy", connectivityCheckInterval)
 	wg.Wait()

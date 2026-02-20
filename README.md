@@ -144,6 +144,7 @@ ports:
   http_mixed: ":17288"      # HTTP混合入口（仅自动选择 HTTP/SOCKS5 上游）
   http_cf_mixed: ":17289"   # HTTP混合入口（仅使用可通过CF挑战的 HTTP/SOCKS5 上游）
   http_mainstream_mixed: ":17290" # HTTP混合入口（仅自动选择 VMESS/VLESS/HY2 上游）
+  status_control: ":17920" # 状态查询入口（GET /list，HTTP Basic Auth）
 
 # 可选代理认证（username/password 必须同时配置）
 auth:
@@ -169,6 +170,7 @@ auth:
 | `ports.http_mixed` | HTTP混合入口（仅自动选择 HTTP/SOCKS5 上游） | :17288 |
 | `ports.http_cf_mixed` | HTTP混合入口（仅使用可通过CF挑战的 HTTP/SOCKS5 上游） | :17289 |
 | `ports.http_mainstream_mixed` | HTTP主流协议混合入口（仅自动选择 VMESS/VLESS/HY2 上游） | :17290 |
+| `ports.status_control` | 状态控制端口（GET `/list` 汇总各池统计） | :17920 |
 | `auth.username` | 代理认证用户名（可选） | 空 |
 | `auth.password` | 代理认证密码（可选） | 空 |
 

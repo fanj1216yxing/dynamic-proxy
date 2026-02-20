@@ -55,6 +55,7 @@ ports:
   http_mainstream_mixed: ":17290" # HTTP入口：仅自动选择 VMESS/VLESS/HY2 等主流协议上游代理
   http_cf_mixed: ":17289"   # HTTP入口：自动选择可通过 CF 挑战的 HTTP 或 SOCKS5 上游代理
   rotate_control: ":17287" # 访问该端口会随机切换到一个新的健康代理
+  status_control: ":17920" # 状态查询入口：/list (Basic Auth)
 
 # 代理认证配置（可选）
 # 如果启用，username/password 必须同时设置
