@@ -714,6 +714,38 @@ func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dial
 	}
 }
 
+func isMainstreamMixedScheme(scheme string) bool {
+	switch scheme {
+	case "vmess", "vless", "ss", "trojan", "hy2", "hysteria2":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasRequiredMainstreamAuth(scheme string, auth *proxy.Auth) bool {
+	switch scheme {
+	case "vless", "ss", "trojan", "hy2", "hysteria2":
+		return auth != nil && strings.TrimSpace(auth.User) != ""
+	default:
+		return true
+	}
+}
+
+func checkMainstreamProxyHealth(scheme string, addr string, auth *proxy.Auth) bool {
+	if !hasRequiredMainstreamAuth(scheme, auth) {
+		return false
+	}
+
+	totalTimeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
+	conn, err := net.DialTimeout("tcp", addr, totalTimeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
 func overridePort(addr string, newPort string) string {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -1063,6 +1095,10 @@ func checkMixedProxyHealth(proxyEntry string, strictMode bool) bool {
 	scheme, addr, auth, _, err := parseMixedProxy(proxyEntry)
 	if err != nil {
 		return false
+	}
+
+	if isMainstreamMixedScheme(scheme) {
+		return checkMainstreamProxyHealth(scheme, addr, auth)
 	}
 
 	if scheme == "socks5" || scheme == "socks5h" {
