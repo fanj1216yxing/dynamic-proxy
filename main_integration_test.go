@@ -20,6 +20,24 @@ func poolSize(p *ProxyPool) int {
 	return len(p.proxies)
 }
 
+func startTCPEndpoint(t *testing.T, addr string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("listen tcp endpoint %s: %v", addr, err)
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+}
+
 func startForwardProxy(t *testing.T, requireAuth bool, expectedAuth string) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:"+mainstreamMixedRelayPort)
@@ -183,6 +201,16 @@ func TestIntegration_VlessHy2AuthRequired(t *testing.T) {
 		if checkMixedProxyHealth(entry, false) {
 			t.Fatalf("expected health check fail without credentials for %s", entry)
 		}
+	}
+}
+
+func TestIntegration_MainstreamHealthFailsWithoutRelayPort(t *testing.T) {
+	startTCPEndpoint(t, "127.0.0.1:18081")
+	config.HealthCheck.TotalTimeoutSeconds = 1
+	config.HealthCheck.TLSHandshakeThresholdSeconds = 1
+
+	if checkMixedProxyHealth("vless://user:pass@127.0.0.1:18081", false) {
+		t.Fatal("expected mainstream health check to fail when relay port is unavailable")
 	}
 }
 
