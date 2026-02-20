@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"os"
 	"strings"
 	"testing"
 )
@@ -113,5 +114,76 @@ func TestFilterMixedProxiesByScheme(t *testing.T) {
 	mainstream := filterMixedProxiesByScheme(entries, mainstreamMixedSchemes)
 	if len(mainstream) != 2 {
 		t.Fatalf("expected 2 mainstream entries, got %d (%v)", len(mainstream), mainstream)
+	}
+}
+
+func TestParseClashSubscriptionMixed_SupportsSSAndTrojan(t *testing.T) {
+	content := `proxies:
+  - type: ss
+    server: 1.2.3.4
+    port: 443
+    cipher: aes-128-gcm
+    password: secret
+  - type: trojan
+    server: 5.6.7.8
+    port: 8443
+    password: token
+`
+
+	proxies, ok := parseClashSubscriptionMixed(content)
+	if !ok {
+		t.Fatalf("expected clash mixed parsing to succeed")
+	}
+
+	if len(proxies) != 2 {
+		t.Fatalf("expected 2 proxies, got %d (%v)", len(proxies), proxies)
+	}
+}
+
+func TestNormalizeMixedProxyEntry_SSBase64(t *testing.T) {
+	entry := "ss://YWVzLTEyOC1nY206c2VjcmV0QDEuMi4zLjQ6NDQz"
+	got, ok := normalizeMixedProxyEntry(entry)
+	if !ok {
+		t.Fatalf("expected normalization success")
+	}
+	if got != "ss://aes-128-gcm:secret@1.2.3.4:443" {
+		t.Fatalf("unexpected normalized ss entry: %s", got)
+	}
+}
+
+func TestResolveMixedDialTarget_MainstreamUsesOriginalPort(t *testing.T) {
+	dialScheme, dialAddr, useAuth := resolveMixedDialTarget("trojan", "8.8.8.8:443")
+	if dialScheme != "https" {
+		t.Fatalf("expected https dial scheme, got %s", dialScheme)
+	}
+	if dialAddr != "8.8.8.8:443" {
+		t.Fatalf("expected original upstream port, got %s", dialAddr)
+	}
+	if useAuth {
+		t.Fatalf("expected relay mode to disable upstream auth")
+	}
+}
+
+func TestParseLocalProxiesYAML_MixedRecognized(t *testing.T) {
+	data, err := os.ReadFile("proxies.yaml")
+	if err != nil {
+		t.Fatalf("failed to read proxies.yaml: %v", err)
+	}
+
+	proxies, format := parseRegularProxyContentMixed(string(data))
+	if len(proxies) == 0 {
+		t.Fatalf("expected proxies parsed from proxies.yaml, got none (format=%s)", format)
+	}
+}
+
+func TestParseLocalV2YAML_MixedRecognized(t *testing.T) {
+	data, err := os.ReadFile("v2.yaml")
+	if err != nil {
+		t.Fatalf("failed to read v2.yaml: %v", err)
+	}
+
+	proxies, format := parseRegularProxyContentMixed(string(data))
+	if len(proxies) == 0 {
+		t.Fatalf("expected proxies parsed from v2.yaml, got none (format=%s)", format)
 	}
 }
