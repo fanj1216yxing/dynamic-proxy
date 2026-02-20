@@ -96,3 +96,22 @@ func TestParseProxySwitchInterval_Invalid(t *testing.T) {
 		t.Fatalf("expected error for invalid value")
 	}
 }
+
+func TestFilterMixedProxiesByScheme(t *testing.T) {
+	entries := []string{
+		"http://1.1.1.1:80",
+		"socks5://2.2.2.2:1080",
+		"vmess://3.3.3.3:443",
+		"vless://4.4.4.4:443",
+	}
+
+	httpSocks := filterMixedProxiesByScheme(entries, httpSocksMixedSchemes)
+	if len(httpSocks) != 2 {
+		t.Fatalf("expected 2 http/socks entries, got %d (%v)", len(httpSocks), httpSocks)
+	}
+
+	mainstream := filterMixedProxiesByScheme(entries, mainstreamMixedSchemes)
+	if len(mainstream) != 2 {
+		t.Fatalf("expected 2 mainstream entries, got %d (%v)", len(mainstream), mainstream)
+	}
+}

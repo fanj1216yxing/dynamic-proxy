@@ -41,13 +41,14 @@ type Config struct {
 		TLSHandshakeThresholdSeconds int `yaml:"tls_handshake_threshold_seconds"`
 	} `yaml:"health_check"`
 	Ports struct {
-		SOCKS5Strict  string `yaml:"socks5_strict"`
-		SOCKS5Relaxed string `yaml:"socks5_relaxed"`
-		HTTPStrict    string `yaml:"http_strict"`
-		HTTPRelaxed   string `yaml:"http_relaxed"`
-		HTTPMixed     string `yaml:"http_mixed"`
-		HTTPCFMixed   string `yaml:"http_cf_mixed"`
-		RotateControl string `yaml:"rotate_control"`
+		SOCKS5Strict      string `yaml:"socks5_strict"`
+		SOCKS5Relaxed     string `yaml:"socks5_relaxed"`
+		HTTPStrict        string `yaml:"http_strict"`
+		HTTPRelaxed       string `yaml:"http_relaxed"`
+		HTTPMixed         string `yaml:"http_mixed"`
+		HTTPMainstreamMix string `yaml:"http_mainstream_mixed"`
+		HTTPCFMixed       string `yaml:"http_cf_mixed"`
+		RotateControl     string `yaml:"rotate_control"`
 	} `yaml:"ports"`
 	Auth struct {
 		Username string `yaml:"username"`
@@ -116,6 +117,9 @@ func loadConfig(filename string) (*Config, error) {
 	}
 	if cfg.Ports.HTTPMixed == "" {
 		cfg.Ports.HTTPMixed = ":8083"
+	}
+	if cfg.Ports.HTTPMainstreamMix == "" {
+		cfg.Ports.HTTPMainstreamMix = ":8085"
 	}
 	if cfg.Ports.HTTPCFMixed == "" {
 		cfg.Ports.HTTPCFMixed = ":8084"
@@ -382,6 +386,20 @@ var mixedSupportedSchemes = map[string]bool{
 	"https":     true,
 	"socks5":    true,
 	"socks5h":   true,
+	"vmess":     true,
+	"vless":     true,
+	"hy2":       true,
+	"hysteria2": true,
+}
+
+var httpSocksMixedSchemes = map[string]bool{
+	"http":    true,
+	"https":   true,
+	"socks5":  true,
+	"socks5h": true,
+}
+
+var mainstreamMixedSchemes = map[string]bool{
 	"vmess":     true,
 	"vless":     true,
 	"hy2":       true,
@@ -1338,7 +1356,21 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 	return MixedHealthCheckResult{Healthy: mixedHealthy, CFPass: cfPassHealthy}
 }
 
-func updateMixedProxyPool(mixedPool *ProxyPool, cfMixedPool *ProxyPool) {
+func filterMixedProxiesByScheme(entries []string, allowed map[string]bool) []string {
+	filtered := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		scheme, _, _, _, err := parseMixedProxy(entry)
+		if err != nil {
+			continue
+		}
+		if allowed[scheme] {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool) {
 	if !atomic.CompareAndSwapInt32(&mixedPool.updating, 0, 1) {
 		log.Println("Mixed proxy update already in progress, skipping...")
 		return
@@ -1355,11 +1387,21 @@ func updateMixedProxyPool(mixedPool *ProxyPool, cfMixedPool *ProxyPool) {
 	log.Printf("Fetched %d mixed proxies, starting health check...", len(proxies))
 	result := healthCheckMixedProxies(proxies)
 
-	if len(result.Healthy) > 0 {
-		mixedPool.Update(result.Healthy)
-		log.Printf("[HTTP-MIXED] Pool updated with %d healthy mixed proxies", len(result.Healthy))
+	httpSocksHealthy := filterMixedProxiesByScheme(result.Healthy, httpSocksMixedSchemes)
+	mainstreamHealthy := filterMixedProxiesByScheme(result.Healthy, mainstreamMixedSchemes)
+
+	if len(httpSocksHealthy) > 0 {
+		mixedPool.Update(httpSocksHealthy)
+		log.Printf("[HTTP-MIXED] Pool updated with %d healthy HTTP/SOCKS mixed proxies", len(httpSocksHealthy))
 	} else {
-		log.Println("[HTTP-MIXED] Warning: No healthy mixed proxies found, keeping existing pool")
+		log.Println("[HTTP-MIXED] Warning: No healthy HTTP/SOCKS mixed proxies found, keeping existing pool")
+	}
+
+	if len(mainstreamHealthy) > 0 {
+		mainstreamMixedPool.Update(mainstreamHealthy)
+		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy VMESS/VLESS/HY2 mixed proxies", len(mainstreamHealthy))
+	} else {
+		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy VMESS/VLESS/HY2 mixed proxies found, keeping existing pool")
 	}
 
 	if config.CFChallengeCheck.Enabled {
@@ -1372,12 +1414,12 @@ func updateMixedProxyPool(mixedPool *ProxyPool, cfMixedPool *ProxyPool) {
 	}
 }
 
-func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, cfMixedPool *ProxyPool, initialSync bool) {
+func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool, initialSync bool) {
 	if initialSync {
 		// Initial update synchronously to ensure we have proxies before starting servers
 		log.Println("Performing initial proxy update...")
 		updateProxyPool(strictPool, relaxedPool, cfPool)
-		updateMixedProxyPool(mixedPool, cfMixedPool)
+		updateMixedProxyPool(mixedPool, mainstreamMixedPool, cfMixedPool)
 	}
 
 	// Periodic updates - each update runs in its own goroutine to avoid blocking
@@ -1386,7 +1428,7 @@ func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *Pr
 	go func() {
 		for range ticker.C {
 			go updateProxyPool(strictPool, relaxedPool, cfPool)
-			go updateMixedProxyPool(mixedPool, cfMixedPool)
+			go updateMixedProxyPool(mixedPool, mainstreamMixedPool, cfMixedPool)
 		}
 	}()
 }
@@ -1848,6 +1890,9 @@ func main() {
 	log.Printf("  - SOCKS5 Relaxed port: %s", config.Ports.SOCKS5Relaxed)
 	log.Printf("  - HTTP Strict port: %s", config.Ports.HTTPStrict)
 	log.Printf("  - HTTP Relaxed port: %s", config.Ports.HTTPRelaxed)
+	log.Printf("  - HTTP Mixed port (HTTP/SOCKS): %s", config.Ports.HTTPMixed)
+	log.Printf("  - HTTP Mixed port (VMESS/VLESS/HY2): %s", config.Ports.HTTPMainstreamMix)
+	log.Printf("  - HTTP Mixed CF-pass port: %s", config.Ports.HTTPCFMixed)
 	if isProxyAuthEnabled() {
 		log.Printf("  - Proxy authentication: enabled (user: %s)", config.Auth.Username)
 	} else {
@@ -1859,10 +1904,11 @@ func main() {
 	relaxedPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)
 	cfPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)
 	mixedHTTPPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)
+	mainstreamMixedHTTPPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)
 	cfMixedHTTPPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)
 
 	// Start proxy updater with initial synchronous update
-	startProxyUpdater(strictPool, relaxedPool, cfPool, mixedHTTPPool, cfMixedHTTPPool, true)
+	startProxyUpdater(strictPool, relaxedPool, cfPool, mixedHTTPPool, mainstreamMixedHTTPPool, cfMixedHTTPPool, true)
 
 	// Auto monitor current selected proxies and rotate when connectivity is lost
 	startProxyConnectivityMonitor(strictPool, "STRICT", connectivityCheckInterval, func(proxyAddr string) bool {
@@ -1875,6 +1921,9 @@ func main() {
 		return checkMixedProxyHealth(proxyEntry, false)
 	})
 	startProxyConnectivityMonitor(cfMixedHTTPPool, "CF-MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
+		return checkMixedProxyHealth(proxyEntry, false)
+	})
+	startProxyConnectivityMonitor(mainstreamMixedHTTPPool, "MAINSTREAM-MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
 		return checkMixedProxyHealth(proxyEntry, false)
 	})
 
@@ -1898,7 +1947,7 @@ func main() {
 
 	// Start servers
 	var wg sync.WaitGroup
-	wg.Add(7)
+	wg.Add(8)
 
 	// SOCKS5 Strict
 	go func() {
@@ -1956,10 +2005,19 @@ func main() {
 		}
 	}()
 
+	// HTTP Mainstream Mixed (VMESS/VLESS/HY2 upstream)
+	go func() {
+		defer wg.Done()
+		if err := startHTTPServer(mainstreamMixedHTTPPool, config.Ports.HTTPMainstreamMix, "MAINSTREAM-MIXED"); err != nil {
+			log.Fatalf("[MAINSTREAM-MIXED] HTTP server error: %v", err)
+		}
+	}()
+
 	log.Println("All servers started successfully")
 	log.Println("  [STRICT] SOCKS5: " + config.Ports.SOCKS5Strict + " | HTTP: " + config.Ports.HTTPStrict)
 	log.Println("  [RELAXED] SOCKS5: " + config.Ports.SOCKS5Relaxed + " | HTTP: " + config.Ports.HTTPRelaxed)
-	log.Println("  [MIXED] HTTP (SOCKS5/HTTP upstream): " + config.Ports.HTTPMixed)
+	log.Println("  [MIXED] HTTP (HTTP/SOCKS upstream): " + config.Ports.HTTPMixed)
+	log.Println("  [MAINSTREAM-MIXED] HTTP (VMESS/VLESS/HY2 upstream): " + config.Ports.HTTPMainstreamMix)
 	log.Println("  [CF-MIXED] HTTP (CF-pass SOCKS5/HTTP upstream): " + config.Ports.HTTPCFMixed)
 	log.Println("  [ROTATE] Control: " + config.Ports.RotateControl)
 	log.Printf("Proxy pools will update every %d minutes in background...", config.UpdateIntervalMinutes)
