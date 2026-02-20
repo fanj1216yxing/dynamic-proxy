@@ -16,6 +16,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +35,7 @@ type Config struct {
 	SpecialProxyListUrls   []string `yaml:"special_proxy_list_urls"` // 支持复杂格式的代理URL列表
 	HealthCheckConcurrency int      `yaml:"health_check_concurrency"`
 	UpdateIntervalMinutes  int      `yaml:"update_interval_minutes"`
+	ProxySwitchIntervalMin string   `yaml:"proxy_switch_interval_min"`
 	HealthCheck            struct {
 		TotalTimeoutSeconds          int `yaml:"total_timeout_seconds"`
 		TLSHandshakeThresholdSeconds int `yaml:"tls_handshake_threshold_seconds"`
@@ -63,7 +65,6 @@ type Config struct {
 // Global config variable
 var config Config
 
-const proxySwitchInterval = 30 * time.Minute
 const connectivityCheckInterval = 10 * time.Second
 
 // Simple regex to extract ip:port from any format (used for special proxy lists)
@@ -91,6 +92,9 @@ func loadConfig(filename string) (*Config, error) {
 	}
 	if cfg.UpdateIntervalMinutes <= 0 {
 		cfg.UpdateIntervalMinutes = 5
+	}
+	if cfg.ProxySwitchIntervalMin == "" {
+		cfg.ProxySwitchIntervalMin = "30"
 	}
 	if cfg.HealthCheck.TotalTimeoutSeconds <= 0 {
 		cfg.HealthCheck.TotalTimeoutSeconds = 8
@@ -143,6 +147,24 @@ func isProxyAuthEnabled() bool {
 	return config.Auth.Username != "" && config.Auth.Password != ""
 }
 
+func parseProxySwitchInterval(raw string) (time.Duration, bool, error) {
+	value := strings.TrimSpace(strings.ToLower(raw))
+	if value == "" {
+		value = "30"
+	}
+
+	if value == "now" {
+		return 0, true, nil
+	}
+
+	minutes, err := strconv.Atoi(value)
+	if err != nil || minutes <= 0 {
+		return 0, false, fmt.Errorf("proxy_switch_interval_min must be a positive integer (minutes) or 'now'")
+	}
+
+	return time.Duration(minutes) * time.Minute, false, nil
+}
+
 func requireHTTPProxyAuth(w http.ResponseWriter, mode string) {
 	w.Header().Set("Proxy-Authenticate", `Basic realm="Dynamic Proxy"`)
 	log.Printf("[HTTP-%s] Unauthorized request rejected", mode)
@@ -186,19 +208,23 @@ func validateAuthHeader(authHeader string) bool {
 }
 
 type ProxyPool struct {
-	proxies     []string
-	mu          sync.RWMutex
-	index       int
-	nextSwitch  time.Time
-	hasSelected bool
-	updating    int32 // atomic flag to prevent concurrent updates
-	rng         *rand.Rand
+	proxies            []string
+	mu                 sync.RWMutex
+	index              int
+	nextSwitch         time.Time
+	hasSelected        bool
+	updating           int32 // atomic flag to prevent concurrent updates
+	rng                *rand.Rand
+	rotateEveryRequest bool
+	switchInterval     time.Duration
 }
 
-func NewProxyPool() *ProxyPool {
+func NewProxyPool(switchInterval time.Duration, rotateEveryRequest bool) *ProxyPool {
 	return &ProxyPool{
-		proxies: make([]string, 0),
-		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
+		proxies:            make([]string, 0),
+		rng:                rand.New(rand.NewSource(time.Now().UnixNano())),
+		switchInterval:     switchInterval,
+		rotateEveryRequest: rotateEveryRequest,
 	}
 }
 
@@ -227,16 +253,23 @@ func (p *ProxyPool) GetNext() (string, error) {
 	// First request after a pool update randomly selects one healthy proxy.
 	if !p.hasSelected {
 		p.index = p.randomIndexExcluding(-1)
-		p.nextSwitch = time.Now().Add(proxySwitchInterval)
+		if !p.rotateEveryRequest {
+			p.nextSwitch = time.Now().Add(p.switchInterval)
+		}
 		p.hasSelected = true
 		return p.proxies[p.index], nil
 	}
 
-	// Keep using the same proxy for 30 minutes, then randomly switch to another one.
+	if p.rotateEveryRequest {
+		p.index = p.randomIndexExcluding(p.index)
+		return p.proxies[p.index], nil
+	}
+
+	// Keep using the same proxy until the next switch timestamp, then randomly switch.
 	now := time.Now()
 	if !p.nextSwitch.IsZero() && (now.After(p.nextSwitch) || now.Equal(p.nextSwitch)) {
 		p.index = p.randomIndexExcluding(p.index)
-		p.nextSwitch = now.Add(proxySwitchInterval)
+		p.nextSwitch = now.Add(p.switchInterval)
 	}
 
 	if p.index >= len(p.proxies) {
@@ -296,7 +329,11 @@ func (p *ProxyPool) ForceRotate() (string, error) {
 		p.index = p.randomIndexExcluding(p.index)
 	}
 
-	p.nextSwitch = time.Now().Add(proxySwitchInterval)
+	if !p.rotateEveryRequest {
+		p.nextSwitch = time.Now().Add(p.switchInterval)
+	} else {
+		p.nextSwitch = time.Time{}
+	}
 	return p.proxies[p.index], nil
 }
 
@@ -1766,6 +1803,11 @@ func main() {
 	}
 	config = *cfg
 
+	proxySwitchInterval, rotateEveryRequest, err := parseProxySwitchInterval(config.ProxySwitchIntervalMin)
+	if err != nil {
+		log.Fatalf("Failed to parse proxy_switch_interval_min: %v", err)
+	}
+
 	// Log configuration
 	log.Printf("Configuration loaded:")
 	log.Printf("  - Proxy sources: %d", len(config.ProxyListURLs))
@@ -1774,6 +1816,11 @@ func main() {
 	}
 	log.Printf("  - Health check concurrency: %d", config.HealthCheckConcurrency)
 	log.Printf("  - Update interval: %d minutes", config.UpdateIntervalMinutes)
+	if rotateEveryRequest {
+		log.Printf("  - Proxy switch interval: now (switch on every request)")
+	} else {
+		log.Printf("  - Proxy switch interval: %d minutes", int(proxySwitchInterval/time.Minute))
+	}
 	log.Printf("  - Health check timeout: %ds (TLS threshold: %ds)",
 		config.HealthCheck.TotalTimeoutSeconds,
 		config.HealthCheck.TLSHandshakeThresholdSeconds)
@@ -1787,12 +1834,12 @@ func main() {
 		log.Printf("  - Proxy authentication: disabled")
 	}
 
-	// Create two proxy pools
-	strictPool := NewProxyPool()
-	relaxedPool := NewProxyPool()
-	cfPool := NewProxyPool()
-	mixedHTTPPool := NewProxyPool()
-	cfMixedHTTPPool := NewProxyPool()
+	// Create proxy pools
+	strictPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)
+	relaxedPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)
+	cfPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)
+	mixedHTTPPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)
+	cfMixedHTTPPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)
 
 	// Start proxy updater with initial synchronous update
 	startProxyUpdater(strictPool, relaxedPool, cfPool, mixedHTTPPool, cfMixedHTTPPool, true)

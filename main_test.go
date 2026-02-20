@@ -34,3 +34,36 @@ func TestParseRegularProxyContentMixed_Base64Plain(t *testing.T) {
 		t.Fatalf("expected 2 proxies, got %d (%v)", len(proxies), proxies)
 	}
 }
+
+func TestParseProxySwitchInterval_DefaultMinutes(t *testing.T) {
+	d, rotateEveryRequest, err := parseProxySwitchInterval("30")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rotateEveryRequest {
+		t.Fatalf("expected rotateEveryRequest=false")
+	}
+	if d.Minutes() != 30 {
+		t.Fatalf("expected 30 minutes, got %v", d)
+	}
+}
+
+func TestParseProxySwitchInterval_Now(t *testing.T) {
+	d, rotateEveryRequest, err := parseProxySwitchInterval("now")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !rotateEveryRequest {
+		t.Fatalf("expected rotateEveryRequest=true")
+	}
+	if d != 0 {
+		t.Fatalf("expected duration 0 for now, got %v", d)
+	}
+}
+
+func TestParseProxySwitchInterval_Invalid(t *testing.T) {
+	_, _, err := parseProxySwitchInterval("abc")
+	if err == nil {
+		t.Fatalf("expected error for invalid value")
+	}
+}
