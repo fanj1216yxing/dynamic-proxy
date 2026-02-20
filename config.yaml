@@ -41,9 +41,9 @@ proxy_switch_interval_min: 30
 # 健康检查超时设置
 health_check:
   # 总超时时间（秒）
-  total_timeout_seconds: 8
+  total_timeout_seconds: 15
   # TLS握手性能阈值（秒）
-  tls_handshake_threshold_seconds: 5
+  tls_handshake_threshold_seconds: 8
 
 # 服务器端口配置
 ports:
