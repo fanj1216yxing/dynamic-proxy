@@ -20,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/armon/go-socks5"
 	"golang.org/x/net/proxy"
@@ -62,6 +64,7 @@ type Config struct {
 var config Config
 
 const proxySwitchInterval = 30 * time.Minute
+const connectivityCheckInterval = 10 * time.Second
 
 // Simple regex to extract ip:port from any format (used for special proxy lists)
 // Matches: [IP]:[port] and ignores any protocol prefixes or extra text
@@ -263,6 +266,21 @@ func (p *ProxyPool) GetAll() []string {
 	return result
 }
 
+func (p *ProxyPool) GetCurrent() (string, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if len(p.proxies) == 0 || !p.hasSelected {
+		return "", false
+	}
+
+	if p.index < 0 || p.index >= len(p.proxies) {
+		return "", false
+	}
+
+	return p.proxies[p.index], true
+}
+
 func (p *ProxyPool) ForceRotate() (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -364,6 +382,12 @@ func parseRegularProxyContent(content string) ([]string, string) {
 		return clashProxies, "clash"
 	}
 
+	if decoded, ok := decodeBase64ProxySubscription(content); ok {
+		if decodedProxies, decodedFormat := parseRegularProxyContent(decoded); len(decodedProxies) > 0 {
+			return decodedProxies, "base64+" + decodedFormat
+		}
+	}
+
 	proxies := make([]string, 0)
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	for scanner.Scan() {
@@ -384,6 +408,12 @@ func parseRegularProxyContent(content string) ([]string, string) {
 func parseRegularProxyContentMixed(content string) ([]string, string) {
 	if clashProxies, ok := parseClashSubscriptionMixed(content); ok {
 		return clashProxies, "clash"
+	}
+
+	if decoded, ok := decodeBase64ProxySubscription(content); ok {
+		if decodedProxies, decodedFormat := parseRegularProxyContentMixed(decoded); len(decodedProxies) > 0 {
+			return decodedProxies, "base64+" + decodedFormat
+		}
 	}
 
 	proxies := make([]string, 0)
@@ -427,6 +457,56 @@ func parseClashSubscriptionMixed(content string) ([]string, bool) {
 	}
 
 	return result, len(result) > 0
+}
+
+func decodeBase64ProxySubscription(content string) (string, bool) {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return "", false
+	}
+
+	compact := strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, trimmed)
+
+	if len(compact) < 32 {
+		return "", false
+	}
+
+	for _, ch := range compact {
+		if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '+' || ch == '/' || ch == '=' || ch == '-' || ch == '_' {
+			continue
+		}
+		return "", false
+	}
+
+	decoders := []func(string) ([]byte, error){
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawURLEncoding.DecodeString,
+	}
+
+	for _, decode := range decoders {
+		payload, err := decode(compact)
+		if err != nil || len(payload) == 0 || !utf8.Valid(payload) {
+			continue
+		}
+
+		decoded := strings.TrimSpace(string(payload))
+		if decoded == "" || decoded == trimmed {
+			continue
+		}
+
+		if strings.Contains(decoded, "://") || strings.Contains(strings.ToLower(decoded), "proxies:") || simpleProxyRegex.MatchString(decoded) {
+			return decoded, true
+		}
+	}
+
+	return "", false
 }
 
 func normalizeMixedProxyEntry(raw string) (string, bool) {
@@ -1126,6 +1206,82 @@ func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *Prox
 	}
 }
 
+type MixedHealthCheckResult struct {
+	Healthy []string
+	CFPass  []string
+}
+
+func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	mixedHealthy := make([]string, 0)
+	cfPassHealthy := make([]string, 0)
+
+	total := len(proxies)
+	var checked int64
+	var healthyCount int64
+	var cfPassCount int64
+
+	semaphore := make(chan struct{}, config.HealthCheckConcurrency)
+	done := make(chan struct{})
+
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		lastChecked := int64(0)
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				current := atomic.LoadInt64(&checked)
+				healthyCurrent := atomic.LoadInt64(&healthyCount)
+				cfCurrent := atomic.LoadInt64(&cfPassCount)
+				if current != lastChecked {
+					percentage := float64(current) / float64(total) * 100
+					barWidth := 40
+					filled := int(float64(barWidth) * float64(current) / float64(total))
+					bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+					log.Printf("[MIXED-%s] %d/%d (%.1f%%) | Healthy: %d | CF-Pass: %d", bar, current, total, percentage, healthyCurrent, cfCurrent)
+					lastChecked = current
+				}
+			}
+		}
+	}()
+
+	for _, proxyEntry := range proxies {
+		wg.Add(1)
+		go func(entry string) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			healthy := checkMixedProxyHealth(entry, false)
+			if healthy {
+				mu.Lock()
+				mixedHealthy = append(mixedHealthy, entry)
+				mu.Unlock()
+				atomic.AddInt64(&healthyCount, 1)
+				if config.CFChallengeCheck.Enabled && checkCloudflareBypassMixed(entry) {
+					mu.Lock()
+					cfPassHealthy = append(cfPassHealthy, entry)
+					mu.Unlock()
+					atomic.AddInt64(&cfPassCount, 1)
+				}
+			}
+			atomic.AddInt64(&checked, 1)
+		}(proxyEntry)
+	}
+
+	wg.Wait()
+	close(done)
+	log.Printf("[MIXED-%s] %d/%d (100.0%%) | Healthy: %d | CF-Pass: %d", strings.Repeat("█", 40), total, total, len(mixedHealthy), len(cfPassHealthy))
+	sort.Strings(cfPassHealthy)
+
+	return MixedHealthCheckResult{Healthy: mixedHealthy, CFPass: cfPassHealthy}
+}
+
 func updateMixedProxyPool(mixedPool *ProxyPool, cfMixedPool *ProxyPool) {
 	if !atomic.CompareAndSwapInt32(&mixedPool.updating, 0, 1) {
 		log.Println("Mixed proxy update already in progress, skipping...")
@@ -1140,28 +1296,20 @@ func updateMixedProxyPool(mixedPool *ProxyPool, cfMixedPool *ProxyPool) {
 		return
 	}
 
-	mixedHealthy := make([]string, 0)
-	cfPassHealthy := make([]string, 0)
-	for _, proxyEntry := range proxies {
-		if checkMixedProxyHealth(proxyEntry, false) {
-			mixedHealthy = append(mixedHealthy, proxyEntry)
-			if config.CFChallengeCheck.Enabled && checkCloudflareBypassMixed(proxyEntry) {
-				cfPassHealthy = append(cfPassHealthy, proxyEntry)
-			}
-		}
-	}
+	log.Printf("Fetched %d mixed proxies, starting health check...", len(proxies))
+	result := healthCheckMixedProxies(proxies)
 
-	if len(mixedHealthy) > 0 {
-		mixedPool.Update(mixedHealthy)
-		log.Printf("[HTTP-MIXED] Pool updated with %d healthy mixed proxies", len(mixedHealthy))
+	if len(result.Healthy) > 0 {
+		mixedPool.Update(result.Healthy)
+		log.Printf("[HTTP-MIXED] Pool updated with %d healthy mixed proxies", len(result.Healthy))
 	} else {
 		log.Println("[HTTP-MIXED] Warning: No healthy mixed proxies found, keeping existing pool")
 	}
 
 	if config.CFChallengeCheck.Enabled {
-		if len(cfPassHealthy) > 0 {
-			cfMixedPool.Update(cfPassHealthy)
-			log.Printf("[HTTP-CF-MIXED] Pool updated with %d CF-pass mixed proxies", len(cfPassHealthy))
+		if len(result.CFPass) > 0 {
+			cfMixedPool.Update(result.CFPass)
+			log.Printf("[HTTP-CF-MIXED] Pool updated with %d CF-pass mixed proxies", len(result.CFPass))
 		} else {
 			log.Println("[HTTP-CF-MIXED] Warning: No CF-pass mixed proxies found, keeping existing pool")
 		}
@@ -1573,6 +1721,41 @@ func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfP
 	return server.ListenAndServe()
 }
 
+func startProxyConnectivityMonitor(pool *ProxyPool, mode string, interval time.Duration, checker func(string) bool) {
+	if interval <= 0 {
+		interval = connectivityCheckInterval
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			proxyAddr, ok := pool.GetCurrent()
+			if !ok {
+				continue
+			}
+
+			if checker(proxyAddr) {
+				continue
+			}
+
+			newProxy, err := pool.ForceRotate()
+			if err != nil {
+				log.Printf("[AUTO-ROTATE-%s] connectivity check failed for %s, but rotate failed: %v", mode, proxyAddr, err)
+				continue
+			}
+
+			if newProxy == proxyAddr {
+				log.Printf("[AUTO-ROTATE-%s] connectivity check failed for %s, only one proxy available", mode, proxyAddr)
+				continue
+			}
+
+			log.Printf("[AUTO-ROTATE-%s] connectivity check failed for %s, rotated to %s", mode, proxyAddr, newProxy)
+		}
+	}()
+}
+
 func main() {
 	log.Println("Starting Dynamic Proxy Server...")
 
@@ -1613,6 +1796,20 @@ func main() {
 
 	// Start proxy updater with initial synchronous update
 	startProxyUpdater(strictPool, relaxedPool, cfPool, mixedHTTPPool, cfMixedHTTPPool, true)
+
+	// Auto monitor current selected proxies and rotate when connectivity is lost
+	startProxyConnectivityMonitor(strictPool, "STRICT", connectivityCheckInterval, func(proxyAddr string) bool {
+		return checkProxyHealth(proxyAddr, true)
+	})
+	startProxyConnectivityMonitor(relaxedPool, "RELAXED", connectivityCheckInterval, func(proxyAddr string) bool {
+		return checkProxyHealth(proxyAddr, false)
+	})
+	startProxyConnectivityMonitor(mixedHTTPPool, "MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
+		return checkMixedProxyHealth(proxyEntry, false)
+	})
+	startProxyConnectivityMonitor(cfMixedHTTPPool, "CF-MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
+		return checkMixedProxyHealth(proxyEntry, false)
+	})
 
 	// Check proxy pool status
 	strictCount := len(strictPool.GetAll())
@@ -1699,5 +1896,6 @@ func main() {
 	log.Println("  [CF-MIXED] HTTP (CF-pass SOCKS5/HTTP upstream): " + config.Ports.HTTPCFMixed)
 	log.Println("  [ROTATE] Control: " + config.Ports.RotateControl)
 	log.Printf("Proxy pools will update every %d minutes in background...", config.UpdateIntervalMinutes)
+	log.Printf("Auto connectivity monitor enabled: checks every %s and rotates unhealthy current proxy", connectivityCheckInterval)
 	wg.Wait()
 }
