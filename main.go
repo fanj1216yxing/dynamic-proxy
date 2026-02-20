@@ -60,6 +60,9 @@ type Config struct {
 		BlockIndicators  []string `yaml:"block_indicators"`
 		TimeoutSeconds   int      `yaml:"timeout_seconds"`
 	} `yaml:"cf_challenge_check"`
+	ProtocolBridge struct {
+		URL string `yaml:"url"`
+	} `yaml:"protocol_bridge"`
 }
 
 // Global config variable
@@ -567,7 +570,11 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 		if !mixedSupportedSchemes[scheme] {
 			return "", false
 		}
-		return fmt.Sprintf("%s://%s", scheme, u.Host), true
+		authority := u.Host
+		if u.User != nil {
+			authority = u.User.String() + "@" + authority
+		}
+		return fmt.Sprintf("%s://%s", scheme, authority), true
 	}
 
 	return "socks5://" + line, true
@@ -602,11 +609,38 @@ func normalizeVMESSURI(raw string) (string, bool) {
 }
 
 func getDialSchemeForMixed(scheme string) string {
-	// vmess/vless/hy2 节点通过 HTTP 混合入口时，按 HTTPS CONNECT 上游方式尝试连接。
-	if scheme == "vmess" || scheme == "vless" || scheme == "hy2" || scheme == "hysteria2" {
-		return "https"
-	}
 	return scheme
+}
+
+func isNativeMixedDialScheme(scheme string) bool {
+	return scheme == "http" || scheme == "https" || scheme == "socks5" || scheme == "socks5h"
+}
+
+func resolveMixedProxyForDial(entry string) (displayScheme string, scheme string, addr string, auth *proxy.Auth, httpAuthHeader string, err error) {
+	originalScheme, originalAddr, originalAuth, originalHeader, parseErr := parseMixedProxy(entry)
+	if parseErr != nil {
+		return "", "", "", nil, "", parseErr
+	}
+
+	if isNativeMixedDialScheme(originalScheme) {
+		return originalScheme, originalScheme, originalAddr, originalAuth, originalHeader, nil
+	}
+
+	bridge := strings.TrimSpace(config.ProtocolBridge.URL)
+	if bridge == "" {
+		return "", "", "", nil, "", fmt.Errorf("unsupported mixed upstream scheme %s without protocol_bridge.url", originalScheme)
+	}
+
+	bridgeScheme, bridgeAddr, bridgeAuth, bridgeHeader, bridgeErr := parseMixedProxy(bridge)
+	if bridgeErr != nil {
+		return "", "", "", nil, "", fmt.Errorf("invalid protocol_bridge.url: %w", bridgeErr)
+	}
+	if !isNativeMixedDialScheme(bridgeScheme) {
+		return "", "", "", nil, "", fmt.Errorf("protocol_bridge.url must be http/https/socks5/socks5h, got %s", bridgeScheme)
+	}
+
+	log.Printf("[MIXED] Bridge %s node %s via protocol_bridge %s", originalScheme, entry, bridge)
+	return originalScheme, bridgeScheme, bridgeAddr, bridgeAuth, bridgeHeader, nil
 }
 
 func parseSpecialProxyURLMixed(content string) []string {
@@ -839,20 +873,32 @@ func fetchMixedProxyList() ([]string, error) {
 	return allProxies, nil
 }
 
-func parseMixedProxy(entry string) (scheme string, addr string, err error) {
+func parseMixedProxy(entry string) (scheme string, addr string, auth *proxy.Auth, httpAuthHeader string, err error) {
 	if strings.Contains(entry, "://") {
 		u, parseErr := url.Parse(entry)
 		if parseErr != nil || u.Host == "" {
-			return "", "", fmt.Errorf("invalid proxy entry: %s", entry)
+			return "", "", nil, "", fmt.Errorf("invalid proxy entry: %s", entry)
 		}
 		s := strings.ToLower(u.Scheme)
 		if !mixedSupportedSchemes[s] {
-			return "", "", fmt.Errorf("unsupported proxy scheme: %s", s)
+			return "", "", nil, "", fmt.Errorf("unsupported proxy scheme: %s", s)
 		}
-		return s, u.Host, nil
+
+		var socksAuth *proxy.Auth
+		httpHeader := ""
+		if u.User != nil {
+			username := u.User.Username()
+			password, _ := u.User.Password()
+			if username != "" {
+				socksAuth = &proxy.Auth{User: username, Password: password}
+				httpHeader = "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
+			}
+		}
+
+		return s, u.Host, socksAuth, httpHeader, nil
 	}
 
-	return "socks5", entry, nil
+	return "socks5", entry, nil, "", nil
 }
 
 func checkCloudflareBypassMixed(proxyEntry string) bool {
@@ -860,7 +906,7 @@ func checkCloudflareBypassMixed(proxyEntry string) bool {
 		return false
 	}
 
-	scheme, addr, err := parseMixedProxy(proxyEntry)
+	_, scheme, addr, auth, httpAuthHeader, err := resolveMixedProxyForDial(proxyEntry)
 	if err != nil {
 		return false
 	}
@@ -870,7 +916,7 @@ func checkCloudflareBypassMixed(proxyEntry string) bool {
 	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 
 	if dialScheme == "socks5" || dialScheme == "socks5h" {
-		dialer, dialErr := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
+		dialer, dialErr := proxy.SOCKS5("tcp", addr, auth, proxy.Direct)
 		if dialErr != nil {
 			return false
 		}
@@ -878,9 +924,9 @@ func checkCloudflareBypassMixed(proxyEntry string) bool {
 			return dialer.Dial(network, targetAddr)
 		}
 	} else {
-		proxyURL, parseErr := url.Parse(fmt.Sprintf("%s://%s", dialScheme, addr))
-		if parseErr != nil {
-			return false
+		proxyURL := &url.URL{Scheme: dialScheme, Host: addr}
+		if auth != nil {
+			proxyURL.User = url.UserPassword(auth.User, auth.Password)
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
@@ -891,6 +937,9 @@ func checkCloudflareBypassMixed(proxyEntry string) bool {
 		return false
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 DynamicProxy/1.0")
+	if httpAuthHeader != "" {
+		req.Header.Set("Proxy-Authorization", httpAuthHeader)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -924,7 +973,7 @@ func checkCloudflareBypassMixed(proxyEntry string) bool {
 }
 
 func checkMixedProxyHealth(proxyEntry string, strictMode bool) bool {
-	scheme, addr, err := parseMixedProxy(proxyEntry)
+	_, scheme, addr, auth, _, err := resolveMixedProxyForDial(proxyEntry)
 	if err != nil {
 		return false
 	}
@@ -937,9 +986,9 @@ func checkMixedProxyHealth(proxyEntry string, strictMode bool) bool {
 	threshold := time.Duration(config.HealthCheck.TLSHandshakeThresholdSeconds) * time.Second
 	totalTimeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
 
-	proxyURL, err := url.Parse(fmt.Sprintf("%s://%s", dialScheme, addr))
-	if err != nil {
-		return false
+	proxyURL := &url.URL{Scheme: dialScheme, Host: addr}
+	if auth != nil {
+		proxyURL.User = url.UserPassword(auth.User, auth.Password)
 	}
 
 	transport := &http.Transport{
@@ -1504,18 +1553,21 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 
 	log.Printf("[HTTP-%s] Using proxy %s for %s %s", mode, proxyAddr, r.Method, r.URL.String())
 
-	scheme, upstreamAddr, err := parseMixedProxy(proxyAddr)
+	displayScheme, scheme, upstreamAddr, upstreamAuth, upstreamHTTPAuthHeader, err := resolveMixedProxyForDial(proxyAddr)
 	if err != nil {
 		log.Printf("[HTTP-%s] ERROR: Invalid proxy entry %s: %v", mode, proxyAddr, err)
 		http.Error(w, "Invalid upstream proxy", http.StatusInternalServerError)
 		return
+	}
+	if displayScheme != scheme {
+		log.Printf("[HTTP-%s] Bridged scheme %s via %s", mode, displayScheme, scheme)
 	}
 
 	// Handle CONNECT method for HTTPS
 	if r.Method == http.MethodConnect {
 		dialScheme := getDialSchemeForMixed(scheme)
 		if dialScheme == "socks5" || dialScheme == "socks5h" {
-			dialer, dialErr := proxy.SOCKS5("tcp", upstreamAddr, nil, proxy.Direct)
+			dialer, dialErr := proxy.SOCKS5("tcp", upstreamAddr, upstreamAuth, proxy.Direct)
 			if dialErr != nil {
 				log.Printf("[HTTP-%s] ERROR: Failed to create dialer for proxy %s: %v", mode, proxyAddr, dialErr)
 				http.Error(w, "Failed to create proxy dialer", http.StatusInternalServerError)
@@ -1528,7 +1580,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 		}
 
 		handleHTTPSProxy(w, r, func(target string) (net.Conn, error) {
-			return dialTargetThroughHTTPProxy(dialScheme, upstreamAddr, target)
+			return dialTargetThroughHTTPProxy(dialScheme, upstreamAddr, upstreamHTTPAuthHeader, target)
 		}, proxyAddr, mode)
 		return
 	}
@@ -1541,7 +1593,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 
 	dialScheme := getDialSchemeForMixed(scheme)
 	if dialScheme == "socks5" || dialScheme == "socks5h" {
-		dialer, dialErr := proxy.SOCKS5("tcp", upstreamAddr, nil, proxy.Direct)
+		dialer, dialErr := proxy.SOCKS5("tcp", upstreamAddr, upstreamAuth, proxy.Direct)
 		if dialErr != nil {
 			log.Printf("[HTTP-%s] ERROR: Failed to create dialer for proxy %s: %v", mode, proxyAddr, dialErr)
 			http.Error(w, "Failed to create proxy dialer", http.StatusInternalServerError)
@@ -1549,11 +1601,9 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 		}
 		transport.Dial = dialer.Dial
 	} else {
-		proxyURL, parseErr := url.Parse(fmt.Sprintf("%s://%s", dialScheme, upstreamAddr))
-		if parseErr != nil {
-			log.Printf("[HTTP-%s] ERROR: Invalid upstream HTTP proxy %s: %v", mode, proxyAddr, parseErr)
-			http.Error(w, "Invalid upstream proxy", http.StatusInternalServerError)
-			return
+		proxyURL := &url.URL{Scheme: dialScheme, Host: upstreamAddr}
+		if upstreamAuth != nil {
+			proxyURL.User = url.UserPassword(upstreamAuth.User, upstreamAuth.Password)
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
@@ -1651,7 +1701,7 @@ func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetDial func(st
 	wg.Wait()
 }
 
-func dialTargetThroughHTTPProxy(proxyScheme string, proxyAddr string, targetHost string) (net.Conn, error) {
+func dialTargetThroughHTTPProxy(proxyScheme string, proxyAddr string, proxyAuthHeader string, targetHost string) (net.Conn, error) {
 	connectAddr := proxyAddr
 	if !strings.Contains(connectAddr, ":") {
 		if proxyScheme == "https" {
@@ -1677,6 +1727,9 @@ func dialTargetThroughHTTPProxy(proxyScheme string, proxyAddr string, targetHost
 		URL:    &url.URL{Opaque: targetHost},
 		Host:   targetHost,
 		Header: make(http.Header),
+	}
+	if proxyAuthHeader != "" {
+		connectReq.Header.Set("Proxy-Authorization", proxyAuthHeader)
 	}
 
 	if err := connectReq.Write(conn); err != nil {

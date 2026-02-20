@@ -6,6 +6,69 @@ import (
 	"testing"
 )
 
+func TestNormalizeMixedProxyEntry_PreservesCredentials(t *testing.T) {
+	got, ok := normalizeMixedProxyEntry("http://user:pass@127.0.0.1:8080")
+	if !ok {
+		t.Fatalf("expected normalization success")
+	}
+	if got != "http://user:pass@127.0.0.1:8080" {
+		t.Fatalf("expected credentials to be preserved, got %s", got)
+	}
+}
+
+func TestParseMixedProxy_WithCredentials(t *testing.T) {
+	scheme, addr, auth, httpAuthHeader, err := parseMixedProxy("http://user:pass@127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if scheme != "http" {
+		t.Fatalf("expected scheme http, got %s", scheme)
+	}
+	if addr != "127.0.0.1:8080" {
+		t.Fatalf("expected addr 127.0.0.1:8080, got %s", addr)
+	}
+	if auth == nil || auth.User != "user" || auth.Password != "pass" {
+		t.Fatalf("unexpected parsed auth: %#v", auth)
+	}
+	if httpAuthHeader != "Basic dXNlcjpwYXNz" {
+		t.Fatalf("unexpected Proxy-Authorization value: %s", httpAuthHeader)
+	}
+}
+
+func TestResolveMixedProxyForDial_VmessWithoutBridge(t *testing.T) {
+	original := config
+	defer func() { config = original }()
+	config.ProtocolBridge.URL = ""
+
+	_, _, _, _, _, err := resolveMixedProxyForDial("vmess://1.2.3.4:443")
+	if err == nil {
+		t.Fatalf("expected error when vmess is used without protocol bridge")
+	}
+}
+
+func TestResolveMixedProxyForDial_VmessWithBridge(t *testing.T) {
+	original := config
+	defer func() { config = original }()
+	config.ProtocolBridge.URL = "socks5://bridge-user:bridge-pass@127.0.0.1:7891"
+
+	displayScheme, scheme, addr, auth, _, err := resolveMixedProxyForDial("vmess://1.2.3.4:443")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if displayScheme != "vmess" {
+		t.Fatalf("expected display scheme vmess, got %s", displayScheme)
+	}
+	if scheme != "socks5" {
+		t.Fatalf("expected bridged scheme socks5, got %s", scheme)
+	}
+	if addr != "127.0.0.1:7891" {
+		t.Fatalf("expected bridged addr 127.0.0.1:7891, got %s", addr)
+	}
+	if auth == nil || auth.User != "bridge-user" || auth.Password != "bridge-pass" {
+		t.Fatalf("unexpected bridged auth: %#v", auth)
+	}
+}
+
 func TestParseRegularProxyContent_Base64Plain(t *testing.T) {
 	raw := "1.1.1.1:80\n2.2.2.2:1080\n"
 	encoded := base64.StdEncoding.EncodeToString([]byte(raw))

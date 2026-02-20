@@ -73,3 +73,10 @@ cf_challenge_check:
     - "cf-challenge"
     - "captcha"
   timeout_seconds: 12
+
+# 非原生协议桥接（可选）
+# 当 mixed 列表中包含 vmess/vless/hy2/hysteria2 节点时，程序无法直接与这些协议握手。
+# 可配置一个本地/远端桥接代理（http/https/socks5/socks5h），将这些节点以“后置链式代理”方式转发。
+# 示例：url: "socks5://127.0.0.1:7891"
+protocol_bridge:
+  url: ""
