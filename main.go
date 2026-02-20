@@ -408,15 +408,6 @@ var httpSocksMixedSchemes = map[string]bool{
 	"socks5h": true,
 }
 
-var mainstreamMixedSchemes = map[string]bool{
-	"vmess":     true,
-	"vless":     true,
-	"ss":        true,
-	"trojan":    true,
-	"hy2":       true,
-	"hysteria2": true,
-}
-
 const mainstreamMixedRelayPort = "17290"
 
 func parseClashSubscription(content string) ([]string, bool) {
@@ -1476,6 +1467,20 @@ func filterMixedProxiesByScheme(entries []string, allowed map[string]bool) []str
 	return filtered
 }
 
+func filterMixedProxiesExcludingSchemes(entries []string, blocked map[string]bool) []string {
+	filtered := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		scheme, _, _, _, err := parseMixedProxy(entry)
+		if err != nil {
+			continue
+		}
+		if !blocked[scheme] {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
 func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool) {
 	if !atomic.CompareAndSwapInt32(&mixedPool.updating, 0, 1) {
 		log.Println("Mixed proxy update already in progress, skipping...")
@@ -1494,7 +1499,8 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 	result := healthCheckMixedProxies(proxies)
 
 	httpSocksHealthy := filterMixedProxiesByScheme(result.Healthy, httpSocksMixedSchemes)
-	mainstreamHealthy := filterMixedProxiesByScheme(result.Healthy, mainstreamMixedSchemes)
+	mainstreamHealthy := filterMixedProxiesExcludingSchemes(result.Healthy, httpSocksMixedSchemes)
+	log.Printf("[MIXED] Health check split result: total_healthy=%d http_socks=%d mainstream=%d", len(result.Healthy), len(httpSocksHealthy), len(mainstreamHealthy))
 
 	if len(httpSocksHealthy) > 0 {
 		mixedPool.Update(httpSocksHealthy)
@@ -1505,9 +1511,9 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 
 	if len(mainstreamHealthy) > 0 {
 		mainstreamMixedPool.Update(mainstreamHealthy)
-		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy mainstream mixed proxies (vmess/vless/ss/trojan/hy2/hysteria2)", len(mainstreamHealthy))
+		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy non-HTTP/SOCKS mixed proxies", len(mainstreamHealthy))
 	} else {
-		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy mainstream mixed proxies (vmess/vless/ss/trojan/hy2/hysteria2) found, keeping existing pool")
+		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy non-HTTP/SOCKS mixed proxies found, keeping existing pool")
 	}
 
 	if config.CFChallengeCheck.Enabled {
@@ -1656,8 +1662,8 @@ func startSOCKS5Server(pool *ProxyPool, port string, mode string) error {
 // HTTP Proxy Server
 func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode string) {
 	if r.URL.Path == "/list" {
-		if !validateHTTPProxyAuth(r) {
-			requireHTTPProxyAuth(w, mode)
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "HTTP-"+mode)
 			return
 		}
 		writePoolListResponse(w, pool, mode)

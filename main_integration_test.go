@@ -213,16 +213,29 @@ func TestListEndpointForHTTPProxyPool(t *testing.T) {
 	pool.Update([]string{"1.1.1.1:80", "2.2.2.2:80"})
 	_, _ = pool.GetNext()
 
+	cfg := Config{}
+	cfg.Auth.Username = "admin"
+	cfg.Auth.Password = "secret"
+	config = cfg
+
 	req := httptest.NewRequest(http.MethodGet, "http://local/list", nil)
 	rr := httptest.NewRecorder()
 	handleHTTPProxy(rr, req, pool, "MIXED")
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized status code, got: %d body=%s", rr.Code, rr.Body.String())
+	}
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("unexpected status code: %d body=%s", rr.Code, rr.Body.String())
+	reqOK := httptest.NewRequest(http.MethodGet, "http://local/list", nil)
+	reqOK.SetBasicAuth("admin", "secret")
+	rrOK := httptest.NewRecorder()
+	handleHTTPProxy(rrOK, reqOK, pool, "MIXED")
+
+	if rrOK.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: %d body=%s", rrOK.Code, rrOK.Body.String())
 	}
 
 	var payload map[string]interface{}
-	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+	if err := json.Unmarshal(rrOK.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 	if int(payload["proxy_count"].(float64)) != 2 {
@@ -230,5 +243,39 @@ func TestListEndpointForHTTPProxyPool(t *testing.T) {
 	}
 	if payload["current_proxy"].(string) == "" {
 		t.Fatalf("current_proxy should not be empty: %+v", payload)
+	}
+}
+
+func TestMixedSchemeFilteringFor17290(t *testing.T) {
+	entries := []string{
+		"http://1.1.1.1:80",
+		"https://2.2.2.2:443",
+		"socks5://3.3.3.3:1080",
+		"socks5h://4.4.4.4:1080",
+		"vmess://5.5.5.5:443",
+		"vless://uuid@6.6.6.6:443",
+		"ss://aes-128-gcm:pwd@7.7.7.7:8388",
+		"trojan://pwd@8.8.8.8:443",
+		"hy2://pwd@9.9.9.9:443",
+	}
+
+	httpSocks := filterMixedProxiesByScheme(entries, httpSocksMixedSchemes)
+	nonHTTPSocks := filterMixedProxiesExcludingSchemes(entries, httpSocksMixedSchemes)
+
+	if len(httpSocks) != 4 {
+		t.Fatalf("expected 4 http/socks proxies, got %d: %v", len(httpSocks), httpSocks)
+	}
+	if len(nonHTTPSocks) != 5 {
+		t.Fatalf("expected 5 non-http/socks proxies, got %d: %v", len(nonHTTPSocks), nonHTTPSocks)
+	}
+
+	for _, v := range nonHTTPSocks {
+		scheme, _, _, _, err := parseMixedProxy(v)
+		if err != nil {
+			t.Fatalf("unexpected parse err for %s: %v", v, err)
+		}
+		if httpSocksMixedSchemes[scheme] {
+			t.Fatalf("17290 pool should not contain http/socks proxy, found: %s", v)
+		}
 	}
 }
