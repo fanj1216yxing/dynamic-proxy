@@ -64,6 +64,7 @@ type Config struct {
 var config Config
 
 const proxySwitchInterval = 30 * time.Minute
+const connectivityCheckInterval = 10 * time.Second
 
 // Simple regex to extract ip:port from any format (used for special proxy lists)
 // Matches: [IP]:[port] and ignores any protocol prefixes or extra text
@@ -263,6 +264,21 @@ func (p *ProxyPool) GetAll() []string {
 	result := make([]string, len(p.proxies))
 	copy(result, p.proxies)
 	return result
+}
+
+func (p *ProxyPool) GetCurrent() (string, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if len(p.proxies) == 0 || !p.hasSelected {
+		return "", false
+	}
+
+	if p.index < 0 || p.index >= len(p.proxies) {
+		return "", false
+	}
+
+	return p.proxies[p.index], true
 }
 
 func (p *ProxyPool) ForceRotate() (string, error) {
@@ -1637,6 +1653,41 @@ func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfP
 	return server.ListenAndServe()
 }
 
+func startProxyConnectivityMonitor(pool *ProxyPool, mode string, interval time.Duration, checker func(string) bool) {
+	if interval <= 0 {
+		interval = connectivityCheckInterval
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			proxyAddr, ok := pool.GetCurrent()
+			if !ok {
+				continue
+			}
+
+			if checker(proxyAddr) {
+				continue
+			}
+
+			newProxy, err := pool.ForceRotate()
+			if err != nil {
+				log.Printf("[AUTO-ROTATE-%s] connectivity check failed for %s, but rotate failed: %v", mode, proxyAddr, err)
+				continue
+			}
+
+			if newProxy == proxyAddr {
+				log.Printf("[AUTO-ROTATE-%s] connectivity check failed for %s, only one proxy available", mode, proxyAddr)
+				continue
+			}
+
+			log.Printf("[AUTO-ROTATE-%s] connectivity check failed for %s, rotated to %s", mode, proxyAddr, newProxy)
+		}
+	}()
+}
+
 func main() {
 	log.Println("Starting Dynamic Proxy Server...")
 
@@ -1677,6 +1728,20 @@ func main() {
 
 	// Start proxy updater with initial synchronous update
 	startProxyUpdater(strictPool, relaxedPool, cfPool, mixedHTTPPool, cfMixedHTTPPool, true)
+
+	// Auto monitor current selected proxies and rotate when connectivity is lost
+	startProxyConnectivityMonitor(strictPool, "STRICT", connectivityCheckInterval, func(proxyAddr string) bool {
+		return checkProxyHealth(proxyAddr, true)
+	})
+	startProxyConnectivityMonitor(relaxedPool, "RELAXED", connectivityCheckInterval, func(proxyAddr string) bool {
+		return checkProxyHealth(proxyAddr, false)
+	})
+	startProxyConnectivityMonitor(mixedHTTPPool, "MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
+		return checkMixedProxyHealth(proxyEntry, false)
+	})
+	startProxyConnectivityMonitor(cfMixedHTTPPool, "CF-MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
+		return checkMixedProxyHealth(proxyEntry, false)
+	})
 
 	// Check proxy pool status
 	strictCount := len(strictPool.GetAll())
@@ -1763,5 +1828,6 @@ func main() {
 	log.Println("  [CF-MIXED] HTTP (CF-pass SOCKS5/HTTP upstream): " + config.Ports.HTTPCFMixed)
 	log.Println("  [ROTATE] Control: " + config.Ports.RotateControl)
 	log.Printf("Proxy pools will update every %d minutes in background...", config.UpdateIntervalMinutes)
+	log.Printf("Auto connectivity monitor enabled: checks every %s and rotates unhealthy current proxy", connectivityCheckInterval)
 	wg.Wait()
 }
