@@ -1206,6 +1206,82 @@ func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *Prox
 	}
 }
 
+type MixedHealthCheckResult struct {
+	Healthy []string
+	CFPass  []string
+}
+
+func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	mixedHealthy := make([]string, 0)
+	cfPassHealthy := make([]string, 0)
+
+	total := len(proxies)
+	var checked int64
+	var healthyCount int64
+	var cfPassCount int64
+
+	semaphore := make(chan struct{}, config.HealthCheckConcurrency)
+	done := make(chan struct{})
+
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		lastChecked := int64(0)
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				current := atomic.LoadInt64(&checked)
+				healthyCurrent := atomic.LoadInt64(&healthyCount)
+				cfCurrent := atomic.LoadInt64(&cfPassCount)
+				if current != lastChecked {
+					percentage := float64(current) / float64(total) * 100
+					barWidth := 40
+					filled := int(float64(barWidth) * float64(current) / float64(total))
+					bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+					log.Printf("[MIXED-%s] %d/%d (%.1f%%) | Healthy: %d | CF-Pass: %d", bar, current, total, percentage, healthyCurrent, cfCurrent)
+					lastChecked = current
+				}
+			}
+		}
+	}()
+
+	for _, proxyEntry := range proxies {
+		wg.Add(1)
+		go func(entry string) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			healthy := checkMixedProxyHealth(entry, false)
+			if healthy {
+				mu.Lock()
+				mixedHealthy = append(mixedHealthy, entry)
+				mu.Unlock()
+				atomic.AddInt64(&healthyCount, 1)
+				if config.CFChallengeCheck.Enabled && checkCloudflareBypassMixed(entry) {
+					mu.Lock()
+					cfPassHealthy = append(cfPassHealthy, entry)
+					mu.Unlock()
+					atomic.AddInt64(&cfPassCount, 1)
+				}
+			}
+			atomic.AddInt64(&checked, 1)
+		}(proxyEntry)
+	}
+
+	wg.Wait()
+	close(done)
+	log.Printf("[MIXED-%s] %d/%d (100.0%%) | Healthy: %d | CF-Pass: %d", strings.Repeat("█", 40), total, total, len(mixedHealthy), len(cfPassHealthy))
+	sort.Strings(cfPassHealthy)
+
+	return MixedHealthCheckResult{Healthy: mixedHealthy, CFPass: cfPassHealthy}
+}
+
 func updateMixedProxyPool(mixedPool *ProxyPool, cfMixedPool *ProxyPool) {
 	if !atomic.CompareAndSwapInt32(&mixedPool.updating, 0, 1) {
 		log.Println("Mixed proxy update already in progress, skipping...")
@@ -1220,28 +1296,20 @@ func updateMixedProxyPool(mixedPool *ProxyPool, cfMixedPool *ProxyPool) {
 		return
 	}
 
-	mixedHealthy := make([]string, 0)
-	cfPassHealthy := make([]string, 0)
-	for _, proxyEntry := range proxies {
-		if checkMixedProxyHealth(proxyEntry, false) {
-			mixedHealthy = append(mixedHealthy, proxyEntry)
-			if config.CFChallengeCheck.Enabled && checkCloudflareBypassMixed(proxyEntry) {
-				cfPassHealthy = append(cfPassHealthy, proxyEntry)
-			}
-		}
-	}
+	log.Printf("Fetched %d mixed proxies, starting health check...", len(proxies))
+	result := healthCheckMixedProxies(proxies)
 
-	if len(mixedHealthy) > 0 {
-		mixedPool.Update(mixedHealthy)
-		log.Printf("[HTTP-MIXED] Pool updated with %d healthy mixed proxies", len(mixedHealthy))
+	if len(result.Healthy) > 0 {
+		mixedPool.Update(result.Healthy)
+		log.Printf("[HTTP-MIXED] Pool updated with %d healthy mixed proxies", len(result.Healthy))
 	} else {
 		log.Println("[HTTP-MIXED] Warning: No healthy mixed proxies found, keeping existing pool")
 	}
 
 	if config.CFChallengeCheck.Enabled {
-		if len(cfPassHealthy) > 0 {
-			cfMixedPool.Update(cfPassHealthy)
-			log.Printf("[HTTP-CF-MIXED] Pool updated with %d CF-pass mixed proxies", len(cfPassHealthy))
+		if len(result.CFPass) > 0 {
+			cfMixedPool.Update(result.CFPass)
+			log.Printf("[HTTP-CF-MIXED] Pool updated with %d CF-pass mixed proxies", len(result.CFPass))
 		} else {
 			log.Println("[HTTP-CF-MIXED] Warning: No CF-pass mixed proxies found, keeping existing pool")
 		}
