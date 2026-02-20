@@ -707,8 +707,6 @@ func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dial
 		return "http", overridePort(addr, mainstreamMixedRelayPort), false
 	case "vless", "hy2", "hysteria2", "trojan":
 		return "http", overridePort(addr, mainstreamMixedRelayPort), true
-	case "ss":
-		return "socks5", overridePort(addr, mainstreamMixedRelayPort), false
 	default:
 		return scheme, addr, true
 	}
@@ -716,7 +714,7 @@ func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dial
 
 func isMainstreamMixedScheme(scheme string) bool {
 	switch scheme {
-	case "vmess", "vless", "ss", "trojan", "hy2", "hysteria2":
+	case "vmess", "vless", "trojan", "hy2", "hysteria2":
 		return true
 	default:
 		return false
@@ -725,7 +723,7 @@ func isMainstreamMixedScheme(scheme string) bool {
 
 func hasRequiredMainstreamAuth(scheme string, auth *proxy.Auth) bool {
 	switch scheme {
-	case "vless", "ss", "trojan", "hy2", "hysteria2":
+	case "vless", "trojan", "hy2", "hysteria2":
 		return auth != nil && strings.TrimSpace(auth.User) != ""
 	default:
 		return true
