@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,12 +40,21 @@ type Config struct {
 		SOCKS5Relaxed string `yaml:"socks5_relaxed"`
 		HTTPStrict    string `yaml:"http_strict"`
 		HTTPRelaxed   string `yaml:"http_relaxed"`
+		HTTPMixed     string `yaml:"http_mixed"`
+		HTTPCFMixed   string `yaml:"http_cf_mixed"`
 		RotateControl string `yaml:"rotate_control"`
 	} `yaml:"ports"`
 	Auth struct {
 		Username string `yaml:"username"`
 		Password string `yaml:"password"`
 	} `yaml:"auth"`
+	CFChallengeCheck struct {
+		Enabled          bool     `yaml:"enabled"`
+		URL              string   `yaml:"url"`
+		ExpectedStatuses []int    `yaml:"expected_statuses"`
+		BlockIndicators  []string `yaml:"block_indicators"`
+		TimeoutSeconds   int      `yaml:"timeout_seconds"`
+	} `yaml:"cf_challenge_check"`
 }
 
 // Global config variable
@@ -94,8 +106,26 @@ func loadConfig(filename string) (*Config, error) {
 	if cfg.Ports.HTTPRelaxed == "" {
 		cfg.Ports.HTTPRelaxed = ":8082"
 	}
+	if cfg.Ports.HTTPMixed == "" {
+		cfg.Ports.HTTPMixed = ":8084"
+	}
+	if cfg.Ports.HTTPCFMixed == "" {
+		cfg.Ports.HTTPCFMixed = ":8086"
+	}
 	if cfg.Ports.RotateControl == "" {
 		cfg.Ports.RotateControl = ":9090"
+	}
+
+	if cfg.CFChallengeCheck.Enabled {
+		if cfg.CFChallengeCheck.URL == "" {
+			return nil, fmt.Errorf("cf_challenge_check.url must be set when enabled")
+		}
+		if cfg.CFChallengeCheck.TimeoutSeconds <= 0 {
+			cfg.CFChallengeCheck.TimeoutSeconds = 12
+		}
+		if len(cfg.CFChallengeCheck.ExpectedStatuses) == 0 {
+			cfg.CFChallengeCheck.ExpectedStatuses = []int{http.StatusOK}
+		}
 	}
 
 	if (cfg.Auth.Username == "") != (cfg.Auth.Password == "") {
@@ -115,12 +145,25 @@ func requireHTTPProxyAuth(w http.ResponseWriter, mode string) {
 	http.Error(w, "Proxy authentication required", http.StatusProxyAuthRequired)
 }
 
+func requireBasicAuth(w http.ResponseWriter, mode string) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="Dynamic Proxy Rotate Control"`)
+	log.Printf("[%s] Unauthorized request rejected", mode)
+	http.Error(w, "Authentication required", http.StatusUnauthorized)
+}
+
 func validateHTTPProxyAuth(r *http.Request) bool {
+	return validateAuthHeader(r.Header.Get("Proxy-Authorization"))
+}
+
+func validateBasicAuth(r *http.Request) bool {
+	return validateAuthHeader(r.Header.Get("Authorization"))
+}
+
+func validateAuthHeader(authHeader string) bool {
 	if !isProxyAuthEnabled() {
 		return true
 	}
 
-	authHeader := r.Header.Get("Proxy-Authorization")
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Basic ") {
 		return false
 	}
@@ -145,11 +188,13 @@ type ProxyPool struct {
 	nextSwitch  time.Time
 	hasSelected bool
 	updating    int32 // atomic flag to prevent concurrent updates
+	rng         *rand.Rand
 }
 
 func NewProxyPool() *ProxyPool {
 	return &ProxyPool{
 		proxies: make([]string, 0),
+		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -159,7 +204,7 @@ func (p *ProxyPool) Update(proxies []string) {
 
 	oldCount := len(p.proxies)
 	p.proxies = proxies
-	// Reset selection state so the first connection after update always uses proxy #1.
+	// Reset selection state so the first connection after update reselects a proxy.
 	p.index = 0
 	p.nextSwitch = time.Time{}
 	p.hasSelected = false
@@ -175,18 +220,18 @@ func (p *ProxyPool) GetNext() (string, error) {
 		return "", fmt.Errorf("no available proxies")
 	}
 
-	// First request after a pool update always uses proxy #1.
+	// First request after a pool update randomly selects one healthy proxy.
 	if !p.hasSelected {
-		p.index = 0
+		p.index = p.randomIndexExcluding(-1)
 		p.nextSwitch = time.Now().Add(proxySwitchInterval)
 		p.hasSelected = true
 		return p.proxies[p.index], nil
 	}
 
-	// Keep using the same proxy for 30 minutes, then switch to the next one.
+	// Keep using the same proxy for 30 minutes, then randomly switch to another one.
 	now := time.Now()
 	if !p.nextSwitch.IsZero() && (now.After(p.nextSwitch) || now.Equal(p.nextSwitch)) {
-		p.index = (p.index + 1) % len(p.proxies)
+		p.index = p.randomIndexExcluding(p.index)
 		p.nextSwitch = now.Add(proxySwitchInterval)
 	}
 
@@ -195,6 +240,18 @@ func (p *ProxyPool) GetNext() (string, error) {
 	}
 
 	return p.proxies[p.index], nil
+}
+
+func (p *ProxyPool) randomIndexExcluding(exclude int) int {
+	if len(p.proxies) <= 1 {
+		return 0
+	}
+
+	idx := p.rng.Intn(len(p.proxies) - 1)
+	if exclude >= 0 && idx >= exclude {
+		idx++
+	}
+	return idx
 }
 
 func (p *ProxyPool) GetAll() []string {
@@ -214,10 +271,10 @@ func (p *ProxyPool) ForceRotate() (string, error) {
 	}
 
 	if !p.hasSelected {
-		p.index = 0
+		p.index = p.randomIndexExcluding(-1)
 		p.hasSelected = true
 	} else {
-		p.index = (p.index + 1) % len(p.proxies)
+		p.index = p.randomIndexExcluding(p.index)
 	}
 
 	p.nextSwitch = time.Now().Add(proxySwitchInterval)
@@ -254,6 +311,158 @@ func parseSpecialProxyURL(content string) ([]string, error) {
 	}
 
 	return proxies, nil
+}
+
+type clashSubscription struct {
+	Proxies []struct {
+		Type   string `yaml:"type"`
+		Server string `yaml:"server"`
+		Port   int    `yaml:"port"`
+	} `yaml:"proxies"`
+}
+
+func parseClashSubscription(content string) ([]string, bool) {
+	var sub clashSubscription
+	if err := yaml.Unmarshal([]byte(content), &sub); err != nil || len(sub.Proxies) == 0 {
+		return nil, false
+	}
+
+	result := make([]string, 0, len(sub.Proxies))
+	seen := make(map[string]bool)
+	for _, p := range sub.Proxies {
+		proxyType := strings.ToLower(strings.TrimSpace(p.Type))
+		if proxyType != "socks5" && proxyType != "socks5h" {
+			continue
+		}
+		if p.Server == "" || p.Port <= 0 {
+			continue
+		}
+		entry := fmt.Sprintf("%s:%d", p.Server, p.Port)
+		if !seen[entry] {
+			seen[entry] = true
+			result = append(result, entry)
+		}
+	}
+
+	return result, len(result) > 0
+}
+
+func parseRegularProxyContent(content string) ([]string, string) {
+	if clashProxies, ok := parseClashSubscription(content); ok {
+		return clashProxies, "clash"
+	}
+
+	proxies := make([]string, 0)
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "socks5://")
+		line = strings.TrimPrefix(line, "socks4://")
+		line = strings.TrimPrefix(line, "https://")
+		line = strings.TrimPrefix(line, "http://")
+		proxies = append(proxies, line)
+	}
+
+	return proxies, "plain"
+}
+
+func parseMixedProxyLine(line string) []string {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return nil
+	}
+	lower := strings.ToLower(line)
+	if strings.HasPrefix(lower, "socks5://") || strings.HasPrefix(lower, "socks4://") {
+		addr := strings.TrimPrefix(strings.TrimPrefix(line, "socks5://"), "socks4://")
+		return []string{"socks5://" + addr}
+	}
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		addr := strings.TrimPrefix(strings.TrimPrefix(line, "http://"), "https://")
+		return []string{"http://" + addr}
+	}
+	return []string{"socks5://" + line, "http://" + line}
+}
+
+func parseMixedProxyContent(content string) ([]string, string) {
+	if clashProxies, ok := parseClashSubscription(content); ok {
+		result := make([]string, 0, len(clashProxies))
+		for _, p := range clashProxies {
+			result = append(result, "socks5://"+p)
+		}
+		return result, "clash"
+	}
+
+	result := make([]string, 0)
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		for _, entry := range parseMixedProxyLine(scanner.Text()) {
+			result = append(result, entry)
+		}
+	}
+	return result, "plain"
+}
+
+func fetchMixedProxyList() ([]string, error) {
+	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	all := make([]string, 0)
+	seen := make(map[string]bool)
+	for _, sourceURL := range config.ProxyListURLs {
+		resp, err := client.Get(sourceURL)
+		if err != nil {
+			log.Printf("Warning: Failed to fetch mixed list from %s: %v", sourceURL, err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		entries, format := parseMixedProxyContent(string(body))
+		count := 0
+		for _, e := range entries {
+			if !seen[e] {
+				seen[e] = true
+				all = append(all, e)
+				count++
+			}
+		}
+		log.Printf("Fetched %d mixed proxies from %s (format=%s)", count, sourceURL, format)
+	}
+	for _, sourceURL := range config.SpecialProxyListUrls {
+		resp, err := client.Get(sourceURL)
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		entries, _ := parseSpecialProxyURL(string(body))
+		for _, addr := range entries {
+			for _, e := range []string{"socks5://" + addr, "http://" + addr} {
+				if !seen[e] {
+					seen[e] = true
+					all = append(all, e)
+				}
+			}
+		}
+	}
+	if len(all) == 0 {
+		return nil, fmt.Errorf("no mixed proxies fetched from any source")
+	}
+	return all, nil
 }
 
 func fetchProxyList() ([]string, error) {
@@ -293,29 +502,17 @@ func fetchProxyList() ([]string, error) {
 		}
 
 		content := string(body)
+		parsedProxies, format := parseRegularProxyContent(content)
 		count := 0
-		scanner := bufio.NewScanner(strings.NewReader(content))
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			// Support formats: ip:port, http://ip:port, https://ip:port, socks5://ip:port, socks4://ip:port
-			// Strip protocol prefixes using string operations (no regex for better performance)
-			line = strings.TrimPrefix(line, "socks5://")
-			line = strings.TrimPrefix(line, "socks4://")
-			line = strings.TrimPrefix(line, "https://")
-			line = strings.TrimPrefix(line, "http://")
-
-			// 去重
-			if !proxySet[line] {
-				proxySet[line] = true
-				allProxies = append(allProxies, line)
+		for _, parsed := range parsedProxies {
+			if !proxySet[parsed] {
+				proxySet[parsed] = true
+				allProxies = append(allProxies, parsed)
 				count++
 			}
 		}
 
-		log.Printf("Fetched %d proxies from regular URL %s", count, url)
+		log.Printf("Fetched %d proxies from regular URL %s (format=%s)", count, url, format)
 	}
 
 	// 处理特殊代理URL（复杂格式）
@@ -368,6 +565,166 @@ func fetchProxyList() ([]string, error) {
 
 	log.Printf("Total unique proxies fetched: %d", len(allProxies))
 	return allProxies, nil
+}
+
+func checkCloudflareBypass(proxyAddr string) bool {
+	if !config.CFChallengeCheck.Enabled {
+		return false
+	}
+
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
+	if err != nil {
+		return false
+	}
+
+	timeout := time.Duration(config.CFChallengeCheck.TimeoutSeconds) * time.Second
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.Dial(network, addr)
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{Transport: transport, Timeout: timeout}
+
+	req, err := http.NewRequest(http.MethodGet, config.CFChallengeCheck.URL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 DynamicProxy/1.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	allowed := false
+	for _, code := range config.CFChallengeCheck.ExpectedStatuses {
+		if resp.StatusCode == code {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return false
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return false
+	}
+	content := strings.ToLower(string(body))
+	for _, indicator := range config.CFChallengeCheck.BlockIndicators {
+		if indicator != "" && strings.Contains(content, strings.ToLower(indicator)) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func splitUpstreamProxy(upstream string) (scheme, addr string, err error) {
+	parsed, err := url.Parse(upstream)
+	if err != nil {
+		return "", "", err
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return "", "", fmt.Errorf("invalid upstream proxy: %s", upstream)
+	}
+	return strings.ToLower(parsed.Scheme), parsed.Host, nil
+}
+
+func checkMixedProxyHealth(upstream string) bool {
+	scheme, addr, err := splitUpstreamProxy(upstream)
+	if err != nil {
+		return false
+	}
+	switch scheme {
+	case "socks5", "socks4":
+		return checkProxyHealth(addr, false)
+	case "http", "https":
+		proxyURL, err := url.Parse("http://" + addr)
+		if err != nil {
+			return false
+		}
+		client := &http.Client{
+			Timeout: time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second,
+			Transport: &http.Transport{
+				Proxy:           http.ProxyURL(proxyURL),
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+		resp, err := client.Get("https://www.google.com/generate_204")
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode >= 200 && resp.StatusCode < 500
+	default:
+		return false
+	}
+}
+
+func checkCloudflareBypassMixed(upstream string) bool {
+	if !config.CFChallengeCheck.Enabled {
+		return false
+	}
+	scheme, addr, err := splitUpstreamProxy(upstream)
+	if err != nil {
+		return false
+	}
+	timeout := time.Duration(config.CFChallengeCheck.TimeoutSeconds) * time.Second
+	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	switch scheme {
+	case "socks5", "socks4":
+		dialer, err := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
+		if err != nil {
+			return false
+		}
+		transport.DialContext = func(ctx context.Context, network, target string) (net.Conn, error) {
+			return dialer.Dial(network, target)
+		}
+	case "http", "https":
+		proxyURL, err := url.Parse("http://" + addr)
+		if err != nil {
+			return false
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+	default:
+		return false
+	}
+	client := &http.Client{Transport: transport, Timeout: timeout}
+	req, err := http.NewRequest(http.MethodGet, config.CFChallengeCheck.URL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 DynamicProxy/1.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	allowed := false
+	for _, code := range config.CFChallengeCheck.ExpectedStatuses {
+		if resp.StatusCode == code {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return false
+	}
+	content := strings.ToLower(string(body))
+	for _, indicator := range config.CFChallengeCheck.BlockIndicators {
+		if indicator != "" && strings.Contains(content, strings.ToLower(indicator)) {
+			return false
+		}
+	}
+	return true
 }
 
 func checkProxyHealth(proxyAddr string, strictMode bool) bool {
@@ -431,6 +788,7 @@ func checkProxyHealth(proxyAddr string, strictMode bool) bool {
 type HealthCheckResult struct {
 	Strict  []string
 	Relaxed []string
+	CFPass  []string
 }
 
 func healthCheckProxies(proxies []string) HealthCheckResult {
@@ -438,11 +796,13 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 	var mu sync.Mutex
 	strictHealthy := make([]string, 0)
 	relaxedHealthy := make([]string, 0)
+	cfPassHealthy := make([]string, 0)
 
 	total := len(proxies)
 	var checked int64
 	var strictCount int64
 	var relaxedCount int64
+	var cfPassCount int64
 
 	// Use worker pool to limit concurrent checks (from config)
 	semaphore := make(chan struct{}, config.HealthCheckConcurrency)
@@ -463,6 +823,7 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 				current := atomic.LoadInt64(&checked)
 				strictCurrent := atomic.LoadInt64(&strictCount)
 				relaxedCurrent := atomic.LoadInt64(&relaxedCount)
+				cfCurrent := atomic.LoadInt64(&cfPassCount)
 
 				// Only print if progress has changed
 				if current != lastChecked {
@@ -473,8 +834,8 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 					filled := int(float64(barWidth) * float64(current) / float64(total))
 					bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
 
-					log.Printf("[%s] %d/%d (%.1f%%) | Strict: %d | Relaxed: %d",
-						bar, current, total, percentage, strictCurrent, relaxedCurrent)
+					log.Printf("[%s] %d/%d (%.1f%%) | Strict: %d | Relaxed: %d | CF-Pass: %d",
+						bar, current, total, percentage, strictCurrent, relaxedCurrent, cfCurrent)
 
 					lastChecked = current
 				}
@@ -491,6 +852,7 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 
 			// Optimized: check strict mode first
 			strictOK := checkProxyHealth(addr, true)
+			healthy := false
 
 			if strictOK {
 				// If strict mode passes, relaxed mode must pass too
@@ -500,6 +862,7 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 				mu.Unlock()
 				atomic.AddInt64(&strictCount, 1)
 				atomic.AddInt64(&relaxedCount, 1)
+				healthy = true
 			} else {
 				// Strict mode failed, try relaxed mode
 				relaxedOK := checkProxyHealth(addr, false)
@@ -508,6 +871,16 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 					relaxedHealthy = append(relaxedHealthy, addr)
 					mu.Unlock()
 					atomic.AddInt64(&relaxedCount, 1)
+					healthy = true
+				}
+			}
+
+			if healthy && config.CFChallengeCheck.Enabled {
+				if checkCloudflareBypass(addr) {
+					mu.Lock()
+					cfPassHealthy = append(cfPassHealthy, addr)
+					mu.Unlock()
+					atomic.AddInt64(&cfPassCount, 1)
 				}
 			}
 			atomic.AddInt64(&checked, 1)
@@ -518,16 +891,19 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 	close(done)
 
 	// Final progress update
-	log.Printf("[%s] %d/%d (100.0%%) | Strict: %d | Relaxed: %d",
-		strings.Repeat("█", 40), total, total, len(strictHealthy), len(relaxedHealthy))
+	log.Printf("[%s] %d/%d (100.0%%) | Strict: %d | Relaxed: %d | CF-Pass: %d",
+		strings.Repeat("█", 40), total, total, len(strictHealthy), len(relaxedHealthy), len(cfPassHealthy))
+
+	sort.Strings(cfPassHealthy)
 
 	return HealthCheckResult{
 		Strict:  strictHealthy,
 		Relaxed: relaxedHealthy,
+		CFPass:  cfPassHealthy,
 	}
 }
 
-func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool) {
+func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool) {
 	// Check if an update is already in progress
 	if !atomic.CompareAndSwapInt32(&strictPool.updating, 0, 1) {
 		log.Println("Proxy update already in progress, skipping...")
@@ -553,6 +929,14 @@ func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool) {
 		log.Println("[STRICT] Warning: No healthy proxies found, keeping existing pool")
 	}
 
+	if config.CFChallengeCheck.Enabled {
+		if len(result.CFPass) > 0 {
+			cfPool.Update(result.CFPass)
+			log.Printf("[CF] Pool updated with %d CF-pass proxies", len(result.CFPass))
+		} else {
+			log.Println("[CF] Warning: No CF-pass proxies found, keeping existing CF pool")
+		}
+	}
 	// Update relaxed pool
 	if len(result.Relaxed) > 0 {
 		relaxedPool.Update(result.Relaxed)
@@ -562,11 +946,68 @@ func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool) {
 	}
 }
 
-func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, initialSync bool) {
+func filterHealthyMixedProxies(candidates []string) (healthy []string, cfPass []string) {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, config.HealthCheckConcurrency)
+	healthy = make([]string, 0)
+	cfPass = make([]string, 0)
+	for _, candidate := range candidates {
+		wg.Add(1)
+		go func(proxyURL string) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			if !checkMixedProxyHealth(proxyURL) {
+				return
+			}
+			mu.Lock()
+			healthy = append(healthy, proxyURL)
+			mu.Unlock()
+			if config.CFChallengeCheck.Enabled && checkCloudflareBypassMixed(proxyURL) {
+				mu.Lock()
+				cfPass = append(cfPass, proxyURL)
+				mu.Unlock()
+			}
+		}(candidate)
+	}
+	wg.Wait()
+	sort.Strings(healthy)
+	sort.Strings(cfPass)
+	return healthy, cfPass
+}
+
+func updateMixedProxyPool(mixedPool *ProxyPool, cfMixedPool *ProxyPool) {
+	log.Println("Fetching mixed proxy list...")
+	candidates, err := fetchMixedProxyList()
+	if err != nil {
+		log.Printf("Error fetching mixed proxy list: %v", err)
+		return
+	}
+	log.Printf("Fetched %d mixed proxy candidates, starting mixed health check...", len(candidates))
+	healthy, cfPass := filterHealthyMixedProxies(candidates)
+	if len(healthy) > 0 {
+		mixedPool.Update(healthy)
+		log.Printf("[MIXED] Pool updated with %d healthy upstream proxies", len(healthy))
+	} else {
+		log.Println("[MIXED] Warning: No healthy mixed proxies found, keeping existing pool")
+	}
+	if config.CFChallengeCheck.Enabled {
+		if len(cfPass) > 0 {
+			cfMixedPool.Update(cfPass)
+			log.Printf("[CF-MIXED] Pool updated with %d CF-pass mixed proxies", len(cfPass))
+		} else {
+			log.Println("[CF-MIXED] Warning: No CF-pass mixed proxies found, keeping existing pool")
+		}
+	}
+}
+
+func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, cfMixedPool *ProxyPool, initialSync bool) {
 	if initialSync {
 		// Initial update synchronously to ensure we have proxies before starting servers
 		log.Println("Performing initial proxy update...")
-		updateProxyPool(strictPool, relaxedPool)
+		updateProxyPool(strictPool, relaxedPool, cfPool)
+		updateMixedProxyPool(mixedPool, cfMixedPool)
 	}
 
 	// Periodic updates - each update runs in its own goroutine to avoid blocking
@@ -574,7 +1015,8 @@ func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, initialSyn
 	ticker := time.NewTicker(updateInterval)
 	go func() {
 		for range ticker.C {
-			go updateProxyPool(strictPool, relaxedPool)
+			go updateProxyPool(strictPool, relaxedPool, cfPool)
+			go updateMixedProxyPool(mixedPool, cfMixedPool)
 		}
 	}()
 }
@@ -826,6 +1268,136 @@ func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, dialer proxy.Diale
 	wg.Wait()
 }
 
+func handleHTTPSViaHTTPUpstream(w http.ResponseWriter, r *http.Request, upstreamAddr string, mode string) {
+	upstreamConn, err := net.DialTimeout("tcp", upstreamAddr, 15*time.Second)
+	if err != nil {
+		http.Error(w, "Failed to connect to upstream HTTP proxy", http.StatusBadGateway)
+		return
+	}
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		upstreamConn.Close()
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		upstreamConn.Close()
+		http.Error(w, "Failed to hijack connection", http.StatusInternalServerError)
+		return
+	}
+	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", r.Host, r.Host)
+	if _, err := upstreamConn.Write([]byte(connectReq)); err != nil {
+		clientConn.Close()
+		upstreamConn.Close()
+		return
+	}
+	br := bufio.NewReader(upstreamConn)
+	line, err := br.ReadString('\n')
+	if err != nil || (!strings.Contains(line, " 200 ") && !strings.Contains(line, " 2")) {
+		clientConn.Close()
+		upstreamConn.Close()
+		return
+	}
+	for {
+		h, err := br.ReadString('\n')
+		if err != nil || h == "\r\n" {
+			break
+		}
+	}
+	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	go io.Copy(upstreamConn, clientConn)
+	io.Copy(clientConn, io.MultiReader(br, upstreamConn))
+	clientConn.Close()
+	upstreamConn.Close()
+	_ = mode
+}
+
+func handleHTTPMixedProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode string) {
+	log.Printf("[HTTP-%s] Incoming request: %s %s from %s", mode, r.Method, r.URL.String(), r.RemoteAddr)
+	if !validateHTTPProxyAuth(r) {
+		requireHTTPProxyAuth(w, mode)
+		return
+	}
+	upstream, err := pool.GetNext()
+	if err != nil {
+		http.Error(w, "No available proxies", http.StatusServiceUnavailable)
+		return
+	}
+	scheme, addr, err := splitUpstreamProxy(upstream)
+	if err != nil {
+		http.Error(w, "Invalid upstream proxy", http.StatusInternalServerError)
+		return
+	}
+	if r.Method == http.MethodConnect {
+		if scheme == "socks5" || scheme == "socks4" {
+			dialer, err := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
+			if err != nil {
+				http.Error(w, "Failed to create upstream dialer", http.StatusInternalServerError)
+				return
+			}
+			handleHTTPSProxy(w, r, dialer, addr, mode)
+			return
+		}
+		handleHTTPSViaHTTPUpstream(w, r, addr, mode)
+		return
+	}
+	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	if scheme == "socks5" || scheme == "socks4" {
+		dialer, err := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
+		if err != nil {
+			http.Error(w, "Failed to create upstream dialer", http.StatusInternalServerError)
+			return
+		}
+		transport.DialContext = func(ctx context.Context, network, target string) (net.Conn, error) {
+			return dialer.Dial(network, target)
+		}
+	} else {
+		proxyURL, err := url.Parse("http://" + addr)
+		if err != nil {
+			http.Error(w, "Invalid upstream proxy", http.StatusInternalServerError)
+			return
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+	proxyReq, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
+	if err != nil {
+		http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
+		return
+	}
+	for key, values := range r.Header {
+		if strings.EqualFold(key, "Proxy-Authorization") {
+			continue
+		}
+		for _, v := range values {
+			proxyReq.Header.Add(key, v)
+		}
+	}
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Proxy request failed: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	for k, values := range resp.Header {
+		for _, v := range values {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+func startHTTPMixedServer(pool *ProxyPool, port string, mode string) error {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleHTTPMixedProxy(w, r, pool, mode)
+	})
+	server := &http.Server{Addr: port, Handler: handler}
+	log.Printf("[%s] HTTP mixed proxy server listening on %s", mode, port)
+	return server.ListenAndServe()
+}
+
 func startHTTPServer(pool *ProxyPool, port string, mode string) error {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleHTTPProxy(w, r, pool, mode)
@@ -840,27 +1412,39 @@ func startHTTPServer(pool *ProxyPool, port string, mode string) error {
 	return server.ListenAndServe()
 }
 
-func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, port string) error {
+func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, port string) error {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !validateHTTPProxyAuth(r) {
-			requireHTTPProxyAuth(w, "ROTATE")
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "ROTATE")
 			return
 		}
 
-		strictProxy, strictErr := strictPool.ForceRotate()
-		relaxedProxy, relaxedErr := relaxedPool.ForceRotate()
+		switch r.URL.Path {
+		case "/", "/rotate":
+			strictProxy, strictErr := strictPool.ForceRotate()
+			relaxedProxy, relaxedErr := relaxedPool.ForceRotate()
 
-		if strictErr != nil && relaxedErr != nil {
-			log.Printf("[ROTATE] ERROR: rotate failed (strict=%v, relaxed=%v)", strictErr, relaxedErr)
-			http.Error(w, "Rotate failed: no available proxies", http.StatusServiceUnavailable)
-			return
+			if strictErr != nil && relaxedErr != nil {
+				log.Printf("[ROTATE] ERROR: rotate failed (strict=%v, relaxed=%v)", strictErr, relaxedErr)
+				http.Error(w, "Rotate failed: no available proxies", http.StatusServiceUnavailable)
+				return
+			}
+
+			log.Printf("[ROTATE] Manual rotate triggered from %s | strict=%s err=%v | relaxed=%s err=%v",
+				r.RemoteAddr, strictProxy, strictErr, relaxedProxy, relaxedErr)
+
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprintf(w, "rotate success\nstrict: %s\nrelaxed: %s\n", strictProxy, relaxedProxy)
+		case "/cf-proxies":
+			proxies := cfPool.GetAll()
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprintf(w, "cf_pass_proxy_count: %d\n", len(proxies))
+			for _, proxyAddr := range proxies {
+				fmt.Fprintln(w, proxyAddr)
+			}
+		default:
+			http.NotFound(w, r)
 		}
-
-		log.Printf("[ROTATE] Manual rotate triggered from %s | strict=%s err=%v | relaxed=%s err=%v",
-			r.RemoteAddr, strictProxy, strictErr, relaxedProxy, relaxedErr)
-
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintf(w, "rotate success\nstrict: %s\nrelaxed: %s\n", strictProxy, relaxedProxy)
 	})
 
 	server := &http.Server{
@@ -897,6 +1481,8 @@ func main() {
 	log.Printf("  - SOCKS5 Relaxed port: %s", config.Ports.SOCKS5Relaxed)
 	log.Printf("  - HTTP Strict port: %s", config.Ports.HTTPStrict)
 	log.Printf("  - HTTP Relaxed port: %s", config.Ports.HTTPRelaxed)
+	log.Printf("  - HTTP Mixed port: %s", config.Ports.HTTPMixed)
+	log.Printf("  - HTTP CF-Mixed port: %s", config.Ports.HTTPCFMixed)
 	if isProxyAuthEnabled() {
 		log.Printf("  - Proxy authentication: enabled (user: %s)", config.Auth.Username)
 	} else {
@@ -906,9 +1492,12 @@ func main() {
 	// Create two proxy pools
 	strictPool := NewProxyPool()
 	relaxedPool := NewProxyPool()
+	cfPool := NewProxyPool()
+	mixedPool := NewProxyPool()
+	cfMixedPool := NewProxyPool()
 
 	// Start proxy updater with initial synchronous update
-	startProxyUpdater(strictPool, relaxedPool, true)
+	startProxyUpdater(strictPool, relaxedPool, cfPool, mixedPool, cfMixedPool, true)
 
 	// Check proxy pool status
 	strictCount := len(strictPool.GetAll())
@@ -930,7 +1519,7 @@ func main() {
 
 	// Start servers (5 servers total)
 	var wg sync.WaitGroup
-	wg.Add(5)
+	wg.Add(7)
 
 	// SOCKS5 Strict
 	go func() {
@@ -964,10 +1553,26 @@ func main() {
 		}
 	}()
 
+	// HTTP Mixed (upstream can be HTTP or SOCKS5)
+	go func() {
+		defer wg.Done()
+		if err := startHTTPMixedServer(mixedPool, config.Ports.HTTPMixed, "MIXED"); err != nil {
+			log.Fatalf("[MIXED] HTTP server error: %v", err)
+		}
+	}()
+
+	// HTTP CF Mixed (only CF-pass upstreams)
+	go func() {
+		defer wg.Done()
+		if err := startHTTPMixedServer(cfMixedPool, config.Ports.HTTPCFMixed, "CF-MIXED"); err != nil {
+			log.Fatalf("[CF-MIXED] HTTP server error: %v", err)
+		}
+	}()
+
 	// Rotate Control
 	go func() {
 		defer wg.Done()
-		if err := startRotateControlServer(strictPool, relaxedPool, config.Ports.RotateControl); err != nil {
+		if err := startRotateControlServer(strictPool, relaxedPool, cfPool, config.Ports.RotateControl); err != nil {
 			log.Fatalf("[ROTATE] Control server error: %v", err)
 		}
 	}()
@@ -975,6 +1580,8 @@ func main() {
 	log.Println("All servers started successfully")
 	log.Println("  [STRICT] SOCKS5: " + config.Ports.SOCKS5Strict + " | HTTP: " + config.Ports.HTTPStrict)
 	log.Println("  [RELAXED] SOCKS5: " + config.Ports.SOCKS5Relaxed + " | HTTP: " + config.Ports.HTTPRelaxed)
+	log.Println("  [MIXED] HTTP: " + config.Ports.HTTPMixed)
+	log.Println("  [CF-MIXED] HTTP: " + config.Ports.HTTPCFMixed)
 	log.Println("  [ROTATE] Control: " + config.Ports.RotateControl)
 	log.Printf("Proxy pools will update every %d minutes in background...", config.UpdateIntervalMinutes)
 	wg.Wait()
