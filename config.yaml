@@ -11,6 +11,11 @@ proxy_list_urls:
   - "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt"
   # 可以添加更多代理源（支持 http/https/socks4/socks5 协议）
   - "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/socks5/raw/all.txt"
+  - "https://raw.githubusercontent.com/kssku/guaxue/main/data/proxies.yaml"
+  - "https://raw.githubusercontent.com/waterbaizhang/tv/main/final.yaml"
+  - "https://qybndbviblvt.us-west-1.clawcloudrun.com/api/v1/subscribe?token=u0bt57u81cui26g1vc&target=v2ray&list=true"
+  - "https://raw.githubusercontent.com/nekosolo1233/p1oxy/main/v2.yaml"
+  
   # - "https://example.com/http-proxies.txt"
   # - "https://example.com/socks4-proxies.txt"
 
@@ -56,7 +61,7 @@ auth:
 cf_challenge_check:
   enabled: false
   # 建议填写你自己的 CF 保护页面，用于筛选可自动通过挑战的代理
-  url: "https://example.com/"
+  url: "https://linux.do"
   expected_statuses: [200]
   # 页面若包含以下关键词则判定为未通过挑战
   block_indicators:
