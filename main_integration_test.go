@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net"
@@ -20,59 +19,21 @@ func poolSize(p *ProxyPool) int {
 	return len(p.proxies)
 }
 
-func startForwardProxy(t *testing.T, requireAuth bool, expectedAuth string) {
+func startTCPEndpoint(t *testing.T, addr string) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:"+mainstreamMixedRelayPort)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		t.Fatalf("listen relay proxy: %v", err)
+		t.Fatalf("listen tcp endpoint %s: %v", addr, err)
 	}
-
-	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if requireAuth && r.Header.Get("Proxy-Authorization") != expectedAuth {
-			w.WriteHeader(http.StatusProxyAuthRequired)
-			return
-		}
-
-		if r.Method == http.MethodConnect {
-			hj, ok := w.(http.Hijacker)
-			if !ok {
-				http.Error(w, "hijack unsupported", http.StatusInternalServerError)
-				return
-			}
-			clientConn, buf, err := hj.Hijack()
+	go func() {
+		for {
+			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			defer clientConn.Close()
-			_, _ = buf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
-			_ = buf.Flush()
-
-			targetConn, err := net.DialTimeout("tcp", r.Host, 5*time.Second)
-			if err != nil {
-				return
-			}
-			defer targetConn.Close()
-			go io.Copy(targetConn, clientConn)
-			io.Copy(clientConn, targetConn)
-			return
+			_ = conn.Close()
 		}
-
-		resp, err := http.DefaultTransport.RoundTrip(r)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-		for k, vv := range resp.Header {
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
-	})
-
-	go func() { _ = http.Serve(ln, h) }()
+	}()
 	t.Cleanup(func() { _ = ln.Close() })
 }
 
@@ -129,7 +90,9 @@ func TestIntegration_NonStandardConfigAndMainstreamPool(t *testing.T) {
 		t.Fatalf("missing normalized hy2 credential entry: %v", parsed)
 	}
 
-	startForwardProxy(t, false, "")
+	startTCPEndpoint(t, "127.0.0.1:18080")
+	startTCPEndpoint(t, "127.0.0.1:18081")
+	startTCPEndpoint(t, "127.0.0.1:18082")
 
 	mixedPool := NewProxyPool(time.Minute, false)
 	mainstreamPool := NewProxyPool(time.Minute, false)
@@ -164,8 +127,8 @@ func TestIntegration_VlessHy2AuthRequired(t *testing.T) {
 	config.HealthCheck.TotalTimeoutSeconds = 8
 	config.HealthCheck.TLSHandshakeThresholdSeconds = 8
 
-	expected := "Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass"))
-	startForwardProxy(t, true, expected)
+	startTCPEndpoint(t, "127.0.0.1:18081")
+	startTCPEndpoint(t, "127.0.0.1:18082")
 
 	for _, entry := range []string{
 		"vless://user:pass@127.0.0.1:18081",
