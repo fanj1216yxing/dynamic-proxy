@@ -71,6 +71,7 @@ const connectivityCheckInterval = 10 * time.Second
 // Simple regex to extract ip:port from any format (used for special proxy lists)
 // Matches: [IP]:[port] and ignores any protocol prefixes or extra text
 var simpleProxyRegex = regexp.MustCompile(`([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})`)
+var mixedProxyURICandidateRegex = regexp.MustCompile(`(?i)(?:^|\s)((?:vmess|vless|trojan|ss|hy2|hysteria2|socks5h?|https?)://[^\s]+)`)
 
 // loadConfig loads configuration from config.yaml
 func loadConfig(filename string) (*Config, error) {
@@ -693,8 +694,10 @@ func normalizeSSURI(raw string) (string, bool) {
 
 func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dialAddr string, useAuth bool) {
 	switch scheme {
-	case "vmess", "vless", "hy2", "hysteria2", "trojan":
+	case "vmess":
 		return "https", overridePort(addr, mainstreamMixedRelayPort), false
+	case "vless", "hy2", "hysteria2", "trojan":
+		return "https", overridePort(addr, mainstreamMixedRelayPort), true
 	case "ss":
 		return "socks5", overridePort(addr, mainstreamMixedRelayPort), false
 	default:
@@ -710,6 +713,38 @@ func overridePort(addr string, newPort string) string {
 	return net.JoinHostPort(host, newPort)
 }
 
+func trimMixedProxyCandidate(candidate string) string {
+	trimmed := strings.TrimSpace(strings.Trim(candidate, "\"'`"))
+	for len(trimmed) > 0 {
+		last := trimmed[len(trimmed)-1]
+		if strings.ContainsRune(",;)]}>", rune(last)) {
+			trimmed = strings.TrimSpace(trimmed[:len(trimmed)-1])
+			continue
+		}
+		break
+	}
+	return trimmed
+}
+
+func normalizeMixedProxyFromLine(line string) (string, bool) {
+	if normalized, ok := normalizeMixedProxyEntry(line); ok {
+		return normalized, true
+	}
+
+	matches := mixedProxyURICandidateRegex.FindAllStringSubmatch(line, -1)
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		candidate := trimMixedProxyCandidate(m[1])
+		if normalized, ok := normalizeMixedProxyEntry(candidate); ok {
+			return normalized, true
+		}
+	}
+
+	return "", false
+}
+
 func parseSpecialProxyURLMixed(content string) []string {
 	proxies := make([]string, 0)
 	proxySet := make(map[string]bool)
@@ -721,6 +756,14 @@ func parseSpecialProxyURLMixed(content string) []string {
 			continue
 		}
 
+		if normalized, ok := normalizeMixedProxyFromLine(line); ok {
+			if !proxySet[normalized] {
+				proxySet[normalized] = true
+				proxies = append(proxies, normalized)
+			}
+			continue
+		}
+
 		matches := simpleProxyRegex.FindStringSubmatch(line)
 		if len(matches) < 3 {
 			continue
@@ -729,21 +772,25 @@ func parseSpecialProxyURLMixed(content string) []string {
 		scheme := "socks5"
 		lowerLine := strings.ToLower(line)
 		switch {
-		case strings.Contains(lowerLine, "https://"):
+		case strings.Contains(lowerLine, "https"):
 			scheme = "https"
-		case strings.Contains(lowerLine, "http://"):
+		case strings.Contains(lowerLine, "http"):
 			scheme = "http"
-		case strings.Contains(lowerLine, "socks5h://"):
+		case strings.Contains(lowerLine, "socks5h"):
 			scheme = "socks5h"
-		case strings.Contains(lowerLine, "socks5://"):
+		case strings.Contains(lowerLine, "socks5"):
 			scheme = "socks5"
-		case strings.Contains(lowerLine, "vmess://"):
+		case strings.Contains(lowerLine, "vmess"):
 			scheme = "vmess"
-		case strings.Contains(lowerLine, "vless://"):
+		case strings.Contains(lowerLine, "vless"):
 			scheme = "vless"
-		case strings.Contains(lowerLine, "hy2://"):
+		case strings.Contains(lowerLine, "trojan"):
+			scheme = "trojan"
+		case strings.Contains(lowerLine, "ss"):
+			scheme = "ss"
+		case strings.Contains(lowerLine, "hy2"):
 			scheme = "hy2"
-		case strings.Contains(lowerLine, "hysteria2://"):
+		case strings.Contains(lowerLine, "hysteria2"):
 			scheme = "hysteria2"
 		}
 
@@ -1485,9 +1532,9 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 
 	if len(mainstreamHealthy) > 0 {
 		mainstreamMixedPool.Update(mainstreamHealthy)
-		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy VMESS/VLESS/HY2 mixed proxies", len(mainstreamHealthy))
+		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy mainstream mixed proxies (vmess/vless/ss/trojan/hy2/hysteria2)", len(mainstreamHealthy))
 	} else {
-		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy VMESS/VLESS/HY2 mixed proxies found, keeping existing pool")
+		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy mainstream mixed proxies (vmess/vless/ss/trojan/hy2/hysteria2) found, keeping existing pool")
 	}
 
 	if config.CFChallengeCheck.Enabled {
