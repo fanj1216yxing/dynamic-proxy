@@ -263,3 +263,30 @@ func TestMainstreamMixedFallbackToHTTPSocksPool(t *testing.T) {
 		t.Fatalf("expected bad gateway from unreachable fallback proxy, got %d body=%s", rr.Code, rr.Body.String())
 	}
 }
+
+func TestMainstreamMixedPreferredAndFallbackSchemes(t *testing.T) {
+	entries := []string{
+		"http://127.0.0.1:8080",
+		"https://127.0.0.1:8443",
+		"socks5://127.0.0.1:1080",
+		"socks5h://127.0.0.1:1081",
+		"vmess://127.0.0.1:18080",
+		"vless://user@127.0.0.1:18081",
+	}
+
+	preferred := filterMixedProxiesByScheme(entries, mainstreamMixedPreferredSchemes)
+	preferredJoined := strings.Join(preferred, "\n")
+	fallback := filterMixedProxiesByScheme(entries, mainstreamMixedFallbackSchemes)
+	fallbackJoined := strings.Join(fallback, "\n")
+
+	if strings.Contains(preferredJoined, "https://") || strings.Contains(preferredJoined, "socks5h://") {
+		t.Fatalf("mainstream preferred pool should exclude https/socks5h entries, got: %v", preferred)
+	}
+	if !strings.Contains(preferredJoined, "vmess://") || !strings.Contains(preferredJoined, "vless://") {
+		t.Fatalf("mainstream preferred pool should keep vmess/vless entries, got: %v", preferred)
+	}
+
+	if !strings.Contains(fallbackJoined, "https://") || !strings.Contains(fallbackJoined, "socks5h://") {
+		t.Fatalf("mainstream fallback pool should keep https/socks5h entries, got: %v", fallback)
+	}
+}

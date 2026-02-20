@@ -403,10 +403,21 @@ var mixedSupportedSchemes = map[string]bool{
 
 var httpSocksMixedSchemes = map[string]bool{
 	"http":   true,
+	"https":  true,
 	"socks5": true,
+	"socks5h": true,
 }
 
-var mainstreamMixedExcludedSchemes = map[string]bool{"http": true, "socks5": true}
+var mainstreamMixedPreferredSchemes = map[string]bool{
+	"vmess":     true,
+	"vless":     true,
+	"ss":        true,
+	"trojan":    true,
+	"hy2":       true,
+	"hysteria2": true,
+}
+
+var mainstreamMixedFallbackSchemes = map[string]bool{"https": true, "socks5h": true}
 
 const mainstreamMixedRelayPort = "17290"
 
@@ -1499,7 +1510,8 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 	result := healthCheckMixedProxies(proxies)
 
 	httpSocksHealthy := filterMixedProxiesByScheme(result.Healthy, httpSocksMixedSchemes)
-	mainstreamHealthy := filterMixedProxiesByExcludedScheme(result.Healthy, mainstreamMixedExcludedSchemes)
+	mainstreamHealthy := filterMixedProxiesByScheme(result.Healthy, mainstreamMixedPreferredSchemes)
+	mainstreamFallbackHealthy := filterMixedProxiesByScheme(result.Healthy, mainstreamMixedFallbackSchemes)
 	log.Printf("[MIXED] Health check split result: total_healthy=%d http_socks=%d mainstream=%d", len(result.Healthy), len(httpSocksHealthy), len(mainstreamHealthy))
 
 	if len(httpSocksHealthy) > 0 {
@@ -1511,9 +1523,12 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 
 	if len(mainstreamHealthy) > 0 {
 		mainstreamMixedPool.Update(mainstreamHealthy)
-		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy non-http/socks5 mixed proxies", len(mainstreamHealthy))
+		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy mainstream protocol mixed proxies", len(mainstreamHealthy))
+	} else if len(mainstreamFallbackHealthy) > 0 {
+		mainstreamMixedPool.Update(mainstreamFallbackHealthy)
+		log.Printf("[HTTP-MAINSTREAM-MIXED] Fallback: updated with %d healthy HTTPS/SOCKS5H proxies because no mainstream protocol proxy passed health checks", len(mainstreamFallbackHealthy))
 	} else {
-		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy non-http/socks5 mixed proxies found, keeping existing pool")
+		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy mainstream protocol (or fallback HTTPS/SOCKS5H) mixed proxies found, keeping existing pool")
 	}
 
 	if config.CFChallengeCheck.Enabled {
@@ -2023,7 +2038,8 @@ func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool
 			"cf_mixed_current_proxy":        cfMixedCurrent,
 			"mainstream_listen_port":        config.Ports.HTTPMainstreamMix,
 			"status_listen_addr":            port,
-			"mainstream_excluded_protocols": []string{"http", "socks5"},
+			"mainstream_preferred_protocols": []string{"vmess", "vless", "ss", "trojan", "hy2", "hysteria2"},
+			"mainstream_fallback_protocols":  []string{"https", "socks5h"},
 		})
 	})
 
