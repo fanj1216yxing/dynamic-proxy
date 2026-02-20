@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,13 @@ type Config struct {
 		Username string `yaml:"username"`
 		Password string `yaml:"password"`
 	} `yaml:"auth"`
+	CFChallengeCheck struct {
+		Enabled          bool     `yaml:"enabled"`
+		URL              string   `yaml:"url"`
+		ExpectedStatuses []int    `yaml:"expected_statuses"`
+		BlockIndicators  []string `yaml:"block_indicators"`
+		TimeoutSeconds   int      `yaml:"timeout_seconds"`
+	} `yaml:"cf_challenge_check"`
 }
 
 // Global config variable
@@ -97,6 +105,18 @@ func loadConfig(filename string) (*Config, error) {
 	}
 	if cfg.Ports.RotateControl == "" {
 		cfg.Ports.RotateControl = ":9090"
+	}
+
+	if cfg.CFChallengeCheck.Enabled {
+		if cfg.CFChallengeCheck.URL == "" {
+			return nil, fmt.Errorf("cf_challenge_check.url must be set when enabled")
+		}
+		if cfg.CFChallengeCheck.TimeoutSeconds <= 0 {
+			cfg.CFChallengeCheck.TimeoutSeconds = 12
+		}
+		if len(cfg.CFChallengeCheck.ExpectedStatuses) == 0 {
+			cfg.CFChallengeCheck.ExpectedStatuses = []int{http.StatusOK}
+		}
 	}
 
 	if (cfg.Auth.Username == "") != (cfg.Auth.Password == "") {
@@ -284,6 +304,62 @@ func parseSpecialProxyURL(content string) ([]string, error) {
 	return proxies, nil
 }
 
+type clashSubscription struct {
+	Proxies []struct {
+		Type   string `yaml:"type"`
+		Server string `yaml:"server"`
+		Port   int    `yaml:"port"`
+	} `yaml:"proxies"`
+}
+
+func parseClashSubscription(content string) ([]string, bool) {
+	var sub clashSubscription
+	if err := yaml.Unmarshal([]byte(content), &sub); err != nil || len(sub.Proxies) == 0 {
+		return nil, false
+	}
+
+	result := make([]string, 0, len(sub.Proxies))
+	seen := make(map[string]bool)
+	for _, p := range sub.Proxies {
+		proxyType := strings.ToLower(strings.TrimSpace(p.Type))
+		if proxyType != "socks5" && proxyType != "socks5h" {
+			continue
+		}
+		if p.Server == "" || p.Port <= 0 {
+			continue
+		}
+		entry := fmt.Sprintf("%s:%d", p.Server, p.Port)
+		if !seen[entry] {
+			seen[entry] = true
+			result = append(result, entry)
+		}
+	}
+
+	return result, len(result) > 0
+}
+
+func parseRegularProxyContent(content string) ([]string, string) {
+	if clashProxies, ok := parseClashSubscription(content); ok {
+		return clashProxies, "clash"
+	}
+
+	proxies := make([]string, 0)
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "socks5://")
+		line = strings.TrimPrefix(line, "socks4://")
+		line = strings.TrimPrefix(line, "https://")
+		line = strings.TrimPrefix(line, "http://")
+		proxies = append(proxies, line)
+	}
+
+	return proxies, "plain"
+}
+
 func fetchProxyList() ([]string, error) {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
@@ -321,29 +397,17 @@ func fetchProxyList() ([]string, error) {
 		}
 
 		content := string(body)
+		parsedProxies, format := parseRegularProxyContent(content)
 		count := 0
-		scanner := bufio.NewScanner(strings.NewReader(content))
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			// Support formats: ip:port, http://ip:port, https://ip:port, socks5://ip:port, socks4://ip:port
-			// Strip protocol prefixes using string operations (no regex for better performance)
-			line = strings.TrimPrefix(line, "socks5://")
-			line = strings.TrimPrefix(line, "socks4://")
-			line = strings.TrimPrefix(line, "https://")
-			line = strings.TrimPrefix(line, "http://")
-
-			// 去重
-			if !proxySet[line] {
-				proxySet[line] = true
-				allProxies = append(allProxies, line)
+		for _, parsed := range parsedProxies {
+			if !proxySet[parsed] {
+				proxySet[parsed] = true
+				allProxies = append(allProxies, parsed)
 				count++
 			}
 		}
 
-		log.Printf("Fetched %d proxies from regular URL %s", count, url)
+		log.Printf("Fetched %d proxies from regular URL %s (format=%s)", count, url, format)
 	}
 
 	// 处理特殊代理URL（复杂格式）
@@ -396,6 +460,62 @@ func fetchProxyList() ([]string, error) {
 
 	log.Printf("Total unique proxies fetched: %d", len(allProxies))
 	return allProxies, nil
+}
+
+func checkCloudflareBypass(proxyAddr string) bool {
+	if !config.CFChallengeCheck.Enabled {
+		return false
+	}
+
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
+	if err != nil {
+		return false
+	}
+
+	timeout := time.Duration(config.CFChallengeCheck.TimeoutSeconds) * time.Second
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.Dial(network, addr)
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{Transport: transport, Timeout: timeout}
+
+	req, err := http.NewRequest(http.MethodGet, config.CFChallengeCheck.URL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 DynamicProxy/1.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	allowed := false
+	for _, code := range config.CFChallengeCheck.ExpectedStatuses {
+		if resp.StatusCode == code {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return false
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return false
+	}
+	content := strings.ToLower(string(body))
+	for _, indicator := range config.CFChallengeCheck.BlockIndicators {
+		if indicator != "" && strings.Contains(content, strings.ToLower(indicator)) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func checkProxyHealth(proxyAddr string, strictMode bool) bool {
@@ -459,6 +579,7 @@ func checkProxyHealth(proxyAddr string, strictMode bool) bool {
 type HealthCheckResult struct {
 	Strict  []string
 	Relaxed []string
+	CFPass  []string
 }
 
 func healthCheckProxies(proxies []string) HealthCheckResult {
@@ -466,11 +587,13 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 	var mu sync.Mutex
 	strictHealthy := make([]string, 0)
 	relaxedHealthy := make([]string, 0)
+	cfPassHealthy := make([]string, 0)
 
 	total := len(proxies)
 	var checked int64
 	var strictCount int64
 	var relaxedCount int64
+	var cfPassCount int64
 
 	// Use worker pool to limit concurrent checks (from config)
 	semaphore := make(chan struct{}, config.HealthCheckConcurrency)
@@ -491,6 +614,7 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 				current := atomic.LoadInt64(&checked)
 				strictCurrent := atomic.LoadInt64(&strictCount)
 				relaxedCurrent := atomic.LoadInt64(&relaxedCount)
+				cfCurrent := atomic.LoadInt64(&cfPassCount)
 
 				// Only print if progress has changed
 				if current != lastChecked {
@@ -501,8 +625,8 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 					filled := int(float64(barWidth) * float64(current) / float64(total))
 					bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
 
-					log.Printf("[%s] %d/%d (%.1f%%) | Strict: %d | Relaxed: %d",
-						bar, current, total, percentage, strictCurrent, relaxedCurrent)
+					log.Printf("[%s] %d/%d (%.1f%%) | Strict: %d | Relaxed: %d | CF-Pass: %d",
+						bar, current, total, percentage, strictCurrent, relaxedCurrent, cfCurrent)
 
 					lastChecked = current
 				}
@@ -519,6 +643,7 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 
 			// Optimized: check strict mode first
 			strictOK := checkProxyHealth(addr, true)
+			healthy := false
 
 			if strictOK {
 				// If strict mode passes, relaxed mode must pass too
@@ -528,6 +653,7 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 				mu.Unlock()
 				atomic.AddInt64(&strictCount, 1)
 				atomic.AddInt64(&relaxedCount, 1)
+				healthy = true
 			} else {
 				// Strict mode failed, try relaxed mode
 				relaxedOK := checkProxyHealth(addr, false)
@@ -536,6 +662,16 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 					relaxedHealthy = append(relaxedHealthy, addr)
 					mu.Unlock()
 					atomic.AddInt64(&relaxedCount, 1)
+					healthy = true
+				}
+			}
+
+			if healthy && config.CFChallengeCheck.Enabled {
+				if checkCloudflareBypass(addr) {
+					mu.Lock()
+					cfPassHealthy = append(cfPassHealthy, addr)
+					mu.Unlock()
+					atomic.AddInt64(&cfPassCount, 1)
 				}
 			}
 			atomic.AddInt64(&checked, 1)
@@ -546,16 +682,19 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 	close(done)
 
 	// Final progress update
-	log.Printf("[%s] %d/%d (100.0%%) | Strict: %d | Relaxed: %d",
-		strings.Repeat("█", 40), total, total, len(strictHealthy), len(relaxedHealthy))
+	log.Printf("[%s] %d/%d (100.0%%) | Strict: %d | Relaxed: %d | CF-Pass: %d",
+		strings.Repeat("█", 40), total, total, len(strictHealthy), len(relaxedHealthy), len(cfPassHealthy))
+
+	sort.Strings(cfPassHealthy)
 
 	return HealthCheckResult{
 		Strict:  strictHealthy,
 		Relaxed: relaxedHealthy,
+		CFPass:  cfPassHealthy,
 	}
 }
 
-func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool) {
+func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool) {
 	// Check if an update is already in progress
 	if !atomic.CompareAndSwapInt32(&strictPool.updating, 0, 1) {
 		log.Println("Proxy update already in progress, skipping...")
@@ -581,6 +720,14 @@ func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool) {
 		log.Println("[STRICT] Warning: No healthy proxies found, keeping existing pool")
 	}
 
+	if config.CFChallengeCheck.Enabled {
+		if len(result.CFPass) > 0 {
+			cfPool.Update(result.CFPass)
+			log.Printf("[CF] Pool updated with %d CF-pass proxies", len(result.CFPass))
+		} else {
+			log.Println("[CF] Warning: No CF-pass proxies found, keeping existing CF pool")
+		}
+	}
 	// Update relaxed pool
 	if len(result.Relaxed) > 0 {
 		relaxedPool.Update(result.Relaxed)
@@ -590,11 +737,11 @@ func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool) {
 	}
 }
 
-func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, initialSync bool) {
+func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, initialSync bool) {
 	if initialSync {
 		// Initial update synchronously to ensure we have proxies before starting servers
 		log.Println("Performing initial proxy update...")
-		updateProxyPool(strictPool, relaxedPool)
+		updateProxyPool(strictPool, relaxedPool, cfPool)
 	}
 
 	// Periodic updates - each update runs in its own goroutine to avoid blocking
@@ -602,7 +749,7 @@ func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, initialSyn
 	ticker := time.NewTicker(updateInterval)
 	go func() {
 		for range ticker.C {
-			go updateProxyPool(strictPool, relaxedPool)
+			go updateProxyPool(strictPool, relaxedPool, cfPool)
 		}
 	}()
 }
@@ -868,27 +1015,39 @@ func startHTTPServer(pool *ProxyPool, port string, mode string) error {
 	return server.ListenAndServe()
 }
 
-func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, port string) error {
+func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, port string) error {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !validateBasicAuth(r) {
 			requireBasicAuth(w, "ROTATE")
 			return
 		}
 
-		strictProxy, strictErr := strictPool.ForceRotate()
-		relaxedProxy, relaxedErr := relaxedPool.ForceRotate()
+		switch r.URL.Path {
+		case "/", "/rotate":
+			strictProxy, strictErr := strictPool.ForceRotate()
+			relaxedProxy, relaxedErr := relaxedPool.ForceRotate()
 
-		if strictErr != nil && relaxedErr != nil {
-			log.Printf("[ROTATE] ERROR: rotate failed (strict=%v, relaxed=%v)", strictErr, relaxedErr)
-			http.Error(w, "Rotate failed: no available proxies", http.StatusServiceUnavailable)
-			return
+			if strictErr != nil && relaxedErr != nil {
+				log.Printf("[ROTATE] ERROR: rotate failed (strict=%v, relaxed=%v)", strictErr, relaxedErr)
+				http.Error(w, "Rotate failed: no available proxies", http.StatusServiceUnavailable)
+				return
+			}
+
+			log.Printf("[ROTATE] Manual rotate triggered from %s | strict=%s err=%v | relaxed=%s err=%v",
+				r.RemoteAddr, strictProxy, strictErr, relaxedProxy, relaxedErr)
+
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprintf(w, "rotate success\nstrict: %s\nrelaxed: %s\n", strictProxy, relaxedProxy)
+		case "/cf-proxies":
+			proxies := cfPool.GetAll()
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprintf(w, "cf_pass_proxy_count: %d\n", len(proxies))
+			for _, proxyAddr := range proxies {
+				fmt.Fprintln(w, proxyAddr)
+			}
+		default:
+			http.NotFound(w, r)
 		}
-
-		log.Printf("[ROTATE] Manual rotate triggered from %s | strict=%s err=%v | relaxed=%s err=%v",
-			r.RemoteAddr, strictProxy, strictErr, relaxedProxy, relaxedErr)
-
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintf(w, "rotate success\nstrict: %s\nrelaxed: %s\n", strictProxy, relaxedProxy)
 	})
 
 	server := &http.Server{
@@ -934,9 +1093,10 @@ func main() {
 	// Create two proxy pools
 	strictPool := NewProxyPool()
 	relaxedPool := NewProxyPool()
+	cfPool := NewProxyPool()
 
 	// Start proxy updater with initial synchronous update
-	startProxyUpdater(strictPool, relaxedPool, true)
+	startProxyUpdater(strictPool, relaxedPool, cfPool, true)
 
 	// Check proxy pool status
 	strictCount := len(strictPool.GetAll())
@@ -995,7 +1155,7 @@ func main() {
 	// Rotate Control
 	go func() {
 		defer wg.Done()
-		if err := startRotateControlServer(strictPool, relaxedPool, config.Ports.RotateControl); err != nil {
+		if err := startRotateControlServer(strictPool, relaxedPool, cfPool, config.Ports.RotateControl); err != nil {
 			log.Fatalf("[ROTATE] Control server error: %v", err)
 		}
 	}()

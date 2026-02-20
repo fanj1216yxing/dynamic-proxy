@@ -42,10 +42,23 @@ ports:
   socks5_relaxed: ":17284"
   http_strict: ":17285"
   http_relaxed: ":17286"
-  rotate_control: ":17287" # 访问该端口会强制切换到下一个代理
+  rotate_control: ":17287" # 访问该端口会随机切换到一个新的健康代理
 
 # 代理认证配置（可选）
 # 如果启用，username/password 必须同时设置
 auth:
   username: ""
   password: ""
+
+# Cloudflare 挑战可通过性检测（可选）
+cf_challenge_check:
+  enabled: false
+  # 建议填写你自己的 CF 保护页面，用于筛选可自动通过挑战的代理
+  url: "https://example.com/"
+  expected_statuses: [200]
+  # 页面若包含以下关键词则判定为未通过挑战
+  block_indicators:
+    - "just a moment"
+    - "cf-challenge"
+    - "captcha"
+  timeout_seconds: 12
