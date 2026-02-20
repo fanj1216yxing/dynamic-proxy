@@ -12,6 +12,7 @@ services:
       - "17287:17287"  # Rotate control (force switch to next proxy)
       - "17288:17288"  # HTTP mixed upstream (HTTP/SOCKS5)
       - "17289:17289"  # HTTP mixed CF-pass upstream (HTTP/SOCKS5)
+      - "17290:17290"  # HTTP mainstream mixed upstream (VMESS/VLESS/HY2)
     volumes:
       - ./config.yaml:/app/config.yaml:ro  # Mount config as read-only
     restart: unless-stopped
