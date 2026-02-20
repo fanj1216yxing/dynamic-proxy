@@ -99,7 +99,7 @@ Docker 镜像使用多阶段构建，体积最小化：
   - 17284 (SOCKS5 宽松模式 - 禁用SSL验证)
   - 17285 (HTTP 严格模式 - 启用SSL验证)
   - 17286 (HTTP 宽松模式 - 禁用SSL验证)
-  - 17287 (轮换控制端口 - 强制切换到下一个代理)
+  - 17287 (轮换控制端口 - 随机切换到一个新的健康代理)
 - 配置文件可通过卷挂载，方便更新
 
 ### 配置说明
@@ -111,6 +111,7 @@ Docker 镜像使用多阶段构建，体积最小化：
 proxy_list_urls:
   - "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt"
   - "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/socks5/raw/all.txt"
+  # 也支持 Clash 订阅（YAML），会自动识别并提取 socks5/socks5h 节点
   # 添加更多源
   # - "https://example.com/proxy-list.txt"
 
@@ -131,7 +132,7 @@ ports:
   socks5_relaxed: ":17284"   # SOCKS5 宽松模式（禁用SSL验证）
   http_strict: ":17285"      # HTTP 严格模式（启用SSL验证）
   http_relaxed: ":17286"     # HTTP 宽松模式（禁用SSL验证）
-  rotate_control: ":17287"  # 访问该端口强制切换到下一个代理
+  rotate_control: ":17287"  # 访问该端口随机切换到一个新的健康代理
 
 # 可选代理认证（username/password 必须同时配置）
 auth:
@@ -152,7 +153,7 @@ auth:
 | `ports.socks5_relaxed` | SOCKS5服务器端口（禁用SSL验证） | :17284 |
 | `ports.http_strict` | HTTP代理服务器端口（启用SSL验证） | :17285 |
 | `ports.http_relaxed` | HTTP代理服务器端口（禁用SSL验证） | :17286 |
-| `ports.rotate_control` | 手动轮换控制端口（强制切换到下一个代理） | :17287 |
+| `ports.rotate_control` | 手动轮换控制端口（随机切换到一个新的健康代理） | :17287 |
 | `auth.username` | 代理认证用户名（可选） | 空 |
 | `auth.password` | 代理认证密码（可选） | 空 |
 
@@ -179,8 +180,11 @@ curl -x http://username:password@127.0.0.1:17285 https://api.ipify.org
 # 开启认证后的测试（SOCKS5）
 curl --proxy socks5://username:password@127.0.0.1:17283 https://api.ipify.org
 
-# Force rotate to next proxy (both strict/relaxed pools)
+# Force rotate to a random healthy proxy (both strict/relaxed pools)
 curl http://127.0.0.1:17287
+
+# 查看当前可自动通过 CF 挑战的代理列表（需在 config 中启用 cf_challenge_check）
+curl http://127.0.0.1:17287/cf-proxies
 ```
 
 #### 浏览器配置
