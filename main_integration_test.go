@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -204,5 +205,30 @@ func TestIntegration_ParseLocalSamples(t *testing.T) {
 	t.Logf("[%s] proxies.yaml format=%s parsed=%d", time.Now().Format(time.RFC3339), proxiesFormat, len(proxiesParsed))
 	if len(proxiesParsed) == 0 {
 		t.Fatal("proxies.yaml should parse at least one proxy")
+	}
+}
+
+func TestListEndpointForHTTPProxyPool(t *testing.T) {
+	pool := NewProxyPool(time.Minute, false)
+	pool.Update([]string{"1.1.1.1:80", "2.2.2.2:80"})
+	_, _ = pool.GetNext()
+
+	req := httptest.NewRequest(http.MethodGet, "http://local/list", nil)
+	rr := httptest.NewRecorder()
+	handleHTTPProxy(rr, req, pool, "MIXED")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if int(payload["proxy_count"].(float64)) != 2 {
+		t.Fatalf("unexpected proxy_count: %+v", payload)
+	}
+	if payload["current_proxy"].(string) == "" {
+		t.Fatalf("current_proxy should not be empty: %+v", payload)
 	}
 }

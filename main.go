@@ -1655,6 +1655,15 @@ func startSOCKS5Server(pool *ProxyPool, port string, mode string) error {
 
 // HTTP Proxy Server
 func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode string) {
+	if r.URL.Path == "/list" {
+		if !validateHTTPProxyAuth(r) {
+			requireHTTPProxyAuth(w, mode)
+			return
+		}
+		writePoolListResponse(w, pool, mode)
+		return
+	}
+
 	log.Printf("[HTTP-%s] Incoming request: %s %s from %s", mode, r.Method, r.URL.String(), r.RemoteAddr)
 
 	if !validateHTTPProxyAuth(r) {
@@ -1772,6 +1781,22 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mo
 
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+func writePoolListResponse(w http.ResponseWriter, pool *ProxyPool, mode string) {
+	proxies := pool.GetAll()
+	current, ok := pool.GetCurrent()
+	if !ok {
+		current = ""
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"mode":          mode,
+		"proxy_count":   len(proxies),
+		"current_proxy": current,
+		"proxies":       proxies,
+	})
 }
 
 func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetDial func(string) (net.Conn, error), proxyAddr string, mode string) {
@@ -1919,6 +1944,21 @@ func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfP
 			for _, proxyAddr := range proxies {
 				fmt.Fprintln(w, proxyAddr)
 			}
+		case "/list":
+			strictProxies := strictPool.GetAll()
+			relaxedProxies := relaxedPool.GetAll()
+			cfProxies := cfPool.GetAll()
+			strictCurrent, _ := strictPool.GetCurrent()
+			relaxedCurrent, _ := relaxedPool.GetCurrent()
+
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"strict_proxy_count":    len(strictProxies),
+				"strict_current_proxy":  strictCurrent,
+				"relaxed_proxy_count":   len(relaxedProxies),
+				"relaxed_current_proxy": relaxedCurrent,
+				"cf_proxy_count":        len(cfProxies),
+			})
 		default:
 			http.NotFound(w, r)
 		}
