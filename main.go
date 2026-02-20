@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -158,11 +159,13 @@ type ProxyPool struct {
 	nextSwitch  time.Time
 	hasSelected bool
 	updating    int32 // atomic flag to prevent concurrent updates
+	rng         *rand.Rand
 }
 
 func NewProxyPool() *ProxyPool {
 	return &ProxyPool{
 		proxies: make([]string, 0),
+		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -172,7 +175,7 @@ func (p *ProxyPool) Update(proxies []string) {
 
 	oldCount := len(p.proxies)
 	p.proxies = proxies
-	// Reset selection state so the first connection after update always uses proxy #1.
+	// Reset selection state so the first connection after update reselects a proxy.
 	p.index = 0
 	p.nextSwitch = time.Time{}
 	p.hasSelected = false
@@ -188,18 +191,18 @@ func (p *ProxyPool) GetNext() (string, error) {
 		return "", fmt.Errorf("no available proxies")
 	}
 
-	// First request after a pool update always uses proxy #1.
+	// First request after a pool update randomly selects one healthy proxy.
 	if !p.hasSelected {
-		p.index = 0
+		p.index = p.randomIndexExcluding(-1)
 		p.nextSwitch = time.Now().Add(proxySwitchInterval)
 		p.hasSelected = true
 		return p.proxies[p.index], nil
 	}
 
-	// Keep using the same proxy for 30 minutes, then switch to the next one.
+	// Keep using the same proxy for 30 minutes, then randomly switch to another one.
 	now := time.Now()
 	if !p.nextSwitch.IsZero() && (now.After(p.nextSwitch) || now.Equal(p.nextSwitch)) {
-		p.index = (p.index + 1) % len(p.proxies)
+		p.index = p.randomIndexExcluding(p.index)
 		p.nextSwitch = now.Add(proxySwitchInterval)
 	}
 
@@ -208,6 +211,18 @@ func (p *ProxyPool) GetNext() (string, error) {
 	}
 
 	return p.proxies[p.index], nil
+}
+
+func (p *ProxyPool) randomIndexExcluding(exclude int) int {
+	if len(p.proxies) <= 1 {
+		return 0
+	}
+
+	idx := p.rng.Intn(len(p.proxies) - 1)
+	if exclude >= 0 && idx >= exclude {
+		idx++
+	}
+	return idx
 }
 
 func (p *ProxyPool) GetAll() []string {
@@ -227,10 +242,10 @@ func (p *ProxyPool) ForceRotate() (string, error) {
 	}
 
 	if !p.hasSelected {
-		p.index = 0
+		p.index = p.randomIndexExcluding(-1)
 		p.hasSelected = true
 	} else {
-		p.index = (p.index + 1) % len(p.proxies)
+		p.index = p.randomIndexExcluding(p.index)
 	}
 
 	p.nextSwitch = time.Now().Add(proxySwitchInterval)
