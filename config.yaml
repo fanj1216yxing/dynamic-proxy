@@ -29,7 +29,7 @@ special_proxy_list_urls:
   # - "https://example.org/another-complex-list.txt"
 
 # 健康检查并发数（同时测试多少个代理）
-health_check_concurrency: 200
+health_check_concurrency: 1000
 
 # 代理池更新间隔（分钟）
 update_interval_minutes: 5
