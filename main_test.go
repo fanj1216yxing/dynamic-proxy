@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"net/http"
+	"net/url"
+	"testing"
+)
 
 func TestParseMixedProxyKeepsHTTPSScheme(t *testing.T) {
 	scheme, addr, auth, header, err := parseMixedProxy("https://user:pass@1.2.3.4:443")
@@ -78,5 +82,37 @@ func TestParseSpecialProxyURLMixedKeepsFullVLESSAndVMESS(t *testing.T) {
 	expectedVLESS := "vless://123e4567-e89b-12d3-a456-426614174000@2.2.2.2:443?encryption=none&security=tls&type=ws"
 	if parsed[1] != expectedVLESS {
 		t.Fatalf("expected vless entry %s, got %s", expectedVLESS, parsed[1])
+	}
+}
+
+func TestResolveConnectTargetStripsDoubleSlash(t *testing.T) {
+	r := &http.Request{
+		Method: http.MethodConnect,
+		Host:   "//linux.do:443",
+		URL:    &url.URL{Opaque: "//linux.do:443"},
+	}
+
+	target, err := resolveConnectTarget(r)
+	if err != nil {
+		t.Fatalf("resolveConnectTarget returned error: %v", err)
+	}
+	if target != "linux.do:443" {
+		t.Fatalf("expected linux.do:443, got %s", target)
+	}
+}
+
+func TestResolveConnectTargetAddsDefaultPort(t *testing.T) {
+	r := &http.Request{
+		Method: http.MethodConnect,
+		Host:   "example.com",
+		URL:    &url.URL{Opaque: "example.com"},
+	}
+
+	target, err := resolveConnectTarget(r)
+	if err != nil {
+		t.Fatalf("resolveConnectTarget returned error: %v", err)
+	}
+	if target != "example.com:443" {
+		t.Fatalf("expected example.com:443, got %s", target)
 	}
 }
