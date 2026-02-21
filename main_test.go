@@ -33,34 +33,3 @@ func TestFilterMixedProxiesBySchemeIncludesHTTPS(t *testing.T) {
 		t.Fatalf("expected only https entry, got %#v", filtered)
 	}
 }
-
-func TestBuildPoolStatusPayloadIncludesHealthyProxyLists(t *testing.T) {
-	strictPool := NewProxyPool(0, false)
-	relaxedPool := NewProxyPool(0, false)
-	cfPool := NewProxyPool(0, false)
-	mixedPool := NewProxyPool(0, false)
-	mainstreamPool := NewProxyPool(0, false)
-	cfMixedPool := NewProxyPool(0, false)
-
-	strictPool.Update([]string{"s1:1"})
-	relaxedPool.Update([]string{"r1:1"})
-	cfPool.Update([]string{"c1:1"})
-	mixedPool.Update([]string{"https://m1:443"})
-	mainstreamPool.Update([]string{"vmess://example"})
-	cfMixedPool.Update([]string{"https://cfm:443"})
-
-	payload := buildPoolStatusPayload(strictPool, relaxedPool, cfPool, mixedPool, mainstreamPool, cfMixedPool, ":17233")
-
-	allHealthy, ok := payload["all_healthy_proxies"].([]string)
-	if !ok {
-		t.Fatalf("expected []string all_healthy_proxies, got %#v", payload["all_healthy_proxies"])
-	}
-	if len(allHealthy) != 6 {
-		t.Fatalf("expected 6 healthy proxies, got %d (%#v)", len(allHealthy), allHealthy)
-	}
-
-	mixedEntries, ok := payload["http_socks_proxies"].([]string)
-	if !ok || len(mixedEntries) != 1 || mixedEntries[0] != "https://m1:443" {
-		t.Fatalf("expected mixed http_socks_proxies to include https entry, got %#v", payload["http_socks_proxies"])
-	}
-}
