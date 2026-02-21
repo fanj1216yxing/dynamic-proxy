@@ -1775,7 +1775,42 @@ func filterMixedProxiesByExcludedScheme(entries []string, excluded map[string]bo
 	return filtered
 }
 
-func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool) {
+func mergeUniqueMixedEntries(base []string, extras []string) []string {
+	merged := make([]string, 0, len(base)+len(extras))
+	seen := make(map[string]bool, len(base)+len(extras))
+
+	for _, entry := range base {
+		if entry == "" || seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		merged = append(merged, entry)
+	}
+
+	for _, entry := range extras {
+		if entry == "" || seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		merged = append(merged, entry)
+	}
+
+	return merged
+}
+
+func poolEntriesAsSocks5(pool *ProxyPool) []string {
+	entries := pool.GetAll()
+	result := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if strings.TrimSpace(entry) == "" {
+			continue
+		}
+		result = append(result, "socks5://"+entry)
+	}
+	return result
+}
+
+func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool, strictPool *ProxyPool, relaxedPool *ProxyPool) {
 	if !atomic.CompareAndSwapInt32(&mixedPool.updating, 0, 1) {
 		log.Println("Mixed proxy update already in progress, skipping...")
 		return
@@ -1794,13 +1829,17 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 
 	httpSocksHealthy := filterMixedProxiesByScheme(result.Healthy, httpSocksMixedSchemes)
 	mainstreamHealthy := filterMixedProxiesByExcludedScheme(result.Healthy, mainstreamMixedExcludedSchemes)
-	log.Printf("[MIXED] Health check split result: total_healthy=%d http_socks=%d mainstream=%d", len(result.Healthy), len(httpSocksHealthy), len(mainstreamHealthy))
+	strictAsMixed := poolEntriesAsSocks5(strictPool)
+	relaxedAsMixed := poolEntriesAsSocks5(relaxedPool)
+	httpSocksCombined := mergeUniqueMixedEntries(httpSocksHealthy, append(strictAsMixed, relaxedAsMixed...))
+	log.Printf("[MIXED] Health check split result: total_healthy=%d http_socks=%d mainstream=%d strict_imported=%d relaxed_imported=%d combined_http_socks=%d",
+		len(result.Healthy), len(httpSocksHealthy), len(mainstreamHealthy), len(strictAsMixed), len(relaxedAsMixed), len(httpSocksCombined))
 
-	if len(httpSocksHealthy) > 0 {
-		mixedPool.Update(httpSocksHealthy)
-		log.Printf("[HTTP-MIXED] Pool updated with %d healthy HTTP/HTTPS/SOCKS mixed proxies", len(httpSocksHealthy))
+	if len(httpSocksCombined) > 0 {
+		mixedPool.Update(httpSocksCombined)
+		log.Printf("[HTTP-MIXED] Pool updated with %d proxies (mixed http/socks + strict/relaxed imports)", len(httpSocksCombined))
 	} else {
-		log.Println("[HTTP-MIXED] Warning: No healthy HTTP/HTTPS/SOCKS mixed proxies found, keeping existing pool")
+		log.Println("[HTTP-MIXED] Warning: No mixed HTTP/HTTPS/SOCKS proxies and no strict/relaxed imports found, keeping existing pool")
 	}
 
 	if len(mainstreamHealthy) > 0 {
@@ -1825,7 +1864,7 @@ func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *Pr
 		// Initial update synchronously to ensure we have proxies before starting servers
 		log.Println("Performing initial proxy update...")
 		updateProxyPool(strictPool, relaxedPool, cfPool)
-		updateMixedProxyPool(mixedPool, mainstreamMixedPool, cfMixedPool)
+		updateMixedProxyPool(mixedPool, mainstreamMixedPool, cfMixedPool, strictPool, relaxedPool)
 	}
 
 	// Periodic updates - each update runs in its own goroutine to avoid blocking
@@ -1834,7 +1873,7 @@ func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *Pr
 	go func() {
 		for range ticker.C {
 			go updateProxyPool(strictPool, relaxedPool, cfPool)
-			go updateMixedProxyPool(mixedPool, mainstreamMixedPool, cfMixedPool)
+			go updateMixedProxyPool(mixedPool, mainstreamMixedPool, cfMixedPool, strictPool, relaxedPool)
 		}
 	}()
 }
