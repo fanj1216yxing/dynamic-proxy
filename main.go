@@ -686,7 +686,7 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 		if u.RawQuery != "" {
 			normalized += "?" + u.RawQuery
 		}
-		if u.Fragment != "" {
+		if u.Fragment != "" && scheme != "vless" {
 			normalized += "#" + u.Fragment
 		}
 		return normalized, true
@@ -892,7 +892,7 @@ func validateMainstreamURI(scheme string, u *url.URL) bool {
 		if u.User == nil || strings.TrimSpace(u.User.Username()) == "" {
 			return false
 		}
-		return strings.EqualFold(strings.TrimSpace(query.Get("encryption")), "none")
+		return true
 	case "trojan", "hy2", "hysteria2":
 		return u.User != nil && strings.TrimSpace(u.User.Username()) != ""
 	case "hysteria":
@@ -993,6 +993,14 @@ func parseSpecialProxyURLMixed(content string) []string {
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if normalized, ok := normalizeMixedProxyEntry(line); ok {
+			if !proxySet[normalized] {
+				proxySet[normalized] = true
+				proxies = append(proxies, normalized)
+			}
 			continue
 		}
 

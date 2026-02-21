@@ -47,3 +47,36 @@ func TestNormalizeMixedProxyEntryStripsHTTPSParams(t *testing.T) {
 		t.Fatalf("expected %s, got %s", expected, normalized)
 	}
 }
+
+func TestNormalizeMixedProxyEntryVLESSDropsFragmentKeepsQuery(t *testing.T) {
+	entry := "vless://123e4567-e89b-12d3-a456-426614174000@1.2.3.4:443?encryption=none&security=tls&type=ws#node-name"
+
+	normalized, ok := normalizeMixedProxyEntry(entry)
+	if !ok {
+		t.Fatalf("normalizeMixedProxyEntry returned false")
+	}
+
+	expected := "vless://123e4567-e89b-12d3-a456-426614174000@1.2.3.4:443?encryption=none&security=tls&type=ws"
+	if normalized != expected {
+		t.Fatalf("expected %s, got %s", expected, normalized)
+	}
+}
+
+func TestParseSpecialProxyURLMixedKeepsFullVLESSAndVMESS(t *testing.T) {
+	vmessRaw := "vmess://eyJhZGQiOiIxLjEuMS4xIiwicG9ydCI6IjQ0MyIsImlkIjoiMTIzZTQ1NjctZTg5Yi0xMmQzLWE0NTYtNDI2NjE0MTc0MDAwIiwibmV0Ijoid3MiLCJwYXRoIjoiLyIsInRscyI6InRscyJ9"
+	vlessRaw := "vless://123e4567-e89b-12d3-a456-426614174000@2.2.2.2:443?encryption=none&security=tls&type=ws#name"
+
+	parsed := parseSpecialProxyURLMixed(vmessRaw + "\n" + vlessRaw)
+	if len(parsed) != 2 {
+		t.Fatalf("expected 2 parsed entries, got %d: %#v", len(parsed), parsed)
+	}
+
+	if _, ok := parseVMESSNode(parsed[0]); !ok {
+		t.Fatalf("expected normalized vmess entry, got %s", parsed[0])
+	}
+
+	expectedVLESS := "vless://123e4567-e89b-12d3-a456-426614174000@2.2.2.2:443?encryption=none&security=tls&type=ws"
+	if parsed[1] != expectedVLESS {
+		t.Fatalf("expected vless entry %s, got %s", expectedVLESS, parsed[1])
+	}
+}
