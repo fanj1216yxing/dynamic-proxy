@@ -344,6 +344,29 @@ func (p *ProxyPool) ForceRotate() (string, error) {
 	return p.proxies[p.index], nil
 }
 
+func (p *ProxyPool) ForceRotateIfCurrent(expected string) (string, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.proxies) == 0 {
+		return "", false, fmt.Errorf("no available proxies")
+	}
+	if !p.hasSelected || p.index < 0 || p.index >= len(p.proxies) {
+		return "", false, nil
+	}
+	if p.proxies[p.index] != expected {
+		return p.proxies[p.index], false, nil
+	}
+
+	p.index = p.randomIndexExcluding(p.index)
+	if !p.rotateEveryRequest {
+		p.nextSwitch = time.Now().Add(p.switchInterval)
+	} else {
+		p.nextSwitch = time.Time{}
+	}
+	return p.proxies[p.index], true, nil
+}
+
 // parseSpecialProxyURL 使用简单正则表达式从复杂格式中提取代理
 // 支持格式：任何包含 ip:port 的行，自动忽略协议前缀和描述文本
 // 例如：socks5://83.217.209.26:1 [[家宽] 英国] → 提取 83.217.209.26:1
@@ -1219,6 +1242,9 @@ func parseMixedProxy(entry string) (scheme string, addr string, auth *proxy.Auth
 		if !mixedSupportedSchemes[s] {
 			return "", "", nil, "", fmt.Errorf("unsupported proxy scheme: %s", s)
 		}
+		if s == "https" {
+			return "", "", nil, "", fmt.Errorf("https upstream proxy format is not supported, use http://host:port or http://user:pass@host:port")
+		}
 
 		var socksAuth *proxy.Auth
 		httpHeader := ""
@@ -1749,7 +1775,42 @@ func filterMixedProxiesByExcludedScheme(entries []string, excluded map[string]bo
 	return filtered
 }
 
-func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool) {
+func mergeUniqueMixedEntries(base []string, extras []string) []string {
+	merged := make([]string, 0, len(base)+len(extras))
+	seen := make(map[string]bool, len(base)+len(extras))
+
+	for _, entry := range base {
+		if entry == "" || seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		merged = append(merged, entry)
+	}
+
+	for _, entry := range extras {
+		if entry == "" || seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		merged = append(merged, entry)
+	}
+
+	return merged
+}
+
+func poolEntriesAsSocks5(pool *ProxyPool) []string {
+	entries := pool.GetAll()
+	result := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if strings.TrimSpace(entry) == "" {
+			continue
+		}
+		result = append(result, "socks5://"+entry)
+	}
+	return result
+}
+
+func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool, strictPool *ProxyPool, relaxedPool *ProxyPool) {
 	if !atomic.CompareAndSwapInt32(&mixedPool.updating, 0, 1) {
 		log.Println("Mixed proxy update already in progress, skipping...")
 		return
@@ -1768,13 +1829,17 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 
 	httpSocksHealthy := filterMixedProxiesByScheme(result.Healthy, httpSocksMixedSchemes)
 	mainstreamHealthy := filterMixedProxiesByExcludedScheme(result.Healthy, mainstreamMixedExcludedSchemes)
-	log.Printf("[MIXED] Health check split result: total_healthy=%d http_socks=%d mainstream=%d", len(result.Healthy), len(httpSocksHealthy), len(mainstreamHealthy))
+	strictAsMixed := poolEntriesAsSocks5(strictPool)
+	relaxedAsMixed := poolEntriesAsSocks5(relaxedPool)
+	httpSocksCombined := mergeUniqueMixedEntries(httpSocksHealthy, append(strictAsMixed, relaxedAsMixed...))
+	log.Printf("[MIXED] Health check split result: total_healthy=%d http_socks=%d mainstream=%d strict_imported=%d relaxed_imported=%d combined_http_socks=%d",
+		len(result.Healthy), len(httpSocksHealthy), len(mainstreamHealthy), len(strictAsMixed), len(relaxedAsMixed), len(httpSocksCombined))
 
-	if len(httpSocksHealthy) > 0 {
-		mixedPool.Update(httpSocksHealthy)
-		log.Printf("[HTTP-MIXED] Pool updated with %d healthy HTTP/HTTPS/SOCKS mixed proxies", len(httpSocksHealthy))
+	if len(httpSocksCombined) > 0 {
+		mixedPool.Update(httpSocksCombined)
+		log.Printf("[HTTP-MIXED] Pool updated with %d proxies (mixed http/socks + strict/relaxed imports)", len(httpSocksCombined))
 	} else {
-		log.Println("[HTTP-MIXED] Warning: No healthy HTTP/HTTPS/SOCKS mixed proxies found, keeping existing pool")
+		log.Println("[HTTP-MIXED] Warning: No mixed HTTP/HTTPS/SOCKS proxies and no strict/relaxed imports found, keeping existing pool")
 	}
 
 	if len(mainstreamHealthy) > 0 {
@@ -1799,7 +1864,7 @@ func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *Pr
 		// Initial update synchronously to ensure we have proxies before starting servers
 		log.Println("Performing initial proxy update...")
 		updateProxyPool(strictPool, relaxedPool, cfPool)
-		updateMixedProxyPool(mixedPool, mainstreamMixedPool, cfMixedPool)
+		updateMixedProxyPool(mixedPool, mainstreamMixedPool, cfMixedPool, strictPool, relaxedPool)
 	}
 
 	// Periodic updates - each update runs in its own goroutine to avoid blocking
@@ -1808,7 +1873,7 @@ func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *Pr
 	go func() {
 		for range ticker.C {
 			go updateProxyPool(strictPool, relaxedPool, cfPool)
-			go updateMixedProxyPool(mixedPool, mainstreamMixedPool, cfMixedPool)
+			go updateMixedProxyPool(mixedPool, mainstreamMixedPool, cfMixedPool, strictPool, relaxedPool)
 		}
 	}()
 }
@@ -1928,6 +1993,27 @@ func startSOCKS5Server(pool *ProxyPool, port string, mode string) error {
 }
 
 // HTTP Proxy Server
+func rotatePoolOnUpstreamFailure(pool *ProxyPool, mode string, failedProxy string, reason error) {
+	if pool == nil || failedProxy == "" {
+		return
+	}
+
+	newProxy, rotated, err := pool.ForceRotateIfCurrent(failedProxy)
+	if err != nil {
+		log.Printf("[AUTO-ROTATE-%s] on-failure rotate failed for %s: %v (trigger=%v)", mode, failedProxy, err, reason)
+		return
+	}
+	if !rotated {
+		return
+	}
+	if newProxy == failedProxy {
+		log.Printf("[AUTO-ROTATE-%s] on-failure rotate skipped, only one proxy available (%s)", mode, failedProxy)
+		return
+	}
+
+	log.Printf("[AUTO-ROTATE-%s] on-failure rotate switched from %s to %s (trigger=%v)", mode, failedProxy, newProxy, reason)
+}
+
 func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fallbackPool *ProxyPool, mode string) {
 	if r.URL.Path == "/list" {
 		if !validateBasicAuth(r) {
@@ -1980,18 +2066,19 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 			dialer, dialErr := proxy.SOCKS5("tcp", dialAddr, upstreamAuth, proxy.Direct)
 			if dialErr != nil {
 				log.Printf("[HTTP-%s] ERROR: Failed to create dialer for proxy %s: %v", mode, proxyAddr, dialErr)
+				rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, dialErr)
 				http.Error(w, "Failed to create proxy dialer", http.StatusInternalServerError)
 				return
 			}
 			handleHTTPSProxy(w, r, func(target string) (net.Conn, error) {
 				return dialer.Dial("tcp", target)
-			}, proxyAddr, mode)
+			}, pool, proxyAddr, mode)
 			return
 		}
 
 		handleHTTPSProxy(w, r, func(target string) (net.Conn, error) {
 			return dialTargetThroughHTTPProxy(dialScheme, dialAddr, upstreamHTTPAuthHeader, target)
-		}, proxyAddr, mode)
+		}, pool, proxyAddr, mode)
 		return
 	}
 
@@ -2009,6 +2096,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 		dialer, dialErr := proxy.SOCKS5("tcp", dialAddr, upstreamAuth, proxy.Direct)
 		if dialErr != nil {
 			log.Printf("[HTTP-%s] ERROR: Failed to create dialer for proxy %s: %v", mode, proxyAddr, dialErr)
+			rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, dialErr)
 			http.Error(w, "Failed to create proxy dialer", http.StatusInternalServerError)
 			return
 		}
@@ -2047,6 +2135,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 	resp, err := client.Do(proxyReq)
 	if err != nil {
 		log.Printf("[HTTP-%s] ERROR: Request failed for %s: %v", mode, r.URL.String(), err)
+		rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, err)
 		http.Error(w, fmt.Sprintf("Proxy request failed: %v", err), http.StatusBadGateway)
 		return
 	}
@@ -2087,13 +2176,14 @@ func writePoolListResponse(w http.ResponseWriter, pool *ProxyPool, fallbackPool 
 	})
 }
 
-func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetDial func(string) (net.Conn, error), proxyAddr string, mode string) {
+func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetDial func(string) (net.Conn, error), pool *ProxyPool, proxyAddr string, mode string) {
 	log.Printf("[HTTPS-%s] Connecting to %s via proxy %s", mode, r.Host, proxyAddr)
 
 	// Connect to target through upstream proxy
 	targetConn, err := targetDial(r.Host)
 	if err != nil {
 		log.Printf("[HTTPS-%s] ERROR: Failed to connect to %s via proxy %s: %v", mode, r.Host, proxyAddr, err)
+		rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, err)
 		http.Error(w, "Failed to connect to target", http.StatusBadGateway)
 		return
 	}
@@ -2350,6 +2440,37 @@ func startProxyConnectivityMonitor(pool *ProxyPool, mode string, interval time.D
 	}()
 }
 
+func startProxyIntervalRotate(pool *ProxyPool, mode string, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			proxyAddr, ok := pool.GetCurrent()
+			if !ok {
+				continue
+			}
+
+			newProxy, err := pool.ForceRotate()
+			if err != nil {
+				log.Printf("[AUTO-ROTATE-%s] periodic rotate failed for %s: %v", mode, proxyAddr, err)
+				continue
+			}
+
+			if newProxy == proxyAddr {
+				log.Printf("[AUTO-ROTATE-%s] periodic rotate skipped, only one proxy available (%s)", mode, proxyAddr)
+				continue
+			}
+
+			log.Printf("[AUTO-ROTATE-%s] periodic rotate switched from %s to %s", mode, proxyAddr, newProxy)
+		}
+	}()
+}
+
 func main() {
 	log.Println("Starting Dynamic Proxy Server...")
 
@@ -2421,6 +2542,14 @@ func main() {
 	startProxyConnectivityMonitor(mainstreamMixedHTTPPool, "MAINSTREAM-MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
 		return checkMixedProxyHealth(proxyEntry, false)
 	})
+
+	if !rotateEveryRequest {
+		startProxyIntervalRotate(strictPool, "STRICT", proxySwitchInterval)
+		startProxyIntervalRotate(relaxedPool, "RELAXED", proxySwitchInterval)
+		startProxyIntervalRotate(mixedHTTPPool, "MIXED", proxySwitchInterval)
+		startProxyIntervalRotate(mainstreamMixedHTTPPool, "MAINSTREAM-MIXED", proxySwitchInterval)
+		startProxyIntervalRotate(cfMixedHTTPPool, "CF-MIXED", proxySwitchInterval)
+	}
 
 	// Check proxy pool status
 	strictCount := len(strictPool.GetAll())
