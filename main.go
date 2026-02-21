@@ -2070,6 +2070,13 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 
 	// Handle CONNECT method for HTTPS
 	if r.Method == http.MethodConnect {
+		targetHost, targetErr := resolveConnectTarget(r)
+		if targetErr != nil {
+			log.Printf("[HTTP-%s] ERROR: Invalid CONNECT target %q: %v", mode, r.URL.String(), targetErr)
+			http.Error(w, "Invalid CONNECT target", http.StatusBadRequest)
+			return
+		}
+
 		dialScheme, dialAddr, useAuth := resolveMixedDialTarget(scheme, upstreamAddr)
 		if !useAuth {
 			upstreamAuth = nil
@@ -2083,13 +2090,13 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 				http.Error(w, "Failed to create proxy dialer", http.StatusInternalServerError)
 				return
 			}
-			handleHTTPSProxy(w, r, func(target string) (net.Conn, error) {
+			handleHTTPSProxy(w, r, targetHost, func(target string) (net.Conn, error) {
 				return dialer.Dial("tcp", target)
 			}, pool, proxyAddr, mode)
 			return
 		}
 
-		handleHTTPSProxy(w, r, func(target string) (net.Conn, error) {
+		handleHTTPSProxy(w, r, targetHost, func(target string) (net.Conn, error) {
 			return dialTargetThroughHTTPProxy(dialScheme, dialAddr, upstreamHTTPAuthHeader, target)
 		}, pool, proxyAddr, mode)
 		return
@@ -2189,13 +2196,41 @@ func writePoolListResponse(w http.ResponseWriter, pool *ProxyPool, fallbackPool 
 	})
 }
 
-func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetDial func(string) (net.Conn, error), pool *ProxyPool, proxyAddr string, mode string) {
-	log.Printf("[HTTPS-%s] Connecting to %s via proxy %s", mode, r.Host, proxyAddr)
+func resolveConnectTarget(r *http.Request) (string, error) {
+	target := strings.TrimSpace(r.Host)
+	if target == "" {
+		target = strings.TrimSpace(r.URL.Host)
+	}
+	if target == "" {
+		target = strings.TrimSpace(r.URL.Opaque)
+	}
+	if target == "" {
+		target = strings.TrimSpace(r.URL.Path)
+	}
+
+	target = strings.TrimPrefix(target, "//")
+	if target == "" {
+		return "", fmt.Errorf("empty CONNECT target")
+	}
+
+	if _, _, err := net.SplitHostPort(target); err != nil {
+		if strings.Contains(err.Error(), "missing port in address") {
+			target = net.JoinHostPort(target, "443")
+		} else {
+			return "", fmt.Errorf("invalid CONNECT target %q: %w", target, err)
+		}
+	}
+
+	return target, nil
+}
+
+func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetHost string, targetDial func(string) (net.Conn, error), pool *ProxyPool, proxyAddr string, mode string) {
+	log.Printf("[HTTPS-%s] Connecting to %s via proxy %s", mode, targetHost, proxyAddr)
 
 	// Connect to target through upstream proxy
-	targetConn, err := targetDial(r.Host)
+	targetConn, err := targetDial(targetHost)
 	if err != nil {
-		log.Printf("[HTTPS-%s] ERROR: Failed to connect to %s via proxy %s: %v", mode, r.Host, proxyAddr, err)
+		log.Printf("[HTTPS-%s] ERROR: Failed to connect to %s via proxy %s: %v", mode, targetHost, proxyAddr, err)
 		rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, err)
 		http.Error(w, "Failed to connect to target", http.StatusBadGateway)
 		return
@@ -2205,14 +2240,14 @@ func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetDial func(st
 	// Hijack the connection
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		log.Printf("[HTTPS-%s] ERROR: Hijacking not supported for %s", mode, r.Host)
+		log.Printf("[HTTPS-%s] ERROR: Hijacking not supported for %s", mode, targetHost)
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 		return
 	}
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		log.Printf("[HTTPS-%s] ERROR: Failed to hijack connection for %s: %v", mode, r.Host, err)
+		log.Printf("[HTTPS-%s] ERROR: Failed to hijack connection for %s: %v", mode, targetHost, err)
 		http.Error(w, "Failed to hijack connection", http.StatusInternalServerError)
 		return
 	}
@@ -2220,7 +2255,7 @@ func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetDial func(st
 
 	// Send 200 Connection Established
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	log.Printf("[HTTPS-%s] SUCCESS: Tunnel established to %s via proxy %s", mode, r.Host, proxyAddr)
+	log.Printf("[HTTPS-%s] SUCCESS: Tunnel established to %s via proxy %s", mode, targetHost, proxyAddr)
 
 	// Bidirectional copy
 	var wg sync.WaitGroup
