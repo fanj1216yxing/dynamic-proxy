@@ -1243,7 +1243,9 @@ func parseMixedProxy(entry string) (scheme string, addr string, auth *proxy.Auth
 			return "", "", nil, "", fmt.Errorf("unsupported proxy scheme: %s", s)
 		}
 		if s == "https" {
-			return "", "", nil, "", fmt.Errorf("https upstream proxy format is not supported, use http://host:port or http://user:pass@host:port")
+			// HTTPS proxy uses the same HTTP CONNECT flow in this project.
+			// Keep accepting https:// entries so mixed pools won't silently drop them.
+			s = "http"
 		}
 
 		var socksAuth *proxy.Auth
@@ -1798,14 +1800,19 @@ func mergeUniqueMixedEntries(base []string, extras []string) []string {
 	return merged
 }
 
-func poolEntriesAsSocks5(pool *ProxyPool) []string {
+func poolEntriesWithDefaultScheme(pool *ProxyPool, defaultScheme string) []string {
 	entries := pool.GetAll()
 	result := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if strings.TrimSpace(entry) == "" {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed == "" {
 			continue
 		}
-		result = append(result, "socks5://"+entry)
+		if strings.Contains(trimmed, "://") {
+			result = append(result, trimmed)
+			continue
+		}
+		result = append(result, defaultScheme+"://"+trimmed)
 	}
 	return result
 }
@@ -1829,8 +1836,8 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 
 	httpSocksHealthy := filterMixedProxiesByScheme(result.Healthy, httpSocksMixedSchemes)
 	mainstreamHealthy := filterMixedProxiesByExcludedScheme(result.Healthy, mainstreamMixedExcludedSchemes)
-	strictAsMixed := poolEntriesAsSocks5(strictPool)
-	relaxedAsMixed := poolEntriesAsSocks5(relaxedPool)
+	strictAsMixed := poolEntriesWithDefaultScheme(strictPool, "http")
+	relaxedAsMixed := poolEntriesWithDefaultScheme(relaxedPool, "http")
 	httpSocksCombined := mergeUniqueMixedEntries(httpSocksHealthy, append(strictAsMixed, relaxedAsMixed...))
 	log.Printf("[MIXED] Health check split result: total_healthy=%d http_socks=%d mainstream=%d strict_imported=%d relaxed_imported=%d combined_http_socks=%d",
 		len(result.Healthy), len(httpSocksHealthy), len(mainstreamHealthy), len(strictAsMixed), len(relaxedAsMixed), len(httpSocksCombined))
