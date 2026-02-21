@@ -2368,6 +2368,54 @@ func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfP
 	return server.ListenAndServe()
 }
 
+func buildPoolStatusPayload(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool, port string) map[string]interface{} {
+	strictProxies := strictPool.GetAll()
+	relaxedProxies := relaxedPool.GetAll()
+	cfProxies := cfPool.GetAll()
+	mixedProxies := mixedPool.GetAll()
+	mainstreamProxies := mainstreamMixedPool.GetAll()
+	cfMixedProxies := cfMixedPool.GetAll()
+
+	strictCurrent, _ := strictPool.GetCurrent()
+	relaxedCurrent, _ := relaxedPool.GetCurrent()
+	cfCurrent, _ := cfPool.GetCurrent()
+	mixedCurrent, _ := mixedPool.GetCurrent()
+	mainstreamCurrent, _ := mainstreamMixedPool.GetCurrent()
+	cfMixedCurrent, _ := cfMixedPool.GetCurrent()
+
+	allHealthyProxies := mergeUniqueMixedEntries(strictProxies, relaxedProxies)
+	allHealthyProxies = mergeUniqueMixedEntries(allHealthyProxies, mixedProxies)
+	allHealthyProxies = mergeUniqueMixedEntries(allHealthyProxies, mainstreamProxies)
+	allHealthyProxies = mergeUniqueMixedEntries(allHealthyProxies, cfProxies)
+	allHealthyProxies = mergeUniqueMixedEntries(allHealthyProxies, cfMixedProxies)
+
+	return map[string]interface{}{
+		"strict_proxy_count":            len(strictProxies),
+		"strict_current_proxy":          strictCurrent,
+		"strict_proxies":                strictProxies,
+		"relaxed_proxy_count":           len(relaxedProxies),
+		"relaxed_current_proxy":         relaxedCurrent,
+		"relaxed_proxies":               relaxedProxies,
+		"cf_proxy_count":                len(cfProxies),
+		"cf_current_proxy":              cfCurrent,
+		"cf_proxies":                    cfProxies,
+		"http_socks_proxy_count":        len(mixedProxies),
+		"http_socks_current_proxy":      mixedCurrent,
+		"http_socks_proxies":            mixedProxies,
+		"mainstream_proxy_count":        len(mainstreamProxies),
+		"mainstream_current_proxy":      mainstreamCurrent,
+		"mainstream_proxies":            mainstreamProxies,
+		"cf_mixed_proxy_count":          len(cfMixedProxies),
+		"cf_mixed_current_proxy":        cfMixedCurrent,
+		"cf_mixed_proxies":              cfMixedProxies,
+		"all_healthy_proxy_count":       len(allHealthyProxies),
+		"all_healthy_proxies":           allHealthyProxies,
+		"mainstream_listen_port":        config.Ports.HTTPMainstreamMix,
+		"status_listen_addr":            port,
+		"mainstream_excluded_protocols": []string{"http", "https", "socks5", "socks5h"},
+	}
+}
+
 func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool, port string) error {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/list" {
@@ -2375,31 +2423,8 @@ func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool
 			return
 		}
 
-		strictCurrent, _ := strictPool.GetCurrent()
-		relaxedCurrent, _ := relaxedPool.GetCurrent()
-		cfCurrent, _ := cfPool.GetCurrent()
-		mixedCurrent, _ := mixedPool.GetCurrent()
-		mainstreamCurrent, _ := mainstreamMixedPool.GetCurrent()
-		cfMixedCurrent, _ := cfMixedPool.GetCurrent()
-
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"strict_proxy_count":            len(strictPool.GetAll()),
-			"strict_current_proxy":          strictCurrent,
-			"relaxed_proxy_count":           len(relaxedPool.GetAll()),
-			"relaxed_current_proxy":         relaxedCurrent,
-			"cf_proxy_count":                len(cfPool.GetAll()),
-			"cf_current_proxy":              cfCurrent,
-			"http_socks_proxy_count":        len(mixedPool.GetAll()),
-			"http_socks_current_proxy":      mixedCurrent,
-			"mainstream_proxy_count":        len(mainstreamMixedPool.GetAll()),
-			"mainstream_current_proxy":      mainstreamCurrent,
-			"cf_mixed_proxy_count":          len(cfMixedPool.GetAll()),
-			"cf_mixed_current_proxy":        cfMixedCurrent,
-			"mainstream_listen_port":        config.Ports.HTTPMainstreamMix,
-			"status_listen_addr":            port,
-			"mainstream_excluded_protocols": []string{"http", "https", "socks5", "socks5h"},
-		})
+		_ = json.NewEncoder(w).Encode(buildPoolStatusPayload(strictPool, relaxedPool, cfPool, mixedPool, mainstreamMixedPool, cfMixedPool, port))
 	})
 
 	server := &http.Server{Addr: port, Handler: handler}
