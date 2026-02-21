@@ -1242,11 +1242,6 @@ func parseMixedProxy(entry string) (scheme string, addr string, auth *proxy.Auth
 		if !mixedSupportedSchemes[s] {
 			return "", "", nil, "", fmt.Errorf("unsupported proxy scheme: %s", s)
 		}
-		if s == "https" {
-			// HTTPS proxy uses the same HTTP CONNECT flow in this project.
-			// Keep accepting https:// entries so mixed pools won't silently drop them.
-			s = "http"
-		}
 
 		var socksAuth *proxy.Auth
 		httpHeader := ""
