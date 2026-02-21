@@ -33,3 +33,17 @@ func TestFilterMixedProxiesBySchemeIncludesHTTPS(t *testing.T) {
 		t.Fatalf("expected only https entry, got %#v", filtered)
 	}
 }
+
+func TestNormalizeMixedProxyEntryStripsHTTPSParams(t *testing.T) {
+	entry := "https://user:pass@1.2.3.4:443?foo=bar#frag"
+
+	normalized, ok := normalizeMixedProxyEntry(entry)
+	if !ok {
+		t.Fatalf("normalizeMixedProxyEntry returned false")
+	}
+
+	expected := "https://user:pass@1.2.3.4:443"
+	if normalized != expected {
+		t.Fatalf("expected %s, got %s", expected, normalized)
+	}
+}
