@@ -941,6 +941,10 @@ func normalizeSSURI(raw string) (string, bool) {
 
 func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dialAddr string, useAuth bool) {
 	switch scheme {
+	case "https":
+		// Upstream HTTPS proxy is dialed via the same HTTP CONNECT path.
+		// Keep original scheme metadata in pool entries, only normalize at dial time.
+		return "http", addr, true
 	case "vmess":
 		return "http", addr, false
 	case "vless", "hy2", "hysteria", "hysteria2", "trojan", "ss", "ssr", "tuic", "wg", "wireguard":
@@ -1242,10 +1246,6 @@ func parseMixedProxy(entry string) (scheme string, addr string, auth *proxy.Auth
 		if !mixedSupportedSchemes[s] {
 			return "", "", nil, "", fmt.Errorf("unsupported proxy scheme: %s", s)
 		}
-		if s == "https" {
-			return "", "", nil, "", fmt.Errorf("https upstream proxy format is not supported, use http://host:port or http://user:pass@host:port")
-		}
-
 		var socksAuth *proxy.Auth
 		httpHeader := ""
 		if u.User != nil {
@@ -1798,14 +1798,19 @@ func mergeUniqueMixedEntries(base []string, extras []string) []string {
 	return merged
 }
 
-func poolEntriesAsSocks5(pool *ProxyPool) []string {
+func poolEntriesWithDefaultScheme(pool *ProxyPool, defaultScheme string) []string {
 	entries := pool.GetAll()
 	result := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if strings.TrimSpace(entry) == "" {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed == "" {
 			continue
 		}
-		result = append(result, "socks5://"+entry)
+		if strings.Contains(trimmed, "://") {
+			result = append(result, trimmed)
+			continue
+		}
+		result = append(result, defaultScheme+"://"+trimmed)
 	}
 	return result
 }
@@ -1829,8 +1834,8 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 
 	httpSocksHealthy := filterMixedProxiesByScheme(result.Healthy, httpSocksMixedSchemes)
 	mainstreamHealthy := filterMixedProxiesByExcludedScheme(result.Healthy, mainstreamMixedExcludedSchemes)
-	strictAsMixed := poolEntriesAsSocks5(strictPool)
-	relaxedAsMixed := poolEntriesAsSocks5(relaxedPool)
+	strictAsMixed := poolEntriesWithDefaultScheme(strictPool, "http")
+	relaxedAsMixed := poolEntriesWithDefaultScheme(relaxedPool, "http")
 	httpSocksCombined := mergeUniqueMixedEntries(httpSocksHealthy, append(strictAsMixed, relaxedAsMixed...))
 	log.Printf("[MIXED] Health check split result: total_healthy=%d http_socks=%d mainstream=%d strict_imported=%d relaxed_imported=%d combined_http_socks=%d",
 		len(result.Healthy), len(httpSocksHealthy), len(mainstreamHealthy), len(strictAsMixed), len(relaxedAsMixed), len(httpSocksCombined))
