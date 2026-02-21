@@ -680,6 +680,9 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 			authority = u.User.String() + "@" + authority
 		}
 		normalized := fmt.Sprintf("%s://%s", scheme, authority)
+		if scheme == "https" {
+			return normalized, true
+		}
 		if u.RawQuery != "" {
 			normalized += "?" + u.RawQuery
 		}
