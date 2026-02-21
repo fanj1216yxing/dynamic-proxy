@@ -1219,6 +1219,9 @@ func parseMixedProxy(entry string) (scheme string, addr string, auth *proxy.Auth
 		if !mixedSupportedSchemes[s] {
 			return "", "", nil, "", fmt.Errorf("unsupported proxy scheme: %s", s)
 		}
+		if s == "https" {
+			return "", "", nil, "", fmt.Errorf("https upstream proxy format is not supported, use http://host:port or http://user:pass@host:port")
+		}
 
 		var socksAuth *proxy.Auth
 		httpHeader := ""
@@ -2350,6 +2353,37 @@ func startProxyConnectivityMonitor(pool *ProxyPool, mode string, interval time.D
 	}()
 }
 
+func startProxyIntervalRotate(pool *ProxyPool, mode string, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			proxyAddr, ok := pool.GetCurrent()
+			if !ok {
+				continue
+			}
+
+			newProxy, err := pool.ForceRotate()
+			if err != nil {
+				log.Printf("[AUTO-ROTATE-%s] periodic rotate failed for %s: %v", mode, proxyAddr, err)
+				continue
+			}
+
+			if newProxy == proxyAddr {
+				log.Printf("[AUTO-ROTATE-%s] periodic rotate skipped, only one proxy available (%s)", mode, proxyAddr)
+				continue
+			}
+
+			log.Printf("[AUTO-ROTATE-%s] periodic rotate switched from %s to %s", mode, proxyAddr, newProxy)
+		}
+	}()
+}
+
 func main() {
 	log.Println("Starting Dynamic Proxy Server...")
 
@@ -2421,6 +2455,14 @@ func main() {
 	startProxyConnectivityMonitor(mainstreamMixedHTTPPool, "MAINSTREAM-MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
 		return checkMixedProxyHealth(proxyEntry, false)
 	})
+
+	if !rotateEveryRequest {
+		startProxyIntervalRotate(strictPool, "STRICT", proxySwitchInterval)
+		startProxyIntervalRotate(relaxedPool, "RELAXED", proxySwitchInterval)
+		startProxyIntervalRotate(mixedHTTPPool, "MIXED", proxySwitchInterval)
+		startProxyIntervalRotate(mainstreamMixedHTTPPool, "MAINSTREAM-MIXED", proxySwitchInterval)
+		startProxyIntervalRotate(cfMixedHTTPPool, "CF-MIXED", proxySwitchInterval)
+	}
 
 	// Check proxy pool status
 	strictCount := len(strictPool.GetAll())
