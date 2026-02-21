@@ -344,6 +344,29 @@ func (p *ProxyPool) ForceRotate() (string, error) {
 	return p.proxies[p.index], nil
 }
 
+func (p *ProxyPool) ForceRotateIfCurrent(expected string) (string, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.proxies) == 0 {
+		return "", false, fmt.Errorf("no available proxies")
+	}
+	if !p.hasSelected || p.index < 0 || p.index >= len(p.proxies) {
+		return "", false, nil
+	}
+	if p.proxies[p.index] != expected {
+		return p.proxies[p.index], false, nil
+	}
+
+	p.index = p.randomIndexExcluding(p.index)
+	if !p.rotateEveryRequest {
+		p.nextSwitch = time.Now().Add(p.switchInterval)
+	} else {
+		p.nextSwitch = time.Time{}
+	}
+	return p.proxies[p.index], true, nil
+}
+
 // parseSpecialProxyURL 使用简单正则表达式从复杂格式中提取代理
 // 支持格式：任何包含 ip:port 的行，自动忽略协议前缀和描述文本
 // 例如：socks5://83.217.209.26:1 [[家宽] 英国] → 提取 83.217.209.26:1
@@ -1931,6 +1954,27 @@ func startSOCKS5Server(pool *ProxyPool, port string, mode string) error {
 }
 
 // HTTP Proxy Server
+func rotatePoolOnUpstreamFailure(pool *ProxyPool, mode string, failedProxy string, reason error) {
+	if pool == nil || failedProxy == "" {
+		return
+	}
+
+	newProxy, rotated, err := pool.ForceRotateIfCurrent(failedProxy)
+	if err != nil {
+		log.Printf("[AUTO-ROTATE-%s] on-failure rotate failed for %s: %v (trigger=%v)", mode, failedProxy, err, reason)
+		return
+	}
+	if !rotated {
+		return
+	}
+	if newProxy == failedProxy {
+		log.Printf("[AUTO-ROTATE-%s] on-failure rotate skipped, only one proxy available (%s)", mode, failedProxy)
+		return
+	}
+
+	log.Printf("[AUTO-ROTATE-%s] on-failure rotate switched from %s to %s (trigger=%v)", mode, failedProxy, newProxy, reason)
+}
+
 func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fallbackPool *ProxyPool, mode string) {
 	if r.URL.Path == "/list" {
 		if !validateBasicAuth(r) {
@@ -1983,18 +2027,19 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 			dialer, dialErr := proxy.SOCKS5("tcp", dialAddr, upstreamAuth, proxy.Direct)
 			if dialErr != nil {
 				log.Printf("[HTTP-%s] ERROR: Failed to create dialer for proxy %s: %v", mode, proxyAddr, dialErr)
+				rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, dialErr)
 				http.Error(w, "Failed to create proxy dialer", http.StatusInternalServerError)
 				return
 			}
 			handleHTTPSProxy(w, r, func(target string) (net.Conn, error) {
 				return dialer.Dial("tcp", target)
-			}, proxyAddr, mode)
+			}, pool, proxyAddr, mode)
 			return
 		}
 
 		handleHTTPSProxy(w, r, func(target string) (net.Conn, error) {
 			return dialTargetThroughHTTPProxy(dialScheme, dialAddr, upstreamHTTPAuthHeader, target)
-		}, proxyAddr, mode)
+		}, pool, proxyAddr, mode)
 		return
 	}
 
@@ -2012,6 +2057,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 		dialer, dialErr := proxy.SOCKS5("tcp", dialAddr, upstreamAuth, proxy.Direct)
 		if dialErr != nil {
 			log.Printf("[HTTP-%s] ERROR: Failed to create dialer for proxy %s: %v", mode, proxyAddr, dialErr)
+			rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, dialErr)
 			http.Error(w, "Failed to create proxy dialer", http.StatusInternalServerError)
 			return
 		}
@@ -2050,6 +2096,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 	resp, err := client.Do(proxyReq)
 	if err != nil {
 		log.Printf("[HTTP-%s] ERROR: Request failed for %s: %v", mode, r.URL.String(), err)
+		rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, err)
 		http.Error(w, fmt.Sprintf("Proxy request failed: %v", err), http.StatusBadGateway)
 		return
 	}
@@ -2090,13 +2137,14 @@ func writePoolListResponse(w http.ResponseWriter, pool *ProxyPool, fallbackPool 
 	})
 }
 
-func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetDial func(string) (net.Conn, error), proxyAddr string, mode string) {
+func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetDial func(string) (net.Conn, error), pool *ProxyPool, proxyAddr string, mode string) {
 	log.Printf("[HTTPS-%s] Connecting to %s via proxy %s", mode, r.Host, proxyAddr)
 
 	// Connect to target through upstream proxy
 	targetConn, err := targetDial(r.Host)
 	if err != nil {
 		log.Printf("[HTTPS-%s] ERROR: Failed to connect to %s via proxy %s: %v", mode, r.Host, proxyAddr, err)
+		rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, err)
 		http.Error(w, "Failed to connect to target", http.StatusBadGateway)
 		return
 	}
