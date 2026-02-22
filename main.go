@@ -2083,14 +2083,13 @@ type LoggedConn struct {
 	net.Conn
 	addr       string
 	proxyAddr  string
-	closed     bool
+	closed     atomic.Bool
 	bytesRead  int64
 	bytesWrite int64
 }
 
 func (c *LoggedConn) Close() error {
-	if !c.closed {
-		c.closed = true
+	if c.closed.CompareAndSwap(false, true) {
 		log.Printf("[SOCKS5] Connection closed: %s via proxy %s (read: %d bytes, wrote: %d bytes)",
 			c.addr, c.proxyAddr, c.bytesRead, c.bytesWrite)
 	}
@@ -2151,7 +2150,6 @@ func (d *CustomDialer) Dial(ctx context.Context, network, addr string) (net.Conn
 		Conn:      conn,
 		addr:      addr,
 		proxyAddr: proxyAddr,
-		closed:    false,
 	}
 
 	return loggedConn, nil
