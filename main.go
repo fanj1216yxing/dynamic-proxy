@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -73,6 +74,33 @@ const connectivityCheckInterval = 10 * time.Second
 const defaultMixedHealthCheckURL = "https://www.google.com"
 
 var mixedHealthCheckURL = defaultMixedHealthCheckURL
+
+//go:embed web/admin/index.html
+var adminPanelHTML string
+
+type AdminRuntime struct {
+	mu                  sync.RWMutex
+	LastUpdateTime      time.Time
+	LastHealthCheckTime time.Time
+	LastUpdateStatus    string
+}
+
+func (a *AdminRuntime) MarkUpdated(status string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now()
+	a.LastUpdateTime = now
+	a.LastHealthCheckTime = now
+	a.LastUpdateStatus = status
+}
+
+func (a *AdminRuntime) Snapshot() (time.Time, time.Time, string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.LastUpdateTime, a.LastHealthCheckTime, a.LastUpdateStatus
+}
+
+var adminRuntime = &AdminRuntime{}
 
 // Simple regex to extract ip:port from any format (used for special proxy lists)
 // Matches: [IP]:[port] and ignores any protocol prefixes or extra text
@@ -1725,6 +1753,8 @@ func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *Prox
 	} else {
 		log.Println("[RELAXED] Warning: No healthy proxies found, keeping existing pool")
 	}
+
+	adminRuntime.MarkUpdated("ok")
 }
 
 type MixedHealthCheckResult struct {
@@ -2074,6 +2104,8 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 			log.Println("[HTTP-CF-MIXED] Warning: No CF-pass mixed proxies found, keeping existing pool")
 		}
 	}
+
+	adminRuntime.MarkUpdated("ok")
 }
 
 func startProxyUpdater(ctx context.Context, strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool, initialSync bool) {
@@ -2690,19 +2722,224 @@ func buildPoolStatusPayload(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPoo
 	}
 }
 
+type ProxyRow struct {
+	Address   string `json:"address"`
+	Protocol  string `json:"protocol"`
+	Pool      string `json:"pool"`
+	LatencyMS int    `json:"latency_ms"`
+	Current   bool   `json:"current"`
+}
+
+func splitProxyEntry(entry string) (protocol string, address string) {
+	trimmed := strings.TrimSpace(entry)
+	if trimmed == "" {
+		return "unknown", ""
+	}
+	if strings.Contains(trimmed, "://") {
+		u, err := url.Parse(trimmed)
+		if err != nil {
+			return "unknown", trimmed
+		}
+		host := u.Host
+		if host == "" {
+			host = strings.TrimPrefix(trimmed, u.Scheme+"://")
+		}
+		return strings.ToLower(u.Scheme), host
+	}
+	return "http", trimmed
+}
+
+func rowsFromPool(poolName string, pool *ProxyPool) []ProxyRow {
+	entries := pool.GetAll()
+	current, _ := pool.GetCurrent()
+	out := make([]ProxyRow, 0, len(entries))
+	for _, entry := range entries {
+		protocol, address := splitProxyEntry(entry)
+		out = append(out, ProxyRow{Address: address, Protocol: protocol, Pool: poolName, LatencyMS: 0, Current: current == entry})
+	}
+	return out
+}
+
+func triggerRotateControlAll() (string, error) {
+	rotateAddr := config.Ports.RotateControl
+	if !strings.HasPrefix(rotateAddr, ":") {
+		if !strings.Contains(rotateAddr, ":") {
+			rotateAddr = ":" + rotateAddr
+		}
+	}
+	endpoint := "http://127.0.0.1" + rotateAddr + "/rotate"
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	if isProxyAuthEnabled() {
+		req.SetBasicAuth(config.Auth.Username, config.Auth.Password)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return string(body), fmt.Errorf("rotate control status=%d", resp.StatusCode)
+	}
+	return string(body), nil
+}
+
 func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool, port string) error {
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/list" {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "STATUS-ADMIN")
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(adminPanelHTML))
+	})
 
+	mux.HandleFunc("/list", func(w http.ResponseWriter, r *http.Request) {
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "STATUS-LIST")
+			return
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(buildPoolStatusPayload(strictPool, relaxedPool, cfPool, mixedPool, mainstreamMixedPool, cfMixedPool, port))
 	})
 
-	server := &http.Server{Addr: port, Handler: handler}
-	log.Printf("[STATUS] Pool status server listening on %s", port)
+	mux.HandleFunc("/api/overview", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "STATUS-OVERVIEW")
+			return
+		}
+		payload := buildPoolStatusPayload(strictPool, relaxedPool, cfPool, mixedPool, mainstreamMixedPool, cfMixedPool, port)
+		lastUpdate, lastHealth, status := adminRuntime.Snapshot()
+		allHealthyCount := payload["all_healthy_proxy_count"]
+		out := map[string]interface{}{
+			"strict":             map[string]interface{}{"available": payload["strict_proxy_count"]},
+			"relaxed":            map[string]interface{}{"available": payload["relaxed_proxy_count"]},
+			"mixed":              map[string]interface{}{"available": payload["http_socks_proxy_count"]},
+			"all_healthy":        allHealthyCount,
+			"last_update_status": status,
+		}
+		if !lastUpdate.IsZero() {
+			out["last_update_time"] = lastUpdate.Format(time.RFC3339)
+		}
+		if !lastHealth.IsZero() {
+			out["last_health_check_time"] = lastHealth.Format(time.RFC3339)
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(out)
+	})
+
+	mux.HandleFunc("/api/proxies", func(w http.ResponseWriter, r *http.Request) {
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "STATUS-PROXIES")
+			return
+		}
+		items := make([]ProxyRow, 0)
+		items = append(items, rowsFromPool("strict", strictPool)...)
+		items = append(items, rowsFromPool("relaxed", relaxedPool)...)
+		items = append(items, rowsFromPool("cf", cfPool)...)
+		items = append(items, rowsFromPool("mixed", mixedPool)...)
+		items = append(items, rowsFromPool("mainstream", mainstreamMixedPool)...)
+		items = append(items, rowsFromPool("cf_mixed", cfMixedPool)...)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"items": items})
+	})
+
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "STATUS-CONFIG")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"update_interval_minutes":   config.UpdateIntervalMinutes,
+			"health_check_concurrency":  config.HealthCheckConcurrency,
+			"proxy_switch_interval_min": config.ProxySwitchIntervalMin,
+			"ports":                     config.Ports,
+			"auth_enabled":              isProxyAuthEnabled(),
+		})
+	})
+
+	mux.HandleFunc("/api/actions/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "STATUS-REFRESH")
+			return
+		}
+		go updateProxyPool(strictPool, relaxedPool, cfPool)
+		go updateMixedProxyPool(mixedPool, mainstreamMixedPool, cfMixedPool, strictPool, relaxedPool)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "message": "refresh triggered"})
+	})
+
+	mux.HandleFunc("/api/actions/rotate", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "STATUS-ROTATE")
+			return
+		}
+		var req struct {
+			Pool string `json:"pool"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Pool == "" {
+			req.Pool = "all"
+		}
+		result := map[string]string{}
+		rotateOne := func(name string, pool *ProxyPool) {
+			proxyAddr, err := pool.ForceRotate()
+			if err != nil {
+				result[name] = "error: " + err.Error()
+				return
+			}
+			result[name] = proxyAddr
+		}
+		switch req.Pool {
+		case "all":
+			body, err := triggerRotateControlAll()
+			if err != nil {
+				result["all"] = "error: " + err.Error() + " body=" + body
+			} else {
+				result["all"] = body
+			}
+		case "strict":
+			rotateOne("strict", strictPool)
+		case "relaxed":
+			rotateOne("relaxed", relaxedPool)
+		case "mixed":
+			rotateOne("mixed", mixedPool)
+		case "mainstream":
+			rotateOne("mainstream", mainstreamMixedPool)
+		case "cf_mixed":
+			rotateOne("cf_mixed", cfMixedPool)
+		default:
+			http.Error(w, "invalid pool", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "pool": req.Pool, "result": result})
+	})
+
+	server := &http.Server{Addr: port, Handler: mux}
+	log.Printf("[STATUS] Admin panel + status API listening on %s", port)
 	return server.ListenAndServe()
 }
 
