@@ -216,7 +216,7 @@ special_proxy_list_urls:
   # - "https://example.org/another-complex-list.txt"
 
 # 健康检查并发数（同时测试多少个代理）
-health_check_concurrency: 1000
+health_check_concurrency: 2000
 
 # 代理池更新间隔（分钟）
 update_interval_minutes: 5
@@ -225,12 +225,24 @@ update_interval_minutes: 5
 # 默认 30，填 now 表示每次请求都轮换一次代理
 proxy_switch_interval_min: 30
 
-# 健康检查超时设置
+# 单阶段健康检查超时设置（当 two-stage 关闭时生效）
 health_check:
   # 总超时时间（秒）
-  total_timeout_seconds: 15
+  total_timeout_seconds: 8
   # TLS握手性能阈值（秒）
-  tls_handshake_threshold_seconds: 8
+  tls_handshake_threshold_seconds: 4
+
+# 两阶段健康检查（适合超大规模代理池）
+health_check_two_stage:
+  enabled: true
+  # 第一阶段：快速淘汰
+  stage_one:
+    total_timeout_seconds: 4
+    tls_handshake_threshold_seconds: 2
+  # 第二阶段：精细检测
+  stage_two:
+    total_timeout_seconds: 8
+    tls_handshake_threshold_seconds: 4
 
 # 服务器端口配置
 ports:
