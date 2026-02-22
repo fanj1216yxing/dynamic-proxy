@@ -103,6 +103,8 @@ const defaultMixedHealthCheckURL = "https://www.google.com"
 const healthCheckBatchSize = 50000
 
 var mixedHealthCheckURL = defaultMixedHealthCheckURL
+var mixedProxyHealthChecker = checkMainstreamProxyHealth
+var mixedCFBypassChecker = checkCloudflareBypassMixed
 
 //go:embed web/admin/index.html
 var adminPanelHTML string
@@ -1073,11 +1075,48 @@ type UpstreamDialer interface {
 }
 
 type socksUpstreamDialer struct {
-	dialer proxy.Dialer
+	proxyAddr string
+	auth      *proxy.Auth
 }
 
-func (d *socksUpstreamDialer) DialContext(_ context.Context, network, addr string) (net.Conn, error) {
-	return d.dialer.Dial(network, addr)
+func (d *socksUpstreamDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	timeout := 10 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, context.DeadlineExceeded
+		}
+		timeout = remaining
+	}
+
+	forward := timeoutForwardDialer{timeout: timeout}
+	dialer, err := proxy.SOCKS5("tcp", d.proxyAddr, d.auth, forward)
+	if err != nil {
+		return nil, err
+	}
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		conn, dialErr := dialer.Dial(network, addr)
+		resultCh <- dialResult{conn: conn, err: dialErr}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-resultCh:
+		if result.err != nil {
+			return nil, result.err
+		}
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = result.conn.SetDeadline(deadline)
+		}
+		return result.conn, nil
+	}
 }
 
 type httpConnectUpstreamDialer struct {
@@ -1086,11 +1125,11 @@ type httpConnectUpstreamDialer struct {
 	proxyAuthHeader string
 }
 
-func (d *httpConnectUpstreamDialer) DialContext(_ context.Context, network, addr string) (net.Conn, error) {
+func (d *httpConnectUpstreamDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	if network != "tcp" {
 		return nil, fmt.Errorf("unsupported network %s for HTTP upstream", network)
 	}
-	return dialTargetThroughHTTPProxy(d.proxyScheme, d.proxyAddr, d.proxyAuthHeader, addr)
+	return dialTargetThroughHTTPProxy(ctx, d.proxyScheme, d.proxyAddr, d.proxyAuthHeader, addr)
 }
 
 func buildUpstreamDialer(entry string) (UpstreamDialer, string, error) {
@@ -1107,11 +1146,7 @@ func buildUpstreamDialer(entry string) (UpstreamDialer, string, error) {
 
 	switch dialScheme {
 	case "socks5", "socks5h":
-		dialer, dialErr := proxy.SOCKS5("tcp", dialAddr, auth, proxy.Direct)
-		if dialErr != nil {
-			return nil, scheme, fmt.Errorf("failed to create SOCKS dialer: %w", dialErr)
-		}
-		return &socksUpstreamDialer{dialer: dialer}, scheme, nil
+		return &socksUpstreamDialer{proxyAddr: dialAddr, auth: auth}, scheme, nil
 	case "http", "https":
 		return &httpConnectUpstreamDialer{proxyScheme: dialScheme, proxyAddr: dialAddr, proxyAuthHeader: httpAuthHeader}, scheme, nil
 	case "vmess", "vless", "hy2", "hysteria", "hysteria2", "trojan", "ss", "ssr", "tuic", "wg", "wireguard":
@@ -2240,6 +2275,7 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 	var healthyCount int64
 	var cfPassCount int64
 	protocolSummary := make(map[string]*protocolStats)
+	latencies := make([]time.Duration, 0, len(proxies))
 
 	workerCount := config.HealthCheckConcurrency
 	if workerCount <= 0 {
@@ -2278,7 +2314,13 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 		go func() {
 			defer wg.Done()
 			for entry := range jobs {
-				status := checkMainstreamProxyHealth(entry, false)
+				begin := time.Now()
+				status := mixedProxyHealthChecker(entry, false)
+				elapsed := time.Since(begin)
+
+				mu.Lock()
+				latencies = append(latencies, elapsed)
+				mu.Unlock()
 
 				mu.Lock()
 				stats, ok := protocolSummary[status.Scheme]
@@ -2294,7 +2336,7 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 					mixedHealthy = append(mixedHealthy, entry)
 					mu.Unlock()
 					atomic.AddInt64(&healthyCount, 1)
-					if config.CFChallengeCheck.Enabled && checkCloudflareBypassMixed(entry) {
+					if config.CFChallengeCheck.Enabled && mixedCFBypassChecker(entry) {
 						mu.Lock()
 						cfPassHealthy = append(cfPassHealthy, entry)
 						mu.Unlock()
@@ -2338,6 +2380,22 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 			stats.Timeout,
 			stats.Unreachable,
 		)
+	}
+	mu.Unlock()
+
+	mu.Lock()
+	if len(latencies) > 0 {
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		q := func(p float64) time.Duration {
+			idx := int(float64(len(latencies)-1) * p)
+			return latencies[idx]
+		}
+		totalLatency := time.Duration(0)
+		for _, d := range latencies {
+			totalLatency += d
+		}
+		avgLatency := totalLatency / time.Duration(len(latencies))
+		log.Printf("[MIXED-LATENCY] count=%d p50=%s p90=%s p99=%s avg=%s", len(latencies), q(0.50), q(0.90), q(0.99), avgLatency)
 	}
 	mu.Unlock()
 
@@ -2899,7 +2957,7 @@ func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetHost string,
 	}
 }
 
-func dialTargetThroughHTTPProxy(proxyScheme string, proxyAddr string, proxyAuthHeader string, targetHost string) (net.Conn, error) {
+func dialTargetThroughHTTPProxy(ctx context.Context, proxyScheme string, proxyAddr string, proxyAuthHeader string, targetHost string) (net.Conn, error) {
 	connectAddr := proxyAddr
 	if !strings.Contains(connectAddr, ":") {
 		if proxyScheme == "https" {
@@ -2911,10 +2969,34 @@ func dialTargetThroughHTTPProxy(proxyScheme string, proxyAddr string, proxyAuthH
 
 	var conn net.Conn
 	var err error
+	dialer := &net.Dialer{}
 	if proxyScheme == "https" {
-		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", connectAddr, &tls.Config{InsecureSkipVerify: true})
+		if deadline, ok := ctx.Deadline(); ok {
+			dialer.Deadline = deadline
+		} else {
+			dialer.Timeout = 10 * time.Second
+		}
+		rawConn, dialErr := dialer.DialContext(ctx, "tcp", connectAddr)
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		host, _, splitErr := net.SplitHostPort(connectAddr)
+		if splitErr != nil {
+			host = connectAddr
+		}
+		tlsConn := tls.Client(rawConn, &tls.Config{InsecureSkipVerify: true, ServerName: host})
+		if err = tlsConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close()
+			return nil, err
+		}
+		conn = tlsConn
 	} else {
-		conn, err = net.DialTimeout("tcp", connectAddr, 10*time.Second)
+		if deadline, ok := ctx.Deadline(); ok {
+			dialer.Deadline = deadline
+		} else {
+			dialer.Timeout = 10 * time.Second
+		}
+		conn, err = dialer.DialContext(ctx, "tcp", connectAddr)
 	}
 	if err != nil {
 		return nil, err
@@ -2946,6 +3028,10 @@ func dialTargetThroughHTTPProxy(proxyScheme string, proxyAddr string, proxyAuthH
 	if resp.StatusCode != http.StatusOK {
 		conn.Close()
 		return nil, fmt.Errorf("http proxy CONNECT failed with status %s", resp.Status)
+	}
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
 	}
 
 	return conn, nil
