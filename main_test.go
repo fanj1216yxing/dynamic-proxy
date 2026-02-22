@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"net"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -195,5 +197,114 @@ func TestHealthCheckMixedProxies_ConcurrencyLimitRespected(t *testing.T) {
 	healthCheckMixedProxies([]string{"p1", "p2", "p3", "p4", "p5", "p6"})
 	if maxRunning.Load() > 2 {
 		t.Fatalf("expected max concurrency <=2, got %d", maxRunning.Load())
+	}
+}
+
+func TestReorderMixedHealthCheckQueue_PreservesEntries(t *testing.T) {
+	input := []string{"slow-1", "slow-2", "healthy-a", "healthy-b", "slow-3", "slow-4"}
+	reordered := reorderMixedHealthCheckQueue(input)
+
+	if len(reordered) != len(input) {
+		t.Fatalf("expected same size, got %d vs %d", len(reordered), len(input))
+	}
+
+	sortedInput := slices.Clone(input)
+	sortedOutput := slices.Clone(reordered)
+	slices.Sort(sortedInput)
+	slices.Sort(sortedOutput)
+	if !slices.Equal(sortedInput, sortedOutput) {
+		t.Fatalf("reordered queue changed entries: in=%v out=%v", sortedInput, sortedOutput)
+	}
+}
+
+func TestHealthCheckMixedProxies_ReorderingAvoidsHealthyStarvation(t *testing.T) {
+	oldHealthChecker := mixedProxyHealthChecker
+	defer func() { mixedProxyHealthChecker = oldHealthChecker }()
+
+	config = Config{HealthCheckConcurrency: 2}
+
+	firstHealthyAt := int64(0)
+	var checkedOrder atomic.Int64
+	mixedProxyHealthChecker = func(proxyEntry string, strictMode bool) proxyHealthStatus {
+		idx := checkedOrder.Add(1)
+		if proxyEntry == "healthy-late" {
+			firstHealthyAt = idx
+			return proxyHealthStatus{Healthy: true, Scheme: "http", Category: healthFailureNone}
+		}
+		time.Sleep(40 * time.Millisecond)
+		return proxyHealthStatus{Healthy: false, Scheme: "http", Category: healthFailureTimeout}
+	}
+
+	result := healthCheckMixedProxies([]string{
+		"slow-1", "slow-2", "slow-3", "slow-4", "slow-5", "slow-6", "slow-7", "slow-8", "healthy-late",
+	})
+
+	if len(result.Healthy) != 1 {
+		t.Fatalf("expected one healthy proxy, got %d", len(result.Healthy))
+	}
+	if firstHealthyAt == 0 {
+		t.Fatalf("healthy proxy was never checked")
+	}
+	if firstHealthyAt >= 9 {
+		t.Fatalf("healthy proxy should not be starved to queue tail, first healthy idx=%d", firstHealthyAt)
+	}
+}
+
+func TestMixedSchedulerComparisonMetrics(t *testing.T) {
+	oldHealthChecker := mixedProxyHealthChecker
+	defer func() { mixedProxyHealthChecker = oldHealthChecker }()
+	config = Config{HealthCheckConcurrency: 20}
+
+	proxies := make([]string, 0, 1000)
+	for i := 0; i < 800; i++ {
+		proxies = append(proxies, fmt.Sprintf("slow-%d", i))
+	}
+	for i := 0; i < 200; i++ {
+		proxies = append(proxies, fmt.Sprintf("healthy-%d", i))
+	}
+
+	checker := func(proxyEntry string) proxyHealthStatus {
+		if len(proxyEntry) >= 7 && proxyEntry[:7] == "healthy" {
+			time.Sleep(5 * time.Millisecond)
+			return proxyHealthStatus{Healthy: true, Scheme: "http", Category: healthFailureNone}
+		}
+		time.Sleep(120 * time.Millisecond)
+		return proxyHealthStatus{Healthy: false, Scheme: "http", Category: healthFailureTimeout}
+	}
+
+	run := func(queue []string) (time.Duration, int) {
+		var checked atomic.Int64
+		var healthy atomic.Int64
+		jobs := make(chan string, 80)
+		start := time.Now()
+		var wg sync.WaitGroup
+		for i := 0; i < config.HealthCheckConcurrency; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for entry := range jobs {
+					status := checker(entry)
+					if status.Healthy {
+						healthy.Add(1)
+					}
+					checked.Add(1)
+				}
+			}()
+		}
+		for _, e := range queue {
+			jobs <- e
+		}
+		close(jobs)
+		wg.Wait()
+		_ = checked.Load()
+		return time.Since(start), int(healthy.Load())
+	}
+
+	fifoDuration, fifoHealthy := run(proxies)
+	reorderedDuration, reorderedHealthy := run(reorderMixedHealthCheckQueue(proxies))
+
+	t.Logf("scheduler_metrics fifo_duration=%s reordered_duration=%s fifo_healthy=%d reordered_healthy=%d", fifoDuration, reorderedDuration, fifoHealthy, reorderedHealthy)
+	if reorderedHealthy != fifoHealthy {
+		t.Fatalf("healthy count mismatch")
 	}
 }

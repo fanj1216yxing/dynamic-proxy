@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"math/rand"
@@ -2267,6 +2268,7 @@ func checkMainstreamProxyHealth(proxyEntry string, strictMode bool) proxyHealthS
 func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	proxies = reorderMixedHealthCheckQueue(proxies)
 	mixedHealthy := make([]string, 0)
 	cfPassHealthy := make([]string, 0)
 
@@ -2281,7 +2283,7 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 	if workerCount <= 0 {
 		workerCount = 1
 	}
-	jobs := make(chan string)
+	jobs := make(chan string, workerCount*4)
 	done := make(chan struct{})
 
 	go func() {
@@ -2313,23 +2315,16 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			localSummary := make(map[string]protocolStats)
+			localLatencies := make([]time.Duration, 0, 32)
 			for entry := range jobs {
 				begin := time.Now()
 				status := mixedProxyHealthChecker(entry, false)
 				elapsed := time.Since(begin)
-
-				mu.Lock()
-				latencies = append(latencies, elapsed)
-				mu.Unlock()
-
-				mu.Lock()
-				stats, ok := protocolSummary[status.Scheme]
-				if !ok {
-					stats = &protocolStats{}
-					protocolSummary[status.Scheme] = stats
-				}
+				localLatencies = append(localLatencies, elapsed)
+				stats := localSummary[status.Scheme]
 				stats.addResult(status)
-				mu.Unlock()
+				localSummary[status.Scheme] = stats
 
 				if status.Healthy {
 					mu.Lock()
@@ -2345,6 +2340,24 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 				}
 				atomic.AddInt64(&checked, 1)
 			}
+
+			mu.Lock()
+			latencies = append(latencies, localLatencies...)
+			for scheme, local := range localSummary {
+				stats, ok := protocolSummary[scheme]
+				if !ok {
+					stats = &protocolStats{}
+					protocolSummary[scheme] = stats
+				}
+				stats.Total += local.Total
+				stats.Success += local.Success
+				stats.ParseFailed += local.ParseFailed
+				stats.HandshakeFail += local.HandshakeFail
+				stats.AuthFail += local.AuthFail
+				stats.Timeout += local.Timeout
+				stats.Unreachable += local.Unreachable
+			}
+			mu.Unlock()
 		}()
 	}
 
@@ -2402,6 +2415,45 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 	sort.Strings(cfPassHealthy)
 
 	return MixedHealthCheckResult{Healthy: mixedHealthy, CFPass: cfPassHealthy}
+}
+
+func reorderMixedHealthCheckQueue(proxies []string) []string {
+	if len(proxies) <= 2 {
+		return proxies
+	}
+
+	type scored struct {
+		entry string
+		score uint64
+	}
+
+	scoredEntries := make([]scored, 0, len(proxies))
+	for _, entry := range proxies {
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(entry))
+		scoredEntries = append(scoredEntries, scored{entry: entry, score: h.Sum64()})
+	}
+
+	sort.Slice(scoredEntries, func(i, j int) bool {
+		if scoredEntries[i].score == scoredEntries[j].score {
+			return scoredEntries[i].entry < scoredEntries[j].entry
+		}
+		return scoredEntries[i].score < scoredEntries[j].score
+	})
+
+	reordered := make([]string, 0, len(proxies))
+	left := 0
+	right := len(scoredEntries) - 1
+	for left <= right {
+		reordered = append(reordered, scoredEntries[left].entry)
+		left++
+		if left <= right {
+			reordered = append(reordered, scoredEntries[right].entry)
+			right--
+		}
+	}
+
+	return reordered
 }
 
 func filterMixedProxiesByScheme(entries []string, allowed map[string]bool) []string {
