@@ -2374,6 +2374,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 
 func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetHost string, targetDial func(string) (net.Conn, error), pool *ProxyPool, proxyAddr string, mode string) {
 	log.Printf("[HTTPS-%s] Connecting to %s via proxy %s", mode, targetHost, proxyAddr)
+	const tunnelIdleTimeout = 90 * time.Second
 
 	// Connect to target through upstream proxy
 	targetConn, err := targetDial(targetHost)
@@ -2404,22 +2405,85 @@ func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetHost string,
 	// Send 200 Connection Established
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	log.Printf("[HTTPS-%s] SUCCESS: Tunnel established to %s via proxy %s", mode, targetHost, proxyAddr)
+	if err := clientConn.SetDeadline(time.Now().Add(tunnelIdleTimeout)); err != nil {
+		log.Printf("[HTTPS-%s] WARN: Failed to set initial client deadline for %s: %v", mode, targetHost, err)
+	}
+	if err := targetConn.SetDeadline(time.Now().Add(tunnelIdleTimeout)); err != nil {
+		log.Printf("[HTTPS-%s] WARN: Failed to set initial target deadline for %s: %v", mode, targetHost, err)
+	}
 
-	// Bidirectional copy
-	var wg sync.WaitGroup
-	wg.Add(2)
+	type copyResult struct {
+		direction string
+		bytes     int64
+		err       error
+	}
 
+	copyWithDeadline := func(dst net.Conn, src net.Conn) (int64, error) {
+		buf := make([]byte, 32*1024)
+		var total int64
+		for {
+			if err := src.SetReadDeadline(time.Now().Add(tunnelIdleTimeout)); err != nil {
+				return total, fmt.Errorf("set read deadline: %w", err)
+			}
+			n, readErr := src.Read(buf)
+			if n > 0 {
+				if err := dst.SetWriteDeadline(time.Now().Add(tunnelIdleTimeout)); err != nil {
+					return total, fmt.Errorf("set write deadline: %w", err)
+				}
+				written, writeErr := dst.Write(buf[:n])
+				total += int64(written)
+				if writeErr != nil {
+					return total, writeErr
+				}
+				if written != n {
+					return total, io.ErrShortWrite
+				}
+			}
+
+			if readErr != nil {
+				return total, readErr
+			}
+		}
+	}
+
+	closeWrite := func(conn net.Conn, side string) {
+		type closeWriter interface{ CloseWrite() error }
+		if cw, ok := conn.(closeWriter); ok {
+			if err := cw.CloseWrite(); err != nil {
+				log.Printf("[HTTPS-%s] WARN: CloseWrite failed on %s for %s: %v", mode, side, targetHost, err)
+			}
+			return
+		}
+		if err := conn.Close(); err != nil {
+			log.Printf("[HTTPS-%s] WARN: Close failed on %s for %s: %v", mode, side, targetHost, err)
+		}
+	}
+
+	resultCh := make(chan copyResult, 2)
 	go func() {
-		defer wg.Done()
-		io.Copy(targetConn, clientConn)
+		bytes, err := copyWithDeadline(targetConn, clientConn)
+		resultCh <- copyResult{direction: "client->target", bytes: bytes, err: err}
+	}()
+	go func() {
+		bytes, err := copyWithDeadline(clientConn, targetConn)
+		resultCh <- copyResult{direction: "target->client", bytes: bytes, err: err}
 	}()
 
-	go func() {
-		defer wg.Done()
-		io.Copy(clientConn, targetConn)
-	}()
-
-	wg.Wait()
+	for i := 0; i < 2; i++ {
+		result := <-resultCh
+		reason := "completed"
+		if result.err != nil {
+			reason = result.err.Error()
+		}
+		log.Printf("[HTTPS-%s] tunnel copy finished %s for %s via %s bytes=%d reason=%s", mode, result.direction, targetHost, proxyAddr, result.bytes, reason)
+		if i == 0 {
+			if result.direction == "client->target" {
+				closeWrite(targetConn, "target")
+			} else {
+				closeWrite(clientConn, "client")
+			}
+		}
+	}
 }
 
 func dialTargetThroughHTTPProxy(proxyScheme string, proxyAddr string, proxyAuthHeader string, targetHost string) (net.Conn, error) {
