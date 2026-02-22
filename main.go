@@ -15,12 +15,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -2074,7 +2076,7 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 	}
 }
 
-func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool, initialSync bool) {
+func startProxyUpdater(ctx context.Context, strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool, initialSync bool) {
 	if initialSync {
 		// Initial update synchronously to ensure we have proxies before starting servers
 		log.Println("Performing initial proxy update...")
@@ -2084,11 +2086,19 @@ func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *Pr
 
 	// Periodic updates - each update runs in its own goroutine to avoid blocking
 	updateInterval := time.Duration(config.UpdateIntervalMinutes) * time.Minute
-	ticker := time.NewTicker(updateInterval)
 	go func() {
-		for range ticker.C {
-			go updateProxyPool(strictPool, relaxedPool, cfPool)
-			go updateMixedProxyPool(mixedPool, mainstreamMixedPool, cfMixedPool, strictPool, relaxedPool)
+		ticker := time.NewTicker(updateInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				log.Printf("[UPDATER] Proxy updater stopped: %v", ctx.Err())
+				return
+			case <-ticker.C:
+				go updateProxyPool(strictPool, relaxedPool, cfPool)
+				go updateMixedProxyPool(mixedPool, mainstreamMixedPool, cfMixedPool, strictPool, relaxedPool)
+			}
 		}
 	}()
 }
@@ -2696,7 +2706,7 @@ func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool
 	return server.ListenAndServe()
 }
 
-func startProxyConnectivityMonitor(pool *ProxyPool, mode string, interval time.Duration, checker func(string) bool) {
+func startProxyConnectivityMonitor(ctx context.Context, pool *ProxyPool, mode string, interval time.Duration, checker func(string) bool) {
 	if interval <= 0 {
 		interval = connectivityCheckInterval
 	}
@@ -2705,33 +2715,39 @@ func startProxyConnectivityMonitor(pool *ProxyPool, mode string, interval time.D
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			proxyAddr, ok := pool.GetCurrent()
-			if !ok {
-				continue
-			}
+		for {
+			select {
+			case <-ctx.Done():
+				log.Printf("[AUTO-ROTATE-%s] connectivity monitor stopped: %v", mode, ctx.Err())
+				return
+			case <-ticker.C:
+				proxyAddr, ok := pool.GetCurrent()
+				if !ok {
+					continue
+				}
 
-			if checker(proxyAddr) {
-				continue
-			}
+				if checker(proxyAddr) {
+					continue
+				}
 
-			newProxy, err := pool.ForceRotate()
-			if err != nil {
-				log.Printf("[AUTO-ROTATE-%s] connectivity check failed for %s, but rotate failed: %v", mode, proxyAddr, err)
-				continue
-			}
+				newProxy, err := pool.ForceRotate()
+				if err != nil {
+					log.Printf("[AUTO-ROTATE-%s] connectivity check failed for %s, but rotate failed: %v", mode, proxyAddr, err)
+					continue
+				}
 
-			if newProxy == proxyAddr {
-				log.Printf("[AUTO-ROTATE-%s] connectivity check failed for %s, only one proxy available", mode, proxyAddr)
-				continue
-			}
+				if newProxy == proxyAddr {
+					log.Printf("[AUTO-ROTATE-%s] connectivity check failed for %s, only one proxy available", mode, proxyAddr)
+					continue
+				}
 
-			log.Printf("[AUTO-ROTATE-%s] connectivity check failed for %s, rotated to %s", mode, proxyAddr, newProxy)
+				log.Printf("[AUTO-ROTATE-%s] connectivity check failed for %s, rotated to %s", mode, proxyAddr, newProxy)
+			}
 		}
 	}()
 }
 
-func startProxyIntervalRotate(pool *ProxyPool, mode string, interval time.Duration) {
+func startProxyIntervalRotate(ctx context.Context, pool *ProxyPool, mode string, interval time.Duration) {
 	if interval <= 0 {
 		return
 	}
@@ -2740,30 +2756,39 @@ func startProxyIntervalRotate(pool *ProxyPool, mode string, interval time.Durati
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			proxyAddr, ok := pool.GetCurrent()
-			if !ok {
-				continue
-			}
+		for {
+			select {
+			case <-ctx.Done():
+				log.Printf("[AUTO-ROTATE-%s] interval rotate stopped: %v", mode, ctx.Err())
+				return
+			case <-ticker.C:
+				proxyAddr, ok := pool.GetCurrent()
+				if !ok {
+					continue
+				}
 
-			newProxy, err := pool.ForceRotate()
-			if err != nil {
-				log.Printf("[AUTO-ROTATE-%s] periodic rotate failed for %s: %v", mode, proxyAddr, err)
-				continue
-			}
+				newProxy, err := pool.ForceRotate()
+				if err != nil {
+					log.Printf("[AUTO-ROTATE-%s] periodic rotate failed for %s: %v", mode, proxyAddr, err)
+					continue
+				}
 
-			if newProxy == proxyAddr {
-				log.Printf("[AUTO-ROTATE-%s] periodic rotate skipped, only one proxy available (%s)", mode, proxyAddr)
-				continue
-			}
+				if newProxy == proxyAddr {
+					log.Printf("[AUTO-ROTATE-%s] periodic rotate skipped, only one proxy available (%s)", mode, proxyAddr)
+					continue
+				}
 
-			log.Printf("[AUTO-ROTATE-%s] periodic rotate switched from %s to %s", mode, proxyAddr, newProxy)
+				log.Printf("[AUTO-ROTATE-%s] periodic rotate switched from %s to %s", mode, proxyAddr, newProxy)
+			}
 		}
 	}()
 }
 
 func main() {
 	log.Println("Starting Dynamic Proxy Server...")
+
+	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
 	// Load configuration
 	cfg, err := loadConfig("config.yaml")
@@ -2815,31 +2840,31 @@ func main() {
 	cfMixedHTTPPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)
 
 	// Start proxy updater with initial synchronous update
-	startProxyUpdater(strictPool, relaxedPool, cfPool, mixedHTTPPool, mainstreamMixedHTTPPool, cfMixedHTTPPool, true)
+	startProxyUpdater(rootCtx, strictPool, relaxedPool, cfPool, mixedHTTPPool, mainstreamMixedHTTPPool, cfMixedHTTPPool, true)
 
 	// Auto monitor current selected proxies and rotate when connectivity is lost
-	startProxyConnectivityMonitor(strictPool, "STRICT", connectivityCheckInterval, func(proxyAddr string) bool {
+	startProxyConnectivityMonitor(rootCtx, strictPool, "STRICT", connectivityCheckInterval, func(proxyAddr string) bool {
 		return checkProxyHealth(proxyAddr, true)
 	})
-	startProxyConnectivityMonitor(relaxedPool, "RELAXED", connectivityCheckInterval, func(proxyAddr string) bool {
+	startProxyConnectivityMonitor(rootCtx, relaxedPool, "RELAXED", connectivityCheckInterval, func(proxyAddr string) bool {
 		return checkProxyHealth(proxyAddr, false)
 	})
-	startProxyConnectivityMonitor(mixedHTTPPool, "MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
+	startProxyConnectivityMonitor(rootCtx, mixedHTTPPool, "MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
 		return checkMixedProxyHealth(proxyEntry, false)
 	})
-	startProxyConnectivityMonitor(cfMixedHTTPPool, "CF-MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
+	startProxyConnectivityMonitor(rootCtx, cfMixedHTTPPool, "CF-MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
 		return checkMixedProxyHealth(proxyEntry, false)
 	})
-	startProxyConnectivityMonitor(mainstreamMixedHTTPPool, "MAINSTREAM-MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
+	startProxyConnectivityMonitor(rootCtx, mainstreamMixedHTTPPool, "MAINSTREAM-MIXED", connectivityCheckInterval, func(proxyEntry string) bool {
 		return checkMixedProxyHealth(proxyEntry, false)
 	})
 
 	if !rotateEveryRequest {
-		startProxyIntervalRotate(strictPool, "STRICT", proxySwitchInterval)
-		startProxyIntervalRotate(relaxedPool, "RELAXED", proxySwitchInterval)
-		startProxyIntervalRotate(mixedHTTPPool, "MIXED", proxySwitchInterval)
-		startProxyIntervalRotate(mainstreamMixedHTTPPool, "MAINSTREAM-MIXED", proxySwitchInterval)
-		startProxyIntervalRotate(cfMixedHTTPPool, "CF-MIXED", proxySwitchInterval)
+		startProxyIntervalRotate(rootCtx, strictPool, "STRICT", proxySwitchInterval)
+		startProxyIntervalRotate(rootCtx, relaxedPool, "RELAXED", proxySwitchInterval)
+		startProxyIntervalRotate(rootCtx, mixedHTTPPool, "MIXED", proxySwitchInterval)
+		startProxyIntervalRotate(rootCtx, mainstreamMixedHTTPPool, "MAINSTREAM-MIXED", proxySwitchInterval)
+		startProxyIntervalRotate(rootCtx, cfMixedHTTPPool, "CF-MIXED", proxySwitchInterval)
 	}
 
 	// Check proxy pool status
