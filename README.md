@@ -21,25 +21,6 @@
 
 ### 快速开始
 
-#### 下载预编译版本
-
-下载适合您平台的最新版本：
-
-- **Linux (amd64)**: `dynamic-proxy-linux-amd64`
-- **macOS (Intel)**: `dynamic-proxy-darwin-amd64`
-- **macOS (Apple Silicon)**: `dynamic-proxy-darwin-arm64`
-- **Windows**: `dynamic-proxy.exe`
-
-```bash
-# Linux / macOS
-chmod +x dynamic-proxy-linux-amd64
-./dynamic-proxy-linux-amd64
-
-# Windows
-dynamic-proxy.exe
-```
-
-#### 从源码编译
 
 ```bash
 # 克隆仓库
