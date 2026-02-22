@@ -78,7 +78,7 @@ var config Config
 
 const connectivityCheckInterval = 10 * time.Second
 const defaultMixedHealthCheckURL = "https://www.google.com"
-const healthCheckBatchSize = 5000
+const healthCheckBatchSize = 50000
 
 var mixedHealthCheckURL = defaultMixedHealthCheckURL
 
