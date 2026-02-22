@@ -1913,8 +1913,11 @@ func healthCheckProxiesSingleStage(proxies []string, settings HealthCheckSetting
 	var relaxedCount int64
 	var cfPassCount int64
 
-	// Use worker pool to limit concurrent checks (from config)
-	semaphore := make(chan struct{}, config.HealthCheckConcurrency)
+	workerCount := config.HealthCheckConcurrency
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+	jobs := make(chan string)
 
 	// Progress reporter goroutine
 	done := make(chan struct{})
@@ -1952,43 +1955,47 @@ func healthCheckProxiesSingleStage(proxies []string, settings HealthCheckSetting
 		}
 	}()
 
-	for _, proxyAddr := range proxies {
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go func(addr string) {
+		go func() {
 			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
+			for addr := range jobs {
+				// Optimized: check strict mode first
+				strictOK, relaxedOK := evaluateProxy(addr, settings)
+				healthy := strictOK || relaxedOK
 
-			// Optimized: check strict mode first
-			strictOK, relaxedOK := evaluateProxy(addr, settings)
-			healthy := strictOK || relaxedOK
-
-			if strictOK {
-				// If strict mode passes, relaxed mode must pass too
-				mu.Lock()
-				strictHealthy = append(strictHealthy, addr)
-				relaxedHealthy = append(relaxedHealthy, addr)
-				mu.Unlock()
-				atomic.AddInt64(&strictCount, 1)
-				atomic.AddInt64(&relaxedCount, 1)
-			} else if relaxedOK {
-				mu.Lock()
-				relaxedHealthy = append(relaxedHealthy, addr)
-				mu.Unlock()
-				atomic.AddInt64(&relaxedCount, 1)
-			}
-
-			if healthy && config.CFChallengeCheck.Enabled {
-				if checkCloudflareBypass(addr) {
+				if strictOK {
+					// If strict mode passes, relaxed mode must pass too
 					mu.Lock()
-					cfPassHealthy = append(cfPassHealthy, addr)
+					strictHealthy = append(strictHealthy, addr)
+					relaxedHealthy = append(relaxedHealthy, addr)
 					mu.Unlock()
-					atomic.AddInt64(&cfPassCount, 1)
+					atomic.AddInt64(&strictCount, 1)
+					atomic.AddInt64(&relaxedCount, 1)
+				} else if relaxedOK {
+					mu.Lock()
+					relaxedHealthy = append(relaxedHealthy, addr)
+					mu.Unlock()
+					atomic.AddInt64(&relaxedCount, 1)
 				}
+
+				if healthy && config.CFChallengeCheck.Enabled {
+					if checkCloudflareBypass(addr) {
+						mu.Lock()
+						cfPassHealthy = append(cfPassHealthy, addr)
+						mu.Unlock()
+						atomic.AddInt64(&cfPassCount, 1)
+					}
+				}
+				atomic.AddInt64(&checked, 1)
 			}
-			atomic.AddInt64(&checked, 1)
-		}(proxyAddr)
+		}()
 	}
+
+	for _, proxyAddr := range proxies {
+		jobs <- proxyAddr
+	}
+	close(jobs)
 
 	wg.Wait()
 	close(done)
@@ -2218,7 +2225,11 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 	var cfPassCount int64
 	protocolSummary := make(map[string]*protocolStats)
 
-	semaphore := make(chan struct{}, config.HealthCheckConcurrency)
+	workerCount := config.HealthCheckConcurrency
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+	jobs := make(chan string)
 	done := make(chan struct{})
 
 	go func() {
@@ -2246,39 +2257,43 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 		}
 	}()
 
-	for _, proxyEntry := range proxies {
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go func(entry string) {
+		go func() {
 			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
+			for entry := range jobs {
+				status := checkMainstreamProxyHealth(entry, false)
 
-			status := checkMainstreamProxyHealth(entry, false)
-
-			mu.Lock()
-			stats, ok := protocolSummary[status.Scheme]
-			if !ok {
-				stats = &protocolStats{}
-				protocolSummary[status.Scheme] = stats
-			}
-			stats.addResult(status)
-			mu.Unlock()
-
-			if status.Healthy {
 				mu.Lock()
-				mixedHealthy = append(mixedHealthy, entry)
-				mu.Unlock()
-				atomic.AddInt64(&healthyCount, 1)
-				if config.CFChallengeCheck.Enabled && checkCloudflareBypassMixed(entry) {
-					mu.Lock()
-					cfPassHealthy = append(cfPassHealthy, entry)
-					mu.Unlock()
-					atomic.AddInt64(&cfPassCount, 1)
+				stats, ok := protocolSummary[status.Scheme]
+				if !ok {
+					stats = &protocolStats{}
+					protocolSummary[status.Scheme] = stats
 				}
+				stats.addResult(status)
+				mu.Unlock()
+
+				if status.Healthy {
+					mu.Lock()
+					mixedHealthy = append(mixedHealthy, entry)
+					mu.Unlock()
+					atomic.AddInt64(&healthyCount, 1)
+					if config.CFChallengeCheck.Enabled && checkCloudflareBypassMixed(entry) {
+						mu.Lock()
+						cfPassHealthy = append(cfPassHealthy, entry)
+						mu.Unlock()
+						atomic.AddInt64(&cfPassCount, 1)
+					}
+				}
+				atomic.AddInt64(&checked, 1)
 			}
-			atomic.AddInt64(&checked, 1)
-		}(proxyEntry)
+		}()
 	}
+
+	for _, proxyEntry := range proxies {
+		jobs <- proxyEntry
+	}
+	close(jobs)
 
 	wg.Wait()
 	close(done)
