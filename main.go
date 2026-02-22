@@ -2369,7 +2369,9 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 	}
 
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("[proxy_error] mode=%s proxyAddr=%s target=%s method=%s error=%v", mode, proxyAddr, r.URL.String(), r.Method, err)
+	}
 }
 
 func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetHost string, targetDial func(string) (net.Conn, error), pool *ProxyPool, proxyAddr string, mode string) {
@@ -2403,7 +2405,10 @@ func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetHost string,
 	defer clientConn.Close()
 
 	// Send 200 Connection Established
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		log.Printf("[proxy_error] mode=%s proxyAddr=%s target=%s method=%s error=%v", mode, proxyAddr, targetHost, r.Method, err)
+		return
+	}
 	log.Printf("[HTTPS-%s] SUCCESS: Tunnel established to %s via proxy %s", mode, targetHost, proxyAddr)
 	if err := clientConn.SetDeadline(time.Now().Add(tunnelIdleTimeout)); err != nil {
 		log.Printf("[HTTPS-%s] WARN: Failed to set initial client deadline for %s: %v", mode, targetHost, err)
@@ -2474,6 +2479,7 @@ func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetHost string,
 		reason := "completed"
 		if result.err != nil {
 			reason = result.err.Error()
+			log.Printf("[proxy_error] mode=%s proxyAddr=%s target=%s method=%s error=%v direction=%s", mode, proxyAddr, targetHost, r.Method, result.err, result.direction)
 		}
 		log.Printf("[HTTPS-%s] tunnel copy finished %s for %s via %s bytes=%d reason=%s", mode, result.direction, targetHost, proxyAddr, result.bytes, reason)
 		if i == 0 {
