@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1782,6 +1784,11 @@ func checkProxyHealth(proxyAddr string, strictMode bool) bool {
 }
 
 func checkProxyHealthWithSettings(proxyAddr string, strictMode bool, settings HealthCheckSettings) bool {
+	ok, _ := checkProxyHealthWithSettingsDetailed(proxyAddr, strictMode, settings)
+	return ok
+}
+
+func checkProxyHealthWithSettingsDetailed(proxyAddr string, strictMode bool, settings HealthCheckSettings) (bool, error) {
 	totalTimeout := time.Duration(settings.TotalTimeoutSeconds) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
 	defer cancel()
@@ -1793,22 +1800,22 @@ func checkProxyHealthWithSettings(proxyAddr string, strictMode bool, settings He
 
 	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, baseDialer)
 	if err != nil {
-		return false
+		return false, err
 	}
 
 	if err := ctx.Err(); err != nil {
-		return false
+		return false, err
 	}
 
 	conn, err := dialer.Dial("tcp", "www.google.com:443")
 	if err != nil {
-		return false
+		return false, err
 	}
 	defer conn.Close()
 
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
-			return false
+			return false, err
 		}
 	}
 
@@ -1820,25 +1827,62 @@ func checkProxyHealthWithSettings(proxyAddr string, strictMode bool, settings He
 
 	err = tlsConn.Handshake()
 	if err != nil {
-		return false
+		return false, err
 	}
 	defer tlsConn.Close()
 
 	elapsed := time.Since(start)
 	threshold := time.Duration(settings.TLSHandshakeThresholdSeconds) * time.Second
 	if elapsed > threshold {
-		return false
+		return false, fmt.Errorf("tls handshake exceeded threshold: %v > %v", elapsed, threshold)
 	}
 
-	return true
+	return true, nil
 }
 
 func evaluateProxy(addr string, settings HealthCheckSettings) (bool, bool) {
-	strictOK := checkProxyHealthWithSettings(addr, true, settings)
+	strictOK, strictErr := checkProxyHealthWithSettingsDetailed(addr, true, settings)
 	if strictOK {
 		return true, true
 	}
+
+	if !shouldRetryRelaxed(strictErr) {
+		return false, false
+	}
+
 	return false, checkProxyHealthWithSettings(addr, false, settings)
+}
+
+func shouldRetryRelaxed(err error) bool {
+	if err == nil {
+		return true
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+
+	var unknownAuthorityErr x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuthorityErr) {
+		return true
+	}
+
+	var hostnameErr x509.HostnameError
+	if errors.As(err, &hostnameErr) {
+		return true
+	}
+
+	var certInvalidErr x509.CertificateInvalidError
+	if errors.As(err, &certInvalidErr) {
+		return true
+	}
+
+	return false
 }
 
 // HealthCheckResult holds the results of health check for both modes
