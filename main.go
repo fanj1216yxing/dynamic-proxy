@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1497,60 +1498,69 @@ func checkCloudflareBypass(proxyAddr string) bool {
 }
 
 func checkProxyHealth(proxyAddr string, strictMode bool) bool {
-	// Create a context with timeout from config
 	totalTimeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
 	defer cancel()
 
-	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
+	baseDialer := &net.Dialer{}
+	if deadline, ok := ctx.Deadline(); ok {
+		baseDialer.Timeout = time.Until(deadline)
+	}
+
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, baseDialer)
 	if err != nil {
+		log.Printf("[HEALTH] proxy=%s strict=%t status=dialer_create_failed err=%v", proxyAddr, strictMode, err)
 		return false
 	}
 
-	// Use a channel to handle timeout
-	done := make(chan bool, 1)
-	go func() {
-		// Test HTTPS connection to verify TLS handshake works and is fast
-		start := time.Now()
-
-		conn, err := dialer.Dial("tcp", "www.google.com:443")
-		if err != nil {
-			done <- false
-			return
-		}
-		defer conn.Close()
-
-		// Perform TLS handshake to test SSL performance
-		tlsConn := tls.Client(conn, &tls.Config{
-			ServerName:         "www.google.com",
-			InsecureSkipVerify: !strictMode, // Strict mode: verify certificate
-		})
-
-		err = tlsConn.Handshake()
-		if err != nil {
-			done <- false
-			return
-		}
-		tlsConn.Close()
-
-		// Check if TLS handshake was fast enough (from config)
-		elapsed := time.Since(start)
-		threshold := time.Duration(config.HealthCheck.TLSHandshakeThresholdSeconds) * time.Second
-		if elapsed > threshold {
-			// Too slow, reject this proxy
-			done <- false
-			return
-		}
-
-		done <- true
-	}()
-
-	select {
-	case result := <-done:
-		return result
-	case <-ctx.Done():
+	if err := ctx.Err(); err != nil {
+		log.Printf("[HEALTH] proxy=%s strict=%t status=timeout stage=before_dial err=%v", proxyAddr, strictMode, err)
 		return false
 	}
+
+	conn, err := dialer.Dial("tcp", "www.google.com:443")
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || isTimeoutError(err) {
+			log.Printf("[HEALTH] proxy=%s strict=%t status=timeout stage=dial err=%v", proxyAddr, strictMode, err)
+		} else {
+			log.Printf("[HEALTH] proxy=%s strict=%t status=dial_failed err=%v", proxyAddr, strictMode, err)
+		}
+		return false
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			log.Printf("[HEALTH] proxy=%s strict=%t status=set_deadline_failed err=%v", proxyAddr, strictMode, err)
+			return false
+		}
+	}
+
+	start := time.Now()
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName:         "www.google.com",
+		InsecureSkipVerify: !strictMode, // Strict mode: verify certificate
+	})
+
+	err = tlsConn.Handshake()
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || isTimeoutError(err) {
+			log.Printf("[HEALTH] proxy=%s strict=%t status=timeout stage=tls_handshake err=%v", proxyAddr, strictMode, err)
+		} else {
+			log.Printf("[HEALTH] proxy=%s strict=%t status=handshake_failed err=%v", proxyAddr, strictMode, err)
+		}
+		return false
+	}
+	defer tlsConn.Close()
+
+	elapsed := time.Since(start)
+	threshold := time.Duration(config.HealthCheck.TLSHandshakeThresholdSeconds) * time.Second
+	if elapsed > threshold {
+		log.Printf("[HEALTH] proxy=%s strict=%t status=timeout stage=tls_handshake_threshold elapsed=%s threshold=%s", proxyAddr, strictMode, elapsed, threshold)
+		return false
+	}
+
+	return true
 }
 
 // HealthCheckResult holds the results of health check for both modes
@@ -1766,6 +1776,17 @@ func (s *protocolStats) addResult(status proxyHealthStatus) {
 	case healthFailureUnreachable:
 		s.Unreachable++
 	}
+}
+
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded")
 }
 
 func classifyHealthFailure(err error) healthFailureCategory {
