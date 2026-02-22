@@ -75,6 +75,26 @@ type HealthCheckSettings struct {
 	TLSHandshakeThresholdSeconds int `yaml:"tls_handshake_threshold_seconds"`
 }
 
+type timeoutForwardDialer struct {
+	timeout time.Duration
+}
+
+func (d timeoutForwardDialer) Dial(network, addr string) (net.Conn, error) {
+	conn, err := (&net.Dialer{Timeout: d.timeout}).Dial(network, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	if d.timeout > 0 {
+		if err := conn.SetDeadline(time.Now().Add(d.timeout)); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+	}
+
+	return conn, nil
+}
+
 // Global config variable
 var config Config
 
@@ -1793,12 +1813,8 @@ func checkProxyHealthWithSettingsDetailed(proxyAddr string, strictMode bool, set
 	ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
 	defer cancel()
 
-	baseDialer := &net.Dialer{}
-	if deadline, ok := ctx.Deadline(); ok {
-		baseDialer.Timeout = time.Until(deadline)
-	}
-
-	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, baseDialer)
+	forwardDialer := timeoutForwardDialer{timeout: totalTimeout}
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, forwardDialer)
 	if err != nil {
 		return false, err
 	}
