@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dynamic Proxy Admin</title>
+  <style>
+    :root {
+      --bg: #fffafb;
+      --card: #ffffff;
+      --text: #2b2b33;
+      --muted: #7a7a8a;
+      --border: #f3dce5;
+      --primary: #f06292;
+      --primary-strong: #e91e63;
+      --primary-soft: #ffe4ef;
+      --ok: #16a34a;
+      --warn: #f59e0b;
+      --shadow: 0 8px 24px rgba(233, 30, 99, 0.08);
+    }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:linear-gradient(180deg,#fff,var(--bg));color:var(--text)}
+    .layout{display:grid;grid-template-columns:230px 1fr;min-height:100vh}
+    .sidebar{padding:18px 12px;border-right:1px solid var(--border);background:#fff}
+    .brand{font-size:18px;font-weight:700;color:var(--primary-strong);margin-bottom:12px}
+    .nav button{display:block;width:100%;text-align:left;padding:10px;border:0;border-radius:10px;background:transparent;margin:6px 0;cursor:pointer}
+    .nav button.active,.nav button:hover{background:var(--primary-soft);color:var(--primary-strong)}
+    .main{padding:20px}
+    .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+    .topbar h1{margin:0;color:var(--primary-strong)}
+    .meta{font-size:12px;color:var(--muted)}
+    .grid{display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:10px}
+    .card,.section{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px;box-shadow:var(--shadow)}
+    .label{font-size:12px;color:var(--muted)}
+    .value{font-size:26px;font-weight:700;color:var(--primary-strong)}
+    .section{margin-top:14px}
+    .section h2{margin:0 0 10px;color:var(--primary-strong);font-size:17px}
+    .row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+    input,select{padding:8px;border:1px solid var(--border);border-radius:8px}
+    .btn{padding:9px 12px;border:0;border-radius:8px;background:var(--primary);color:#fff;cursor:pointer}
+    .btn:hover{background:var(--primary-strong)}
+    .btn.ghost{background:#fff;color:var(--primary-strong);border:1px solid var(--border)}
+    .btn.secondary{background:#fb7185}
+    table{width:100%;border-collapse:collapse;font-size:14px}
+    th,td{padding:9px 6px;border-bottom:1px solid #f7e8ee;text-align:left}
+    th button{border:0;background:transparent;padding:0;cursor:pointer;font-weight:700}
+    .tag{padding:2px 8px;border-radius:999px;background:var(--primary-soft);color:var(--primary-strong);font-size:12px}
+    .status-ok{color:var(--ok)} .status-warn{color:var(--warn)} .hidden{display:none}
+    pre{margin:0;background:#fff5f8;border:1px solid var(--border);padding:10px;border-radius:10px;overflow:auto}
+    @media (max-width:980px){.layout{grid-template-columns:1fr}.grid{grid-template-columns:repeat(2,minmax(140px,1fr))}}
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">Dynamic Proxy Admin</div>
+    <nav class="nav">
+      <button class="active" data-tab="dashboard">仪表盘</button>
+      <button data-tab="proxies">代理列表</button>
+      <button data-tab="config">配置查看</button>
+      <button data-tab="actions">手动操作</button>
+    </nav>
+  </aside>
+  <main class="main">
+    <div class="topbar"><h1 id="pageTitle">仪表盘</h1><div class="meta" id="lastSyncLabel">Last Sync: -</div></div>
+
+    <section id="dashboard" class="tab">
+      <div class="grid" id="overviewCards"></div>
+      <div class="section"><h2>健康状态</h2><div id="healthSummary"></div></div>
+    </section>
+
+    <section id="proxies" class="tab hidden">
+      <div class="section">
+        <h2>代理列表</h2>
+        <div class="row">
+          <input id="searchInput" placeholder="搜索代理地址" />
+          <select id="poolFilter"><option value="">所有池</option><option>strict</option><option>relaxed</option><option>cf</option><option>mixed</option><option>mainstream</option><option>cf_mixed</option></select>
+          <select id="protocolFilter"><option value="">所有协议</option><option>http</option><option>https</option><option>socks5</option><option>vmess</option><option>vless</option><option>hy2</option><option>unknown</option></select>
+          <button class="btn ghost" id="reloadTableBtn">刷新表格</button>
+        </div>
+        <table><thead><tr><th><button data-sort="address">地址</button></th><th><button data-sort="protocol">协议</button></th><th><button data-sort="pool">池</button></th><th><button data-sort="latency_ms">延迟</button></th><th>当前</th></tr></thead><tbody id="proxyTbody"></tbody></table>
+      </div>
+    </section>
+
+    <section id="config" class="tab hidden"><div class="section"><h2>运行配置</h2><pre id="configPre">{}</pre></div></section>
+
+    <section id="actions" class="tab hidden">
+      <div class="section">
+        <h2>手动操作</h2>
+        <div class="row">
+          <button class="btn" id="refreshBtn">手动刷新代理池</button>
+          <button class="btn secondary" id="rotateAllBtn">轮换全部池</button>
+          <button class="btn ghost" data-rotate-pool="strict">轮换 strict</button>
+          <button class="btn ghost" data-rotate-pool="relaxed">轮换 relaxed</button>
+          <button class="btn ghost" data-rotate-pool="mixed">轮换 mixed</button>
+          <button class="btn ghost" data-rotate-pool="mainstream">轮换 mainstream</button>
+          <button class="btn ghost" data-rotate-pool="cf_mixed">轮换 cf_mixed</button>
+        </div>
+        <pre id="actionLog">Ready.</pre>
+      </div>
+    </section>
+  </main>
+</div>
+<script>
+const state={proxies:[],sortKey:"pool",sortAsc:true};
+const $=s=>document.querySelector(s);
+function setTab(tab){document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('hidden',t.id!==tab));$('#pageTitle').textContent=document.querySelector(`.nav button[data-tab="${tab}"]`).textContent;}
+async function jget(u){const r=await fetch(u);if(!r.ok)throw new Error(`${u} => ${r.status}`);return r.json();}
+async function jpost(u,b={}){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});if(!r.ok)throw new Error(`${u} => ${r.status}`);return r.json();}
+function renderCards(ov){const cards=[["Strict 可用",ov.strict.available],["Relaxed 可用",ov.relaxed.available],["Mixed 可用",ov.mixed.available],["All Healthy",ov.all_healthy]];$('#overviewCards').innerHTML=cards.map(([k,v])=>`<div class="card"><div class="label">${k}</div><div class="value">${v}</div></div>`).join('');$('#healthSummary').innerHTML=`<p>严格池: <b class="${ov.strict.available>0?'status-ok':'status-warn'}">${ov.strict.available>0?'正常':'空池'}</b></p><p>宽松池: <b class="${ov.relaxed.available>0?'status-ok':'status-warn'}">${ov.relaxed.available>0?'正常':'空池'}</b></p><p>上次更新: ${ov.last_update_time||'-'}</p><p>上次检查: ${ov.last_health_check_time||'-'}</p>`;$('#lastSyncLabel').textContent=`Last Sync: ${ov.last_update_time||'-'}`;}
+function applyTable(){const q=$('#searchInput').value.trim().toLowerCase();const p=$('#poolFilter').value;const proto=$('#protocolFilter').value;let data=state.proxies.filter(x=>(!q||x.address.toLowerCase().includes(q))&&(!p||x.pool===p)&&(!proto||x.protocol===proto));data.sort((a,b)=>{const ka=a[state.sortKey],kb=b[state.sortKey];if(typeof ka==='number'&&typeof kb==='number')return state.sortAsc?ka-kb:kb-ka;return state.sortAsc?String(ka).localeCompare(String(kb)):String(kb).localeCompare(String(ka));});$('#proxyTbody').innerHTML=data.map(x=>`<tr><td>${x.address}</td><td><span class="tag">${x.protocol}</span></td><td>${x.pool}</td><td>${x.latency_ms}</td><td>${x.current?'✅':''}</td></tr>`).join('');}
+async function loadOverview(){renderCards(await jget('/api/overview'));}
+async function loadProxies(){const d=await jget('/api/proxies');state.proxies=d.items||[];applyTable();}
+async function loadConfig(){$('#configPre').textContent=JSON.stringify(await jget('/api/config'),null,2)}
+async function boot(){await Promise.all([loadOverview(),loadProxies(),loadConfig()]);}
+document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));
+$('#searchInput').oninput=applyTable;$('#poolFilter').onchange=applyTable;$('#protocolFilter').onchange=applyTable;$('#reloadTableBtn').onclick=loadProxies;
+document.querySelectorAll('th button[data-sort]').forEach(b=>b.onclick=()=>{const k=b.dataset.sort;if(state.sortKey===k)state.sortAsc=!state.sortAsc;else{state.sortKey=k;state.sortAsc=true;}applyTable();});
+$('#refreshBtn').onclick=async()=>{$('#actionLog').textContent=JSON.stringify(await jpost('/api/actions/refresh'),null,2);setTimeout(boot,600)};
+$('#rotateAllBtn').onclick=async()=>{$('#actionLog').textContent=JSON.stringify(await jpost('/api/actions/rotate',{pool:'all'}),null,2);setTimeout(boot,600)};
+document.querySelectorAll('[data-rotate-pool]').forEach(b=>b.onclick=async()=>{$('#actionLog').textContent=JSON.stringify(await jpost('/api/actions/rotate',{pool:b.dataset.rotatePool}),null,2);setTimeout(boot,600)});
+boot().catch(e=>$('#actionLog').textContent='Boot failed: '+e.message);
+</script>
+</body>
+</html>
