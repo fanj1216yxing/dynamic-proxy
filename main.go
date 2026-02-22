@@ -35,15 +35,17 @@ import (
 
 // Config represents the application configuration
 type Config struct {
-	ProxyListURLs          []string `yaml:"proxy_list_urls"`
-	SpecialProxyListUrls   []string `yaml:"special_proxy_list_urls"` // 支持复杂格式的代理URL列表
-	HealthCheckConcurrency int      `yaml:"health_check_concurrency"`
-	UpdateIntervalMinutes  int      `yaml:"update_interval_minutes"`
-	ProxySwitchIntervalMin string   `yaml:"proxy_switch_interval_min"`
-	HealthCheck            struct {
-		TotalTimeoutSeconds          int `yaml:"total_timeout_seconds"`
-		TLSHandshakeThresholdSeconds int `yaml:"tls_handshake_threshold_seconds"`
-	} `yaml:"health_check"`
+	ProxyListURLs          []string            `yaml:"proxy_list_urls"`
+	SpecialProxyListUrls   []string            `yaml:"special_proxy_list_urls"` // 支持复杂格式的代理URL列表
+	HealthCheckConcurrency int                 `yaml:"health_check_concurrency"`
+	UpdateIntervalMinutes  int                 `yaml:"update_interval_minutes"`
+	ProxySwitchIntervalMin string              `yaml:"proxy_switch_interval_min"`
+	HealthCheck            HealthCheckSettings `yaml:"health_check"`
+	HealthCheckTwoStage    struct {
+		Enabled  bool                `yaml:"enabled"`
+		StageOne HealthCheckSettings `yaml:"stage_one"`
+		StageTwo HealthCheckSettings `yaml:"stage_two"`
+	} `yaml:"health_check_two_stage"`
 	Ports struct {
 		SOCKS5Strict      string `yaml:"socks5_strict"`
 		SOCKS5Relaxed     string `yaml:"socks5_relaxed"`
@@ -65,6 +67,11 @@ type Config struct {
 		BlockIndicators  []string `yaml:"block_indicators"`
 		TimeoutSeconds   int      `yaml:"timeout_seconds"`
 	} `yaml:"cf_challenge_check"`
+}
+
+type HealthCheckSettings struct {
+	TotalTimeoutSeconds          int `yaml:"total_timeout_seconds"`
+	TLSHandshakeThresholdSeconds int `yaml:"tls_handshake_threshold_seconds"`
 }
 
 // Global config variable
@@ -128,14 +135,26 @@ func loadConfig(filename string) (*Config, error) {
 	if cfg.UpdateIntervalMinutes <= 0 {
 		cfg.UpdateIntervalMinutes = 5
 	}
-	if cfg.ProxySwitchIntervalMin == "" {
-		cfg.ProxySwitchIntervalMin = "30"
-	}
 	if cfg.HealthCheck.TotalTimeoutSeconds <= 0 {
 		cfg.HealthCheck.TotalTimeoutSeconds = 8
 	}
 	if cfg.HealthCheck.TLSHandshakeThresholdSeconds <= 0 {
-		cfg.HealthCheck.TLSHandshakeThresholdSeconds = 5
+		cfg.HealthCheck.TLSHandshakeThresholdSeconds = 4
+	}
+	if cfg.HealthCheckTwoStage.StageOne.TotalTimeoutSeconds <= 0 {
+		cfg.HealthCheckTwoStage.StageOne.TotalTimeoutSeconds = 4
+	}
+	if cfg.HealthCheckTwoStage.StageOne.TLSHandshakeThresholdSeconds <= 0 {
+		cfg.HealthCheckTwoStage.StageOne.TLSHandshakeThresholdSeconds = 2
+	}
+	if cfg.HealthCheckTwoStage.StageTwo.TotalTimeoutSeconds <= 0 {
+		cfg.HealthCheckTwoStage.StageTwo.TotalTimeoutSeconds = 8
+	}
+	if cfg.HealthCheckTwoStage.StageTwo.TLSHandshakeThresholdSeconds <= 0 {
+		cfg.HealthCheckTwoStage.StageTwo.TLSHandshakeThresholdSeconds = 4
+	}
+	if cfg.ProxySwitchIntervalMin == "" {
+		cfg.ProxySwitchIntervalMin = "30"
 	}
 	if cfg.Ports.SOCKS5Strict == "" {
 		cfg.Ports.SOCKS5Strict = ":1080"
@@ -1528,7 +1547,11 @@ func checkCloudflareBypass(proxyAddr string) bool {
 }
 
 func checkProxyHealth(proxyAddr string, strictMode bool) bool {
-	totalTimeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
+	return checkProxyHealthWithSettings(proxyAddr, strictMode, config.HealthCheck)
+}
+
+func checkProxyHealthWithSettings(proxyAddr string, strictMode bool, settings HealthCheckSettings) bool {
+	totalTimeout := time.Duration(settings.TotalTimeoutSeconds) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
 	defer cancel()
 
@@ -1584,13 +1607,21 @@ func checkProxyHealth(proxyAddr string, strictMode bool) bool {
 	defer tlsConn.Close()
 
 	elapsed := time.Since(start)
-	threshold := time.Duration(config.HealthCheck.TLSHandshakeThresholdSeconds) * time.Second
+	threshold := time.Duration(settings.TLSHandshakeThresholdSeconds) * time.Second
 	if elapsed > threshold {
 		log.Printf("[HEALTH] proxy=%s strict=%t status=timeout stage=tls_handshake_threshold elapsed=%s threshold=%s", proxyAddr, strictMode, elapsed, threshold)
 		return false
 	}
 
 	return true
+}
+
+func evaluateProxy(addr string, settings HealthCheckSettings) (bool, bool) {
+	strictOK := checkProxyHealthWithSettings(addr, true, settings)
+	if strictOK {
+		return true, true
+	}
+	return false, checkProxyHealthWithSettings(addr, false, settings)
 }
 
 // HealthCheckResult holds the results of health check for both modes
@@ -1601,6 +1632,14 @@ type HealthCheckResult struct {
 }
 
 func healthCheckProxies(proxies []string) HealthCheckResult {
+	if config.HealthCheckTwoStage.Enabled {
+		return healthCheckProxiesTwoStage(proxies)
+	}
+
+	return healthCheckProxiesSingleStage(proxies, config.HealthCheck)
+}
+
+func healthCheckProxiesSingleStage(proxies []string, settings HealthCheckSettings) HealthCheckResult {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	strictHealthy := make([]string, 0)
@@ -1660,8 +1699,8 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 			defer func() { <-semaphore }()
 
 			// Optimized: check strict mode first
-			strictOK := checkProxyHealth(addr, true)
-			healthy := false
+			strictOK, relaxedOK := evaluateProxy(addr, settings)
+			healthy := strictOK || relaxedOK
 
 			if strictOK {
 				// If strict mode passes, relaxed mode must pass too
@@ -1671,17 +1710,11 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 				mu.Unlock()
 				atomic.AddInt64(&strictCount, 1)
 				atomic.AddInt64(&relaxedCount, 1)
-				healthy = true
-			} else {
-				// Strict mode failed, try relaxed mode
-				relaxedOK := checkProxyHealth(addr, false)
-				if relaxedOK {
-					mu.Lock()
-					relaxedHealthy = append(relaxedHealthy, addr)
-					mu.Unlock()
-					atomic.AddInt64(&relaxedCount, 1)
-					healthy = true
-				}
+			} else if relaxedOK {
+				mu.Lock()
+				relaxedHealthy = append(relaxedHealthy, addr)
+				mu.Unlock()
+				atomic.AddInt64(&relaxedCount, 1)
 			}
 
 			if healthy && config.CFChallengeCheck.Enabled {
@@ -1710,6 +1743,28 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 		Relaxed: relaxedHealthy,
 		CFPass:  cfPassHealthy,
 	}
+}
+
+func healthCheckProxiesTwoStage(proxies []string) HealthCheckResult {
+	log.Printf("[HEALTH] Two-stage health check enabled: stage1 timeout=%ds tls_threshold=%ds, stage2 timeout=%ds tls_threshold=%ds",
+		config.HealthCheckTwoStage.StageOne.TotalTimeoutSeconds,
+		config.HealthCheckTwoStage.StageOne.TLSHandshakeThresholdSeconds,
+		config.HealthCheckTwoStage.StageTwo.TotalTimeoutSeconds,
+		config.HealthCheckTwoStage.StageTwo.TLSHandshakeThresholdSeconds,
+	)
+
+	stage1Result := healthCheckProxiesSingleStage(proxies, config.HealthCheckTwoStage.StageOne)
+	candidates := stage1Result.Relaxed
+	log.Printf("[HEALTH] Stage 1 complete: candidates=%d/%d", len(candidates), len(proxies))
+	if len(candidates) == 0 {
+		return HealthCheckResult{}
+	}
+
+	stage2Result := healthCheckProxiesSingleStage(candidates, config.HealthCheckTwoStage.StageTwo)
+	log.Printf("[HEALTH] Stage 2 complete: strict=%d relaxed=%d cf_pass=%d",
+		len(stage2Result.Strict), len(stage2Result.Relaxed), len(stage2Result.CFPass))
+
+	return stage2Result
 }
 
 func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool) {

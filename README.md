@@ -106,16 +106,26 @@ proxy_list_urls:
   # - "https://example.com/proxy-list.txt"
 
 # 健康检查并发数（同时测试数量）
-health_check_concurrency: 200
+health_check_concurrency: 2000
 
 # 更新间隔（分钟）
 update_interval_minutes: 5
 proxy_switch_interval_min: 30          # 自动轮换间隔（分钟），填 now 表示每次请求都轮换
 
-# 健康检查超时设置
+# 单阶段健康检查超时设置（当两阶段关闭时生效）
 health_check:
   total_timeout_seconds: 8              # 总超时时间
-  tls_handshake_threshold_seconds: 5    # TLS握手阈值
+  tls_handshake_threshold_seconds: 4    # TLS握手阈值
+
+# 两阶段健康检查（工业级大规模代理池推荐）
+health_check_two_stage:
+  enabled: true
+  stage_one:                            # 第一阶段：快速淘汰
+    total_timeout_seconds: 4
+    tls_handshake_threshold_seconds: 2
+  stage_two:                            # 第二阶段：精细检测
+    total_timeout_seconds: 8
+    tls_handshake_threshold_seconds: 4
 
 # 服务器端口
 ports:
@@ -139,11 +149,14 @@ auth:
 | 选项 | 说明 | 默认值 |
 |------|------|--------|
 | `proxy_list_urls` | 代理源URL列表 | 2个源 |
-| `health_check_concurrency` | 并发健康检查数 | 200 |
+| `health_check_concurrency` | 并发健康检查数 | 2000 |
 | `update_interval_minutes` | 代理池刷新间隔 | 5分钟 |
 | `proxy_switch_interval_min` | 自动轮换间隔（单位: 分钟）；支持 `now`（每次请求轮换） | 30分钟 |
 | `total_timeout_seconds` | 健康检查总超时 | 8秒 |
-| `tls_handshake_threshold_seconds` | 最大TLS握手时间 | 5秒 |
+| `tls_handshake_threshold_seconds` | 最大TLS握手时间 | 4秒 |
+| `health_check_two_stage.enabled` | 是否启用两阶段健康检查 | true |
+| `health_check_two_stage.stage_one.*` | 第一阶段快速筛选超时参数 | 4秒 / 2秒 |
+| `health_check_two_stage.stage_two.*` | 第二阶段精细检测超时参数 | 8秒 / 4秒 |
 | `ports.socks5_strict` | SOCKS5服务器端口（启用SSL验证） | :17283 |
 | `ports.socks5_relaxed` | SOCKS5服务器端口（禁用SSL验证） | :17284 |
 | `ports.http_strict` | HTTP代理服务器端口（启用SSL验证） | :17285 |
