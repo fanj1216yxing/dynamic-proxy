@@ -1720,6 +1720,113 @@ type MixedHealthCheckResult struct {
 	CFPass  []string
 }
 
+type healthFailureCategory string
+
+const (
+	healthFailureNone        healthFailureCategory = "none"
+	healthFailureParse       healthFailureCategory = "parse_failed"
+	healthFailureHandshake   healthFailureCategory = "handshake_failed"
+	healthFailureAuth        healthFailureCategory = "auth_failed"
+	healthFailureTimeout     healthFailureCategory = "timeout"
+	healthFailureUnreachable healthFailureCategory = "unreachable"
+)
+
+type proxyHealthStatus struct {
+	Healthy  bool
+	Scheme   string
+	Category healthFailureCategory
+	Reason   string
+}
+
+type protocolStats struct {
+	Total         int64
+	Success       int64
+	ParseFailed   int64
+	HandshakeFail int64
+	AuthFail      int64
+	Timeout       int64
+	Unreachable   int64
+}
+
+func (s *protocolStats) addResult(status proxyHealthStatus) {
+	s.Total++
+	if status.Healthy {
+		s.Success++
+		return
+	}
+	switch status.Category {
+	case healthFailureParse:
+		s.ParseFailed++
+	case healthFailureHandshake:
+		s.HandshakeFail++
+	case healthFailureAuth:
+		s.AuthFail++
+	case healthFailureTimeout:
+		s.Timeout++
+	case healthFailureUnreachable:
+		s.Unreachable++
+	}
+}
+
+func classifyHealthFailure(err error) healthFailureCategory {
+	if err == nil {
+		return healthFailureNone
+	}
+
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return healthFailureTimeout
+	}
+
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "timeout"), strings.Contains(msg, "deadline exceeded"):
+		return healthFailureTimeout
+	case strings.Contains(msg, "auth"), strings.Contains(msg, "unauthorized"), strings.Contains(msg, "forbidden"):
+		return healthFailureAuth
+	case strings.Contains(msg, "handshake"), strings.Contains(msg, "tls"), strings.Contains(msg, "certificate"):
+		return healthFailureHandshake
+	default:
+		return healthFailureUnreachable
+	}
+}
+
+func checkMainstreamProxyHealth(proxyEntry string, strictMode bool) proxyHealthStatus {
+	dialer, scheme, err := buildUpstreamDialer(proxyEntry)
+	if scheme == "" {
+		scheme = "unknown"
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "unsupported upstream proxy scheme") || strings.Contains(err.Error(), "invalid") {
+			return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, Reason: err.Error()}
+		}
+		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: classifyHealthFailure(err), Reason: err.Error()}
+	}
+
+	totalTimeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
+	threshold := time.Duration(config.HealthCheck.TLSHandshakeThresholdSeconds) * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := dialer.DialContext(ctx, "tcp", "www.google.com:443")
+	if err != nil {
+		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: classifyHealthFailure(err), Reason: err.Error()}
+	}
+	defer conn.Close()
+
+	tlsConn := tls.Client(conn, &tls.Config{ServerName: "www.google.com", InsecureSkipVerify: !strictMode})
+	if err := tlsConn.Handshake(); err != nil {
+		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: classifyHealthFailure(err), Reason: err.Error()}
+	}
+	_ = tlsConn.Close()
+
+	if time.Since(start) > threshold {
+		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, Reason: "tls handshake exceeded threshold"}
+	}
+
+	return proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone}
+}
+
 func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -1730,6 +1837,7 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 	var checked int64
 	var healthyCount int64
 	var cfPassCount int64
+	protocolSummary := make(map[string]*protocolStats)
 
 	semaphore := make(chan struct{}, config.HealthCheckConcurrency)
 	done := make(chan struct{})
@@ -1766,8 +1874,18 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			healthy := checkMixedProxyHealth(entry, false)
-			if healthy {
+			status := checkMainstreamProxyHealth(entry, false)
+
+			mu.Lock()
+			stats, ok := protocolSummary[status.Scheme]
+			if !ok {
+				stats = &protocolStats{}
+				protocolSummary[status.Scheme] = stats
+			}
+			stats.addResult(status)
+			mu.Unlock()
+
+			if status.Healthy {
 				mu.Lock()
 				mixedHealthy = append(mixedHealthy, entry)
 				mu.Unlock()
@@ -1786,6 +1904,33 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 	wg.Wait()
 	close(done)
 	log.Printf("[MIXED-%s] %d/%d (100.0%%) | Healthy: %d | CF-Pass: %d", strings.Repeat("█", 40), total, total, len(mixedHealthy), len(cfPassHealthy))
+
+	mu.Lock()
+	protocols := make([]string, 0, len(protocolSummary))
+	for scheme := range protocolSummary {
+		protocols = append(protocols, scheme)
+	}
+	sort.Strings(protocols)
+	for _, scheme := range protocols {
+		stats := protocolSummary[scheme]
+		successRate := 0.0
+		if stats.Total > 0 {
+			successRate = float64(stats.Success) / float64(stats.Total) * 100
+		}
+		log.Printf("[MIXED-SUMMARY] scheme=%s total=%d success=%d success_rate=%.1f%% failures={parse:%d handshake:%d auth:%d timeout:%d unreachable:%d}",
+			scheme,
+			stats.Total,
+			stats.Success,
+			successRate,
+			stats.ParseFailed,
+			stats.HandshakeFail,
+			stats.AuthFail,
+			stats.Timeout,
+			stats.Unreachable,
+		)
+	}
+	mu.Unlock()
+
 	sort.Strings(cfPassHealthy)
 
 	return MixedHealthCheckResult{Healthy: mixedHealthy, CFPass: cfPassHealthy}
