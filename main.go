@@ -443,7 +443,7 @@ var mainstreamMixedExcludedSchemes = map[string]bool{
 	"socks5h": true,
 }
 
-func parseClashSubscription(content string) ([]string, bool) {
+func parseClashSubscriptionForStrictRelaxed(content string) ([]string, bool) {
 	var sub clashSubscription
 	if err := yaml.Unmarshal([]byte(content), &sub); err != nil || len(sub.Proxies) == 0 {
 		return nil, false
@@ -453,13 +453,13 @@ func parseClashSubscription(content string) ([]string, bool) {
 	seen := make(map[string]bool)
 	for _, p := range sub.Proxies {
 		proxyType := strings.ToLower(strings.TrimSpace(p.Type))
-		if proxyType != "socks5" && proxyType != "socks5h" {
+		if !mixedSupportedSchemes[proxyType] {
 			continue
 		}
 		if p.Server == "" || p.Port <= 0 {
 			continue
 		}
-		entry := fmt.Sprintf("%s:%d", p.Server, p.Port)
+		entry := fmt.Sprintf("%s://%s", proxyType, net.JoinHostPort(p.Server, strconv.Itoa(p.Port)))
 		if !seen[entry] {
 			seen[entry] = true
 			result = append(result, entry)
@@ -470,7 +470,7 @@ func parseClashSubscription(content string) ([]string, bool) {
 }
 
 func parseRegularProxyContent(content string) ([]string, string) {
-	if clashProxies, ok := parseClashSubscription(content); ok {
+	if clashProxies, ok := parseClashSubscriptionForStrictRelaxed(content); ok {
 		return clashProxies, "clash"
 	}
 
@@ -487,18 +487,16 @@ func parseRegularProxyContent(content string) ([]string, string) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		line = strings.TrimPrefix(line, "socks5://")
-		line = strings.TrimPrefix(line, "socks4://")
-		line = strings.TrimPrefix(line, "https://")
-		line = strings.TrimPrefix(line, "http://")
-		proxies = append(proxies, line)
+		if normalized, ok := normalizeMixedProxyEntry(line); ok {
+			proxies = append(proxies, normalized)
+		}
 	}
 
 	return proxies, "plain"
 }
 
 func parseRegularProxyContentMixed(content string) ([]string, string) {
-	if clashProxies, ok := parseClashSubscriptionMixed(content); ok {
+	if clashProxies, ok := parseClashSubscriptionForMixed(content); ok {
 		return clashProxies, "clash"
 	}
 
@@ -525,7 +523,7 @@ func parseRegularProxyContentMixed(content string) ([]string, string) {
 	return proxies, "plain"
 }
 
-func parseClashSubscriptionMixed(content string) ([]string, bool) {
+func parseClashSubscriptionForMixed(content string) ([]string, bool) {
 	var sub clashSubscription
 	if err := yaml.Unmarshal([]byte(content), &sub); err != nil || len(sub.Proxies) == 0 {
 		return nil, false
@@ -580,6 +578,58 @@ func parseClashSubscriptionMixed(content string) ([]string, bool) {
 	}
 
 	return result, len(result) > 0
+}
+
+func detectProxyScheme(entry string, defaultScheme string) string {
+	trimmed := strings.TrimSpace(entry)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.Contains(trimmed, "://") {
+		if u, err := url.Parse(trimmed); err == nil {
+			return strings.ToLower(strings.TrimSpace(u.Scheme))
+		}
+	}
+	return strings.ToLower(strings.TrimSpace(defaultScheme))
+}
+
+func logSchemeDistribution(tag string, entries []string, defaultScheme string) {
+	schemeCount := make(map[string]int)
+	for _, entry := range entries {
+		scheme := detectProxyScheme(entry, defaultScheme)
+		if scheme == "" {
+			scheme = "unknown"
+		}
+		schemeCount[scheme]++
+	}
+
+	keys := make([]string, 0, len(schemeCount))
+	for scheme := range schemeCount {
+		keys = append(keys, scheme)
+	}
+	sort.Strings(keys)
+
+	parts := make([]string, 0, len(keys))
+	for _, scheme := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", scheme, schemeCount[scheme]))
+	}
+
+	if len(parts) == 0 {
+		log.Printf("%s parse scheme distribution: empty", tag)
+		return
+	}
+	log.Printf("%s parse scheme distribution: %s", tag, strings.Join(parts, ", "))
+}
+
+func normalizeSocksPoolEntry(entry string) (string, bool) {
+	scheme, addr, _, _, err := parseMixedProxy(entry)
+	if err != nil {
+		return "", false
+	}
+	if scheme != "socks5" && scheme != "socks5h" {
+		return "", false
+	}
+	return addr, true
 }
 
 func decodeBase64ProxySubscription(content string) (string, bool) {
@@ -1067,6 +1117,7 @@ func parseSpecialProxyURLMixed(content string) []string {
 }
 
 func fetchProxyList() ([]string, error) {
+	log.Println("fetchProxyList: strict/relaxed SOCKS pool only (socks5/socks5h)")
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
@@ -1104,16 +1155,23 @@ func fetchProxyList() ([]string, error) {
 
 		content := string(body)
 		parsedProxies, format := parseRegularProxyContent(content)
+		logSchemeDistribution(fmt.Sprintf("regular URL %s", url), parsedProxies, "socks5")
 		count := 0
+		skippedNonSocks := 0
 		for _, parsed := range parsedProxies {
-			if !proxySet[parsed] {
-				proxySet[parsed] = true
-				allProxies = append(allProxies, parsed)
+			normalized, ok := normalizeSocksPoolEntry(parsed)
+			if !ok {
+				skippedNonSocks++
+				continue
+			}
+			if !proxySet[normalized] {
+				proxySet[normalized] = true
+				allProxies = append(allProxies, normalized)
 				count++
 			}
 		}
 
-		log.Printf("Fetched %d proxies from regular URL %s (format=%s)", count, url, format)
+		log.Printf("Fetched %d proxies from regular URL %s (format=%s, skipped_non_socks=%d)", count, url, format, skippedNonSocks)
 	}
 
 	// 处理特殊代理URL（复杂格式）
@@ -1146,10 +1204,10 @@ func fetchProxyList() ([]string, error) {
 			log.Printf("Warning: Error parsing special proxies from %s: %v", url, err)
 			continue
 		}
+		logSchemeDistribution(fmt.Sprintf("special URL %s", url), specialProxies, "socks5")
 
 		count := 0
 		for _, proxy := range specialProxies {
-			// All proxies are now in ip:port format for consistency
 			if !proxySet[proxy] {
 				proxySet[proxy] = true
 				allProxies = append(allProxies, proxy)
@@ -1169,6 +1227,7 @@ func fetchProxyList() ([]string, error) {
 }
 
 func fetchMixedProxyList() ([]string, error) {
+	log.Println("fetchMixedProxyList: mixed multi-scheme pool (http/https/socks and mainstream schemes)")
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
@@ -1199,6 +1258,7 @@ func fetchMixedProxyList() ([]string, error) {
 		}
 
 		parsedProxies, format := parseRegularProxyContentMixed(string(body))
+		logSchemeDistribution(fmt.Sprintf("mixed regular URL %s", sourceURL), parsedProxies, "socks5")
 		count := 0
 		for _, parsed := range parsedProxies {
 			if !proxySet[parsed] {
@@ -1230,6 +1290,7 @@ func fetchMixedProxyList() ([]string, error) {
 		}
 
 		specialProxies := parseSpecialProxyURLMixed(string(body))
+		logSchemeDistribution(fmt.Sprintf("mixed special URL %s", sourceURL), specialProxies, "socks5")
 		count := 0
 		for _, parsed := range specialProxies {
 			if !proxySet[parsed] {
