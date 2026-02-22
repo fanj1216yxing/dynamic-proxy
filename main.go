@@ -7,7 +7,6 @@ import (
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1562,29 +1561,21 @@ func checkProxyHealthWithSettings(proxyAddr string, strictMode bool, settings He
 
 	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, baseDialer)
 	if err != nil {
-		log.Printf("[HEALTH] proxy=%s strict=%t status=dialer_create_failed err=%v", proxyAddr, strictMode, err)
 		return false
 	}
 
 	if err := ctx.Err(); err != nil {
-		log.Printf("[HEALTH] proxy=%s strict=%t status=timeout stage=before_dial err=%v", proxyAddr, strictMode, err)
 		return false
 	}
 
 	conn, err := dialer.Dial("tcp", "www.google.com:443")
 	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) || isTimeoutError(err) {
-			log.Printf("[HEALTH] proxy=%s strict=%t status=timeout stage=dial err=%v", proxyAddr, strictMode, err)
-		} else {
-			log.Printf("[HEALTH] proxy=%s strict=%t status=dial_failed err=%v", proxyAddr, strictMode, err)
-		}
 		return false
 	}
 	defer conn.Close()
 
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
-			log.Printf("[HEALTH] proxy=%s strict=%t status=set_deadline_failed err=%v", proxyAddr, strictMode, err)
 			return false
 		}
 	}
@@ -1597,11 +1588,6 @@ func checkProxyHealthWithSettings(proxyAddr string, strictMode bool, settings He
 
 	err = tlsConn.Handshake()
 	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) || isTimeoutError(err) {
-			log.Printf("[HEALTH] proxy=%s strict=%t status=timeout stage=tls_handshake err=%v", proxyAddr, strictMode, err)
-		} else {
-			log.Printf("[HEALTH] proxy=%s strict=%t status=handshake_failed err=%v", proxyAddr, strictMode, err)
-		}
 		return false
 	}
 	defer tlsConn.Close()
@@ -1609,7 +1595,6 @@ func checkProxyHealthWithSettings(proxyAddr string, strictMode bool, settings He
 	elapsed := time.Since(start)
 	threshold := time.Duration(settings.TLSHandshakeThresholdSeconds) * time.Second
 	if elapsed > threshold {
-		log.Printf("[HEALTH] proxy=%s strict=%t status=timeout stage=tls_handshake_threshold elapsed=%s threshold=%s", proxyAddr, strictMode, elapsed, threshold)
 		return false
 	}
 
