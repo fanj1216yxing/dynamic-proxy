@@ -78,6 +78,7 @@ var config Config
 
 const connectivityCheckInterval = 10 * time.Second
 const defaultMixedHealthCheckURL = "https://www.google.com"
+const healthCheckBatchSize = 5000
 
 var mixedHealthCheckURL = defaultMixedHealthCheckURL
 
@@ -1359,6 +1360,237 @@ func fetchMixedProxyList() ([]string, error) {
 	return allProxies, nil
 }
 
+func fetchAndProcessSocksProxyBatches(batchSize int, onBatch func([]string)) error {
+	if batchSize <= 0 {
+		batchSize = healthCheckBatchSize
+	}
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	seen := make(map[string]bool)
+	batch := make([]string, 0, batchSize)
+	totalUnique := 0
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		onBatch(batch)
+		batch = make([]string, 0, batchSize)
+	}
+
+	handleProxy := func(proxy string) {
+		if proxy == "" || seen[proxy] {
+			return
+		}
+		seen[proxy] = true
+		totalUnique++
+		batch = append(batch, proxy)
+		if len(batch) >= batchSize {
+			flush()
+		}
+	}
+
+	for _, sourceURL := range config.ProxyListURLs {
+		log.Printf("Fetching proxy list from regular URL: %s", sourceURL)
+		resp, err := client.Get(sourceURL)
+		if err != nil {
+			log.Printf("Warning: Failed to fetch from %s: %v", sourceURL, err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("Warning: Unexpected status code %d from %s", resp.StatusCode, sourceURL)
+			resp.Body.Close()
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Printf("Warning: Error reading body from %s: %v", sourceURL, err)
+			continue
+		}
+
+		parsedProxies, format := parseRegularProxyContent(string(body))
+		logSchemeDistribution(fmt.Sprintf("regular URL %s", sourceURL), parsedProxies, "socks5")
+		added := 0
+		skippedNonSocks := 0
+		for _, parsed := range parsedProxies {
+			normalized, ok := normalizeSocksPoolEntry(parsed)
+			if !ok {
+				skippedNonSocks++
+				continue
+			}
+			before := totalUnique
+			handleProxy(normalized)
+			if totalUnique > before {
+				added++
+			}
+		}
+		log.Printf("Fetched %d proxies from regular URL %s (format=%s, skipped_non_socks=%d)", added, sourceURL, format, skippedNonSocks)
+	}
+
+	for _, sourceURL := range config.SpecialProxyListUrls {
+		log.Printf("Fetching proxy list from special URL: %s", sourceURL)
+		resp, err := client.Get(sourceURL)
+		if err != nil {
+			log.Printf("Warning: Failed to fetch from special URL %s: %v", sourceURL, err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("Warning: Unexpected status code %d from special URL %s", resp.StatusCode, sourceURL)
+			resp.Body.Close()
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Printf("Warning: Error reading body from special URL %s: %v", sourceURL, err)
+			continue
+		}
+
+		specialProxies, err := parseSpecialProxyURL(string(body))
+		if err != nil {
+			log.Printf("Warning: Error parsing special proxies from %s: %v", sourceURL, err)
+			continue
+		}
+		logSchemeDistribution(fmt.Sprintf("special URL %s", sourceURL), specialProxies, "socks5")
+
+		added := 0
+		for _, proxy := range specialProxies {
+			before := totalUnique
+			handleProxy(proxy)
+			if totalUnique > before {
+				added++
+			}
+		}
+		log.Printf("Fetched %d proxies from special URL %s", added, sourceURL)
+	}
+
+	flush()
+	if totalUnique == 0 {
+		return fmt.Errorf("no proxies fetched from any source")
+	}
+
+	log.Printf("Total unique proxies fetched: %d", totalUnique)
+	return nil
+}
+
+func fetchAndProcessMixedProxyBatches(batchSize int, onBatch func([]string)) error {
+	if batchSize <= 0 {
+		batchSize = healthCheckBatchSize
+	}
+
+	client := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+	}
+
+	seen := make(map[string]bool)
+	batch := make([]string, 0, batchSize)
+	totalUnique := 0
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		onBatch(batch)
+		batch = make([]string, 0, batchSize)
+	}
+
+	handleProxy := func(proxy string) {
+		if proxy == "" || seen[proxy] {
+			return
+		}
+		seen[proxy] = true
+		totalUnique++
+		batch = append(batch, proxy)
+		if len(batch) >= batchSize {
+			flush()
+		}
+	}
+
+	for _, sourceURL := range config.ProxyListURLs {
+		log.Printf("Fetching mixed proxy list from regular URL: %s", sourceURL)
+		resp, err := client.Get(sourceURL)
+		if err != nil {
+			log.Printf("Warning: Failed to fetch from %s: %v", sourceURL, err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("Warning: Unexpected status code %d from %s", resp.StatusCode, sourceURL)
+			resp.Body.Close()
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Printf("Warning: Error reading body from %s: %v", sourceURL, err)
+			continue
+		}
+
+		parsedProxies, format := parseRegularProxyContentMixed(string(body))
+		logSchemeDistribution(fmt.Sprintf("mixed regular URL %s", sourceURL), parsedProxies, "socks5")
+		added := 0
+		for _, parsed := range parsedProxies {
+			before := totalUnique
+			handleProxy(parsed)
+			if totalUnique > before {
+				added++
+			}
+		}
+		log.Printf("Fetched %d mixed proxies from regular URL %s (format=%s)", added, sourceURL, format)
+	}
+
+	for _, sourceURL := range config.SpecialProxyListUrls {
+		log.Printf("Fetching mixed proxy list from special URL: %s", sourceURL)
+		resp, err := client.Get(sourceURL)
+		if err != nil {
+			log.Printf("Warning: Failed to fetch from special URL %s: %v", sourceURL, err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("Warning: Unexpected status code %d from special URL %s", resp.StatusCode, sourceURL)
+			resp.Body.Close()
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Printf("Warning: Error reading body from special URL %s: %v", sourceURL, err)
+			continue
+		}
+
+		specialProxies := parseSpecialProxyURLMixed(string(body))
+		logSchemeDistribution(fmt.Sprintf("mixed special URL %s", sourceURL), specialProxies, "socks5")
+		added := 0
+		for _, parsed := range specialProxies {
+			before := totalUnique
+			handleProxy(parsed)
+			if totalUnique > before {
+				added++
+			}
+		}
+		log.Printf("Fetched %d mixed proxies from special URL %s", added, sourceURL)
+	}
+
+	flush()
+	if totalUnique == 0 {
+		return fmt.Errorf("no mixed proxies fetched from any source")
+	}
+
+	log.Printf("Total unique mixed proxies fetched: %d", totalUnique)
+	return nil
+}
+
 func parseMixedProxy(entry string) (scheme string, addr string, auth *proxy.Auth, httpAuthHeader string, err error) {
 	if strings.Contains(entry, "://") {
 		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(entry)), "vmess://") {
@@ -1761,14 +1993,24 @@ func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *Prox
 	defer atomic.StoreInt32(&strictPool.updating, 0)
 
 	log.Println("Fetching proxy list...")
-	proxies, err := fetchProxyList()
+	strictHealthy := make([]string, 0)
+	relaxedHealthy := make([]string, 0)
+	cfPassHealthy := make([]string, 0)
+
+	err := fetchAndProcessSocksProxyBatches(healthCheckBatchSize, func(batch []string) {
+		log.Printf("Processing strict/relaxed health check batch: size=%d", len(batch))
+		result := healthCheckProxies(batch)
+		strictHealthy = append(strictHealthy, result.Strict...)
+		relaxedHealthy = append(relaxedHealthy, result.Relaxed...)
+		cfPassHealthy = append(cfPassHealthy, result.CFPass...)
+	})
 	if err != nil {
 		log.Printf("Error fetching proxy list: %v", err)
 		return
 	}
 
-	log.Printf("Fetched %d proxies, starting health check...", len(proxies))
-	result := healthCheckProxies(proxies)
+	result := HealthCheckResult{Strict: strictHealthy, Relaxed: relaxedHealthy, CFPass: cfPassHealthy}
+	log.Printf("Streaming health check complete: strict=%d relaxed=%d cf_pass=%d", len(result.Strict), len(result.Relaxed), len(result.CFPass))
 
 	// Update strict pool
 	if len(result.Strict) > 0 {
@@ -2105,14 +2347,22 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 	defer atomic.StoreInt32(&mixedPool.updating, 0)
 
 	log.Println("Fetching mixed proxy list...")
-	proxies, err := fetchMixedProxyList()
+	allHealthy := make([]string, 0)
+	allCFPass := make([]string, 0)
+
+	err := fetchAndProcessMixedProxyBatches(healthCheckBatchSize, func(batch []string) {
+		log.Printf("Processing mixed health check batch: size=%d", len(batch))
+		result := healthCheckMixedProxies(batch)
+		allHealthy = append(allHealthy, result.Healthy...)
+		allCFPass = append(allCFPass, result.CFPass...)
+	})
 	if err != nil {
 		log.Printf("Error fetching mixed proxy list: %v", err)
 		return
 	}
 
-	log.Printf("Fetched %d mixed proxies, starting health check...", len(proxies))
-	result := healthCheckMixedProxies(proxies)
+	result := MixedHealthCheckResult{Healthy: allHealthy, CFPass: allCFPass}
+	log.Printf("Streaming mixed health check complete: healthy=%d cf_pass=%d", len(result.Healthy), len(result.CFPass))
 
 	httpSocksHealthy := filterMixedProxiesByScheme(result.Healthy, httpSocksMixedSchemes)
 	mainstreamHealthy := filterMixedProxiesByExcludedScheme(result.Healthy, mainstreamMixedExcludedSchemes)
