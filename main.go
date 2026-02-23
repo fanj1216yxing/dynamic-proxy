@@ -16,6 +16,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"os/signal"
@@ -1435,6 +1436,15 @@ func extractMixedURICandidate(line string) (string, bool) {
 	return candidate, true
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
 func parseBoolWithDefault(raw string, def bool) bool {
 	if strings.TrimSpace(raw) == "" {
 		return def
@@ -1776,7 +1786,7 @@ func parseTrojanNodeForKernel(raw string) (trojanKernelNode, bool) {
 		Port:     port,
 		Password: password,
 		SNI:      strings.TrimSpace(q.Get("sni")),
-		Insecure: parseBoolWithDefault(q.Get("allowInsecure"), false),
+		Insecure: parseBoolWithDefault(firstNonEmpty(q.Get("allowInsecure"), q.Get("insecure")), false),
 		Network:  strings.TrimSpace(q.Get("type")),
 		Path:     strings.TrimSpace(q.Get("path")),
 		Host:     strings.TrimSpace(q.Get("host")),
@@ -2886,6 +2896,10 @@ const (
 	healthFailureAuth            healthFailureCategory = "auth_failed"
 	healthFailureTimeout         healthFailureCategory = "timeout"
 	healthFailureUnreachable     healthFailureCategory = "unreachable"
+	healthFailureEOF             healthFailureCategory = "eof"
+	healthFailureProtocolError   healthFailureCategory = "protocol_error"
+	healthFailureCertVerify      healthFailureCategory = "cert_verify_failed"
+	healthFailureSNIMismatch     healthFailureCategory = "sni_mismatch"
 )
 
 type proxyHealthStatus struct {
@@ -2905,6 +2919,10 @@ type protocolStats struct {
 	AuthFail        int64
 	Timeout         int64
 	Unreachable     int64
+	EOF             int64
+	ProtocolError   int64
+	CertVerifyFail  int64
+	SNIMismatch     int64
 }
 
 func (s *protocolStats) addResult(status proxyHealthStatus) {
@@ -2928,7 +2946,34 @@ func (s *protocolStats) addResult(status proxyHealthStatus) {
 		s.Timeout++
 	case healthFailureUnreachable:
 		s.Unreachable++
+	case healthFailureEOF:
+		s.EOF++
+	case healthFailureProtocolError:
+		s.ProtocolError++
+	case healthFailureCertVerify:
+		s.CertVerifyFail++
+	case healthFailureSNIMismatch:
+		s.SNIMismatch++
 	}
+}
+
+type healthPhaseMetrics struct {
+	DNS        time.Duration
+	TCPConnect time.Duration
+	TLSHello   time.Duration
+	CertVerify time.Duration
+	FirstByte  time.Duration
+}
+
+func formatHealthReason(code string, err error) string {
+	if code == "" {
+		code = "unknown"
+	}
+	if err == nil {
+		return "code=" + code
+	}
+	detail := strings.ReplaceAll(err.Error(), ";", ",")
+	return fmt.Sprintf("code=%s;detail=%s", code, detail)
 }
 
 func isTimeoutError(err error) bool {
@@ -2942,29 +2987,55 @@ func isTimeoutError(err error) bool {
 	return strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded")
 }
 
-func classifyHealthFailure(err error) healthFailureCategory {
+func classifyHealthFailure(err error) (healthFailureCategory, string) {
 	if err == nil {
-		return healthFailureNone
+		return healthFailureNone, "ok"
 	}
 
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		return healthFailureTimeout
+		return healthFailureTimeout, "timeout"
+	}
+
+	if errors.Is(err, io.EOF) {
+		return healthFailureEOF, "eof"
+	}
+
+	var hostnameErr x509.HostnameError
+	if errors.As(err, &hostnameErr) {
+		return healthFailureSNIMismatch, "sni_mismatch"
+	}
+
+	var unknownAuthorityErr x509.UnknownAuthorityError
+	var certInvalidErr x509.CertificateInvalidError
+	if errors.As(err, &unknownAuthorityErr) || errors.As(err, &certInvalidErr) {
+		return healthFailureCertVerify, "cert_verify_failed"
 	}
 
 	msg := strings.ToLower(err.Error())
 	switch {
 	case errors.Is(err, errMainstreamAdapterUnavailable), strings.Contains(msg, "detector.core is empty"):
-		return healthFailureCoreUnavailable
+		return healthFailureCoreUnavailable, "core_unconfigured"
 	case strings.Contains(msg, "unsupported"):
-		return healthFailureUnsupported
+		return healthFailureUnsupported, "unsupported"
+	case strings.Contains(msg, "first record does not look like a tls handshake"), strings.Contains(msg, "tls: oversized record"), strings.Contains(msg, "malformed"), strings.Contains(msg, "server gave http response to https client"):
+		return healthFailureProtocolError, "protocol_error"
 	case strings.Contains(msg, "timeout"), strings.Contains(msg, "deadline exceeded"):
-		return healthFailureTimeout
+		if strings.Contains(msg, "handshake") {
+			return healthFailureTimeout, "tls_handshake_timeout"
+		}
+		return healthFailureTimeout, "timeout"
 	case strings.Contains(msg, "auth"), strings.Contains(msg, "unauthorized"), strings.Contains(msg, "forbidden"):
-		return healthFailureAuth
+		return healthFailureAuth, "auth_failed"
+	case strings.Contains(msg, "eof"):
+		return healthFailureEOF, "eof"
+	case strings.Contains(msg, "x509"), strings.Contains(msg, "certificate"):
+		return healthFailureCertVerify, "cert_verify_failed"
+	case strings.Contains(msg, "sni") || strings.Contains(msg, "hostname"):
+		return healthFailureSNIMismatch, "sni_mismatch"
 	case strings.Contains(msg, "handshake"), strings.Contains(msg, "tls"), strings.Contains(msg, "certificate"):
-		return healthFailureHandshake
+		return healthFailureHandshake, "handshake_failed"
 	default:
-		return healthFailureUnreachable
+		return healthFailureUnreachable, "unreachable"
 	}
 }
 
@@ -3021,7 +3092,8 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 		if strings.Contains(err.Error(), "invalid") {
 			return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, Reason: err.Error()}
 		}
-		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: classifyHealthFailure(err), Reason: err.Error()}
+		category, code := classifyHealthFailure(err)
+		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, Reason: formatHealthReason(code, err)}
 	}
 
 	totalTimeout := time.Duration(settings.TotalTimeoutSeconds) * time.Second
@@ -3032,7 +3104,8 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", mixedHealthTargetAddr())
 	if err != nil {
-		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: classifyHealthFailure(err), Reason: err.Error()}
+		category, code := classifyHealthFailure(err)
+		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, Reason: formatHealthReason(code, err)}
 	}
 	_ = conn.Close()
 
@@ -3052,23 +3125,106 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 		if strings.Contains(err.Error(), "invalid") {
 			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, Reason: err.Error()}}
 		}
-		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: classifyHealthFailure(err), Reason: err.Error()}}
+		category, code := classifyHealthFailure(err)
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, Reason: formatHealthReason(code, err)}}
 	}
 
 	totalTimeout := time.Duration(settings.TotalTimeoutSeconds) * time.Second
 	threshold := time.Duration(settings.TLSHandshakeThresholdSeconds) * time.Second
 
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: !strictMode},
+	targetURL, parseErr := url.Parse(mixedHealthCheckURL)
+	if parseErr != nil {
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, Reason: formatHealthReason("invalid_healthcheck_url", parseErr)}}
+	}
+
+	serverName := targetURL.Hostname()
+	phase := &healthPhaseMetrics{}
+	var certVerifyDur time.Duration
+	var verifyErr error
+
+	transport := &http.Transport{}
+	transport.TLSClientConfig = &tls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: true,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if !strictMode {
+				return nil
+			}
+			start := time.Now()
+			defer func() { certVerifyDur = time.Since(start) }()
+			if len(cs.PeerCertificates) == 0 {
+				verifyErr = fmt.Errorf("no peer certificate")
+				return verifyErr
+			}
+			roots, err := x509.SystemCertPool()
+			if err != nil || roots == nil {
+				roots = x509.NewCertPool()
+			}
+			opts := x509.VerifyOptions{DNSName: serverName, Roots: roots, Intermediates: x509.NewCertPool()}
+			for _, cert := range cs.PeerCertificates[1:] {
+				opts.Intermediates.AddCert(cert)
+			}
+			_, verifyErr = cs.PeerCertificates[0].Verify(opts)
+			return verifyErr
+		},
 	}
 	transport.DialContext = dialer.DialContext
 
 	client := &http.Client{Transport: transport, Timeout: totalTimeout}
+
+	var dnsStart, connStart, tlsStart, reqStart time.Time
+	var tlsHandshakeDone bool
+	req, reqErr := http.NewRequest(http.MethodGet, mixedHealthCheckURL, nil)
+	if reqErr != nil {
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, Reason: formatHealthReason("invalid_request", reqErr)}}
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		DNSStart: func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
+		DNSDone: func(httptrace.DNSDoneInfo) {
+			if !dnsStart.IsZero() {
+				phase.DNS = time.Since(dnsStart)
+			}
+		},
+		ConnectStart: func(_, _ string) { connStart = time.Now() },
+		ConnectDone: func(_, _ string, _ error) {
+			if !connStart.IsZero() {
+				phase.TCPConnect = time.Since(connStart)
+			}
+		},
+		TLSHandshakeStart: func() { tlsStart = time.Now() },
+		TLSHandshakeDone: func(_ tls.ConnectionState, _ error) {
+			tlsHandshakeDone = true
+			if !tlsStart.IsZero() {
+				tlsDur := time.Since(tlsStart)
+				phase.CertVerify = certVerifyDur
+				if tlsDur > certVerifyDur {
+					phase.TLSHello = tlsDur - certVerifyDur
+				} else {
+					phase.TLSHello = tlsDur
+				}
+			}
+		},
+		WroteRequest: func(httptrace.WroteRequestInfo) { reqStart = time.Now() },
+		GotFirstResponseByte: func() {
+			if !reqStart.IsZero() {
+				phase.FirstByte = time.Since(reqStart)
+			}
+		},
+	}))
+
 	start := time.Now()
-	resp, err := client.Get(mixedHealthCheckURL)
+	resp, err := client.Do(req)
 	latency := time.Since(start)
 	if err != nil {
-		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: classifyHealthFailure(err), Reason: err.Error()}, Latency: latency}
+		if verifyErr != nil {
+			category, code := classifyHealthFailure(verifyErr)
+			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, Reason: formatHealthReason(code, verifyErr)}, Latency: latency}
+		}
+		if isTimeoutError(err) && !tlsHandshakeDone {
+			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, Reason: formatHealthReason("tls_handshake_timeout", err)}, Latency: latency}
+		}
+		category, code := classifyHealthFailure(err)
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, Reason: formatHealthReason(code, err)}, Latency: latency}
 	}
 	defer resp.Body.Close()
 
@@ -3079,6 +3235,9 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 	if latency > threshold {
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, Reason: "stage2 http verification exceeded threshold"}, Latency: latency}
 	}
+
+	log.Printf("[MIXED-TLS-PHASE] scheme=%s dns=%s tcp_connect=%s tls_clienthello=%s cert_verify=%s first_byte=%s",
+		scheme, phase.DNS, phase.TCPConnect, phase.TLSHello, phase.CertVerify, phase.FirstByte)
 
 	return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone}, Latency: latency}
 }
@@ -3178,10 +3337,15 @@ func healthCheckMixedProxiesSingleStage(proxies []string) MixedHealthCheckResult
 				stats.Success += local.Success
 				stats.ParseFailed += local.ParseFailed
 				stats.Unsupported += local.Unsupported
+				stats.CoreUnavailable += local.CoreUnavailable
 				stats.HandshakeFail += local.HandshakeFail
 				stats.AuthFail += local.AuthFail
 				stats.Timeout += local.Timeout
 				stats.Unreachable += local.Unreachable
+				stats.EOF += local.EOF
+				stats.ProtocolError += local.ProtocolError
+				stats.CertVerifyFail += local.CertVerifyFail
+				stats.SNIMismatch += local.SNIMismatch
 			}
 			mu.Unlock()
 		}()
@@ -3220,6 +3384,13 @@ func healthCheckMixedProxiesSingleStage(proxies []string) MixedHealthCheckResult
 			stats.AuthFail,
 			stats.Timeout,
 			stats.Unreachable,
+		)
+		log.Printf("[MIXED-SUMMARY] scheme=%s tls_failures={eof:%d protocol_error:%d cert_verify_failed:%d sni_mismatch:%d}",
+			scheme,
+			stats.EOF,
+			stats.ProtocolError,
+			stats.CertVerifyFail,
+			stats.SNIMismatch,
 		)
 	}
 	mu.Unlock()

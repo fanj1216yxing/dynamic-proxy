@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -790,5 +791,128 @@ func TestParseKernelNodeConfig_MapsSSSSRAndTrojanFields(t *testing.T) {
 	}
 	if trojanNode.Trojan.SNI != "cdn.example.com" || len(trojanNode.Trojan.ALPN) != 2 || !trojanNode.Trojan.AllowInsecure || trojanNode.Trojan.Network != "ws" || trojanNode.Trojan.Path != "/tr" || trojanNode.Trojan.Host != "ws.example.com" {
 		t.Fatalf("unexpected trojan node mapping: %+v", trojanNode.Trojan)
+	}
+}
+
+type fixedTargetDialer struct {
+	targetAddr string
+}
+
+func (d fixedTargetDialer) DialContext(ctx context.Context, network, _ string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, network, d.targetAddr)
+}
+
+func startSleepTLSLikeServer(t *testing.T, sleep time.Duration, closeImmediately bool) (string, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				select {
+				case <-done:
+					return
+				default:
+					return
+				}
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				if closeImmediately {
+					return
+				}
+				time.Sleep(sleep)
+			}(conn)
+		}
+	}()
+	return ln.Addr().String(), func() {
+		close(done)
+		_ = ln.Close()
+	}
+}
+
+func TestMainstreamStage2_TLSFailureCategoriesWithMockServers(t *testing.T) {
+	oldBuilder := upstreamDialerBuilder
+	oldURL := mixedHealthCheckURL
+	defer func() {
+		upstreamDialerBuilder = oldBuilder
+		mixedHealthCheckURL = oldURL
+	}()
+
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer tlsSrv.Close()
+	tlsAddr := strings.TrimPrefix(tlsSrv.URL, "https://")
+
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer httpSrv.Close()
+	httpAddr := strings.TrimPrefix(httpSrv.URL, "http://")
+
+	timeoutAddr, stopTimeout := startSleepTLSLikeServer(t, 2*time.Second, false)
+	defer stopTimeout()
+	eofAddr, stopEOF := startSleepTLSLikeServer(t, 0, true)
+	defer stopEOF()
+
+	upstreamDialerBuilder = func(entry string) (UpstreamDialer, string, error) {
+		switch entry {
+		case "timeout":
+			return fixedTargetDialer{targetAddr: timeoutAddr}, "trojan", nil
+		case "eof":
+			return fixedTargetDialer{targetAddr: eofAddr}, "trojan", nil
+		case "cert":
+			return fixedTargetDialer{targetAddr: tlsAddr}, "trojan", nil
+		case "protocol":
+			return fixedTargetDialer{targetAddr: httpAddr}, "trojan", nil
+		default:
+			return nil, "", fmt.Errorf("unknown entry")
+		}
+	}
+
+	mixedHealthCheckURL = "https://127.0.0.1/"
+	settings := HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1}
+
+	timeoutResult := checkMainstreamProxyHealthStage2("timeout", false, settings).Status
+	if timeoutResult.Category != healthFailureTimeout || !strings.Contains(timeoutResult.Reason, "code=tls_handshake_timeout") {
+		t.Fatalf("unexpected timeout classification: %+v", timeoutResult)
+	}
+
+	eofResult := checkMainstreamProxyHealthStage2("eof", false, settings).Status
+	if eofResult.Category != healthFailureEOF || !strings.Contains(eofResult.Reason, "code=eof") {
+		t.Fatalf("unexpected eof classification: %+v", eofResult)
+	}
+
+	certResult := checkMainstreamProxyHealthStage2("cert", true, settings).Status
+	if certResult.Category != healthFailureCertVerify || !strings.Contains(certResult.Reason, "code=cert_verify_failed") {
+		t.Fatalf("unexpected cert classification: %+v", certResult)
+	}
+
+	protocolResult := checkMainstreamProxyHealthStage2("protocol", false, settings).Status
+	if protocolResult.Category != healthFailureProtocolError || !strings.Contains(protocolResult.Reason, "code=protocol_error") {
+		t.Fatalf("unexpected protocol classification: %+v", protocolResult)
+	}
+}
+
+func TestClassifyHealthFailure_SNIMismatchCode(t *testing.T) {
+	category, code := classifyHealthFailure(x509.HostnameError{})
+	if category != healthFailureSNIMismatch || code != "sni_mismatch" {
+		t.Fatalf("expected sni mismatch classification, got category=%s code=%s", category, code)
+	}
+}
+
+func TestParseKernelNodeConfig_TrojanInsecureCompatibility(t *testing.T) {
+	node, err := parseKernelNodeConfig("trojan", "trojan://secret@8.8.8.8:443?sni=cdn.example.com&insecure=1", "8.8.8.8:443")
+	if err != nil {
+		t.Fatalf("parse trojan node failed: %v", err)
+	}
+	if !node.Trojan.AllowInsecure {
+		t.Fatalf("expected insecure compatibility to map to allowInsecure")
 	}
 }
