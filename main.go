@@ -476,13 +476,31 @@ func parseSpecialProxyURL(content string) ([]string, error) {
 
 type clashSubscription struct {
 	Proxies []struct {
-		Type     string `yaml:"type"`
-		Server   string `yaml:"server"`
-		Port     int    `yaml:"port"`
-		Username string `yaml:"username"`
-		Password string `yaml:"password"`
-		UUID     string `yaml:"uuid"`
-		Cipher   string `yaml:"cipher"`
+		Type        string            `yaml:"type"`
+		Server      string            `yaml:"server"`
+		Port        int               `yaml:"port"`
+		Username    string            `yaml:"username"`
+		Password    string            `yaml:"password"`
+		UUID        string            `yaml:"uuid"`
+		Cipher      string            `yaml:"cipher"`
+		Network     string            `yaml:"network"`
+		TLS         interface{}       `yaml:"tls"`
+		SNI         string            `yaml:"sni"`
+		ServerName  string            `yaml:"servername"`
+		ALPN        []string          `yaml:"alpn"`
+		Flow        string            `yaml:"flow"`
+		ClientFP    string            `yaml:"client-fingerprint"`
+		RealityOpts map[string]string `yaml:"reality-opts"`
+		WSOpts      struct {
+			Path    string            `yaml:"path"`
+			Headers map[string]string `yaml:"headers"`
+		} `yaml:"ws-opts"`
+		Hysteria2 struct {
+			Password string `yaml:"password"`
+			SNI      string `yaml:"sni"`
+			Obfs     string `yaml:"obfs"`
+			ObfsPass string `yaml:"obfs-password"`
+		} `yaml:"hysteria2"`
 	} `yaml:"proxies"`
 }
 
@@ -616,7 +634,36 @@ func parseClashSubscriptionForMixed(content string) ([]string, bool) {
 		}
 		host := net.JoinHostPort(p.Server, strconv.Itoa(p.Port))
 		entry := ""
+		sni := strings.TrimSpace(p.SNI)
+		if sni == "" {
+			sni = strings.TrimSpace(p.ServerName)
+		}
 		switch proxyType {
+		case "vmess":
+			if p.UUID == "" {
+				continue
+			}
+			q := url.Values{}
+			q.Set("id", p.UUID)
+			if netw := strings.TrimSpace(p.Network); netw != "" {
+				q.Set("network", netw)
+			}
+			if path := strings.TrimSpace(p.WSOpts.Path); path != "" {
+				q.Set("path", path)
+			}
+			if hostHeader := strings.TrimSpace(p.WSOpts.Headers["Host"]); hostHeader != "" {
+				q.Set("host", hostHeader)
+			}
+			if tlsValue := normalizeClashTLS(p.TLS); tlsValue != "" {
+				q.Set("tls", tlsValue)
+			}
+			if sni != "" {
+				q.Set("sni", sni)
+			}
+			if len(p.ALPN) > 0 {
+				q.Set("alpn", strings.Join(p.ALPN, ","))
+			}
+			entry = fmt.Sprintf("vmess://%s?%s", host, q.Encode())
 		case "ss":
 			if p.Cipher == "" || p.Password == "" {
 				continue
@@ -626,12 +673,66 @@ func parseClashSubscriptionForMixed(content string) ([]string, bool) {
 			if p.UUID == "" {
 				continue
 			}
-			entry = fmt.Sprintf("vless://%s@%s", url.QueryEscape(p.UUID), host)
+			q := url.Values{}
+			q.Set("encryption", "none")
+			if netw := strings.TrimSpace(p.Network); netw != "" {
+				q.Set("type", netw)
+			}
+			if path := strings.TrimSpace(p.WSOpts.Path); path != "" {
+				q.Set("path", path)
+			}
+			if hostHeader := strings.TrimSpace(p.WSOpts.Headers["Host"]); hostHeader != "" {
+				q.Set("host", hostHeader)
+			}
+			if tlsValue := normalizeClashTLS(p.TLS); tlsValue != "" && tlsValue != "false" {
+				q.Set("security", "tls")
+			}
+			if sni != "" {
+				q.Set("sni", sni)
+			}
+			if len(p.ALPN) > 0 {
+				q.Set("alpn", strings.Join(p.ALPN, ","))
+			}
+			if flow := strings.TrimSpace(p.Flow); flow != "" {
+				q.Set("flow", flow)
+			}
+			if fp := strings.TrimSpace(p.ClientFP); fp != "" {
+				q.Set("fp", fp)
+			}
+			if pbk := strings.TrimSpace(p.RealityOpts["public-key"]); pbk != "" {
+				q.Set("pbk", pbk)
+			}
+			if sid := strings.TrimSpace(p.RealityOpts["short-id"]); sid != "" {
+				q.Set("sid", sid)
+			}
+			entry = fmt.Sprintf("vless://%s@%s?%s", url.QueryEscape(p.UUID), host, q.Encode())
 		case "hy2", "hysteria2":
-			if p.Password == "" {
+			password := strings.TrimSpace(p.Password)
+			if password == "" {
+				password = strings.TrimSpace(p.Hysteria2.Password)
+			}
+			if password == "" {
 				continue
 			}
-			entry = fmt.Sprintf("%s://%s@%s", proxyType, url.QueryEscape(p.Password), host)
+			q := url.Values{}
+			if sni != "" {
+				q.Set("sni", sni)
+			}
+			if len(p.ALPN) > 0 {
+				q.Set("alpn", strings.Join(p.ALPN, ","))
+			}
+			obfs := strings.TrimSpace(p.Hysteria2.Obfs)
+			if obfs != "" {
+				q.Set("obfs", obfs)
+			}
+			if obfsPassword := strings.TrimSpace(p.Hysteria2.ObfsPass); obfsPassword != "" {
+				q.Set("obfs-password", obfsPassword)
+			}
+			if q.Encode() != "" {
+				entry = fmt.Sprintf("%s://%s@%s?%s", proxyType, url.QueryEscape(password), host, q.Encode())
+			} else {
+				entry = fmt.Sprintf("%s://%s@%s", proxyType, url.QueryEscape(password), host)
+			}
 		case "trojan":
 			if p.Password == "" {
 				continue
@@ -805,11 +906,8 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 			authority = u.User.String() + "@" + authority
 		}
 		normalized := fmt.Sprintf("%s://%s", scheme, authority)
-		if scheme == "https" {
-			return normalized, true
-		}
-		if u.RawQuery != "" {
-			normalized += "?" + u.RawQuery
+		if filteredQuery := filterRawQueryWithWhitelist(u.RawQuery, scheme); filteredQuery != "" {
+			normalized += "?" + filteredQuery
 		}
 		if u.Fragment != "" && scheme != "vless" {
 			normalized += "#" + u.Fragment
@@ -818,6 +916,72 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 	}
 
 	return "socks5://" + line, true
+}
+
+func normalizeClashTLS(raw interface{}) string {
+	switch v := raw.(type) {
+	case bool:
+		if v {
+			return "tls"
+		}
+		return "false"
+	case string:
+		trimmed := strings.TrimSpace(strings.ToLower(v))
+		if trimmed == "" {
+			return ""
+		}
+		if trimmed == "true" {
+			return "tls"
+		}
+		return trimmed
+	default:
+		return ""
+	}
+}
+
+var mixedCommonQueryWhitelist = map[string]bool{
+	"sni": true, "alpn": true, "insecure": true, "security": true,
+	"host": true, "path": true, "type": true, "network": true,
+	"flow": true, "pbk": true, "sid": true, "fp": true,
+	"serviceName": true, "mode": true, "auth": true,
+	"obfs": true, "obfs-password": true,
+}
+
+var mixedSchemeQueryWhitelist = map[string]map[string]bool{
+	"vmess":     {"id": true, "aid": true, "net": true, "tls": true},
+	"vless":     {"encryption": true},
+	"hy2":       {"peer": true, "up": true, "down": true, "mport": true, "ports": true, "password": true},
+	"hysteria2": {"peer": true, "up": true, "down": true, "mport": true, "ports": true, "password": true},
+}
+
+func filterRawQueryWithWhitelist(rawQuery string, scheme string) string {
+	if strings.TrimSpace(rawQuery) == "" {
+		return ""
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return rawQuery
+	}
+	allowed := make(map[string]bool, len(mixedCommonQueryWhitelist)+8)
+	for k := range mixedCommonQueryWhitelist {
+		allowed[k] = true
+	}
+	for k := range mixedSchemeQueryWhitelist[scheme] {
+		allowed[k] = true
+	}
+	if len(allowed) == 0 {
+		return rawQuery
+	}
+	filtered := url.Values{}
+	for key, vals := range values {
+		if !allowed[key] {
+			continue
+		}
+		for _, v := range vals {
+			filtered.Add(key, v)
+		}
+	}
+	return filtered.Encode()
 }
 
 func normalizeVMESSURI(raw string) (string, bool) {
@@ -845,6 +1009,30 @@ type vmessNode struct {
 	Path string `json:"path,omitempty"`
 	TLS  string `json:"tls,omitempty"`
 	SNI  string `json:"sni,omitempty"`
+}
+
+type vlessNode struct {
+	Address   string
+	Port      string
+	UUID      string
+	SNI       string
+	Transport string
+	Host      string
+	Path      string
+	Security  string
+	Flow      string
+	RawQuery  string
+}
+
+type hy2Node struct {
+	Address      string
+	Port         string
+	Password     string
+	SNI          string
+	ALPN         string
+	Obfs         string
+	ObfsPassword string
+	RawQuery     string
 }
 
 func parseVMESSNode(raw string) (vmessNode, bool) {
@@ -925,6 +1113,76 @@ func parseVMESSNode(raw string) (vmessNode, bool) {
 	}
 	if node.Add == "" || node.Port == "" {
 		return vmessNode{}, false
+	}
+	return node, true
+}
+
+func parseVLESSNode(raw string) (vlessNode, bool) {
+	node := vlessNode{}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || strings.ToLower(u.Scheme) != "vless" {
+		return node, false
+	}
+	host := strings.TrimSpace(u.Hostname())
+	port := strings.TrimSpace(u.Port())
+	if host == "" || port == "" || u.User == nil {
+		return node, false
+	}
+	uuid := strings.TrimSpace(u.User.Username())
+	if uuid == "" {
+		return node, false
+	}
+	q := u.Query()
+	node = vlessNode{
+		Address:   host,
+		Port:      port,
+		UUID:      uuid,
+		SNI:       strings.TrimSpace(q.Get("sni")),
+		Transport: strings.TrimSpace(q.Get("type")),
+		Host:      strings.TrimSpace(q.Get("host")),
+		Path:      strings.TrimSpace(q.Get("path")),
+		Security:  strings.TrimSpace(q.Get("security")),
+		Flow:      strings.TrimSpace(q.Get("flow")),
+		RawQuery:  filterRawQueryWithWhitelist(u.RawQuery, "vless"),
+	}
+	if node.Transport == "" {
+		node.Transport = strings.TrimSpace(q.Get("network"))
+	}
+	return node, true
+}
+
+func parseHY2Node(raw string) (hy2Node, bool) {
+	node := hy2Node{}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return node, false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "hy2" && scheme != "hysteria2" {
+		return node, false
+	}
+	host := strings.TrimSpace(u.Hostname())
+	port := strings.TrimSpace(u.Port())
+	if host == "" || port == "" || u.User == nil {
+		return node, false
+	}
+	password := strings.TrimSpace(u.User.Username())
+	if password == "" {
+		return node, false
+	}
+	q := u.Query()
+	node = hy2Node{
+		Address:      host,
+		Port:         port,
+		Password:     password,
+		SNI:          strings.TrimSpace(q.Get("sni")),
+		ALPN:         strings.TrimSpace(q.Get("alpn")),
+		Obfs:         strings.TrimSpace(q.Get("obfs")),
+		ObfsPassword: strings.TrimSpace(q.Get("obfs-password")),
+		RawQuery:     filterRawQueryWithWhitelist(u.RawQuery, scheme),
+	}
+	if node.SNI == "" {
+		node.SNI = strings.TrimSpace(q.Get("peer"))
 	}
 	return node, true
 }
@@ -1691,12 +1949,31 @@ func fetchAndProcessMixedProxyBatches(batchSize int, onBatch func([]string)) err
 
 func parseMixedProxy(entry string) (scheme string, addr string, auth *proxy.Auth, httpAuthHeader string, err error) {
 	if strings.Contains(entry, "://") {
-		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(entry)), "vmess://") {
+		lower := strings.ToLower(strings.TrimSpace(entry))
+		if strings.HasPrefix(lower, "vmess://") {
 			node, ok := parseVMESSNode(entry)
 			if !ok {
 				return "", "", nil, "", fmt.Errorf("invalid vmess entry: %s", entry)
 			}
 			return "vmess", net.JoinHostPort(node.Add, node.Port), nil, "", nil
+		}
+		if strings.HasPrefix(lower, "vless://") {
+			node, ok := parseVLESSNode(entry)
+			if !ok {
+				return "", "", nil, "", fmt.Errorf("invalid vless entry: %s", entry)
+			}
+			return "vless", net.JoinHostPort(node.Address, node.Port), &proxy.Auth{User: node.UUID}, "", nil
+		}
+		if strings.HasPrefix(lower, "hy2://") || strings.HasPrefix(lower, "hysteria2://") {
+			node, ok := parseHY2Node(entry)
+			if !ok {
+				return "", "", nil, "", fmt.Errorf("invalid hy2 entry: %s", entry)
+			}
+			s := "hy2"
+			if strings.HasPrefix(lower, "hysteria2://") {
+				s = "hysteria2"
+			}
+			return s, net.JoinHostPort(node.Address, node.Port), &proxy.Auth{User: node.Password}, "", nil
 		}
 
 		u, parseErr := url.Parse(entry)
