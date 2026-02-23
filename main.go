@@ -1794,6 +1794,37 @@ type kernelNodeConfig struct {
 		Path          string
 		Host          string
 	}
+
+	VMESS struct {
+		UUID       string
+		AlterID    int
+		Security   string
+		Network    string
+		Host       string
+		Path       string
+		TLS        bool
+		ServerName string
+	}
+
+	VLESS struct {
+		UUID          string
+		Flow          string
+		Network       string
+		Host          string
+		Path          string
+		Security      string
+		ServerName    string
+		AllowInsecure bool
+	}
+
+	HY2 struct {
+		Password      string
+		ServerName    string
+		ALPN          string
+		Obfs          string
+		ObfsPassword  string
+		AllowInsecure bool
+	}
 }
 
 type mainstreamCoreInfo struct {
@@ -1868,6 +1899,71 @@ func (b *embeddedSSBackend) DialContext(ctx context.Context, node kernelNodeConf
 
 func (b *embeddedSSBackend) Info() mainstreamCoreInfo {
 	return b.info
+}
+
+func performNativeProtocolHealthCheck(ctx context.Context, node kernelNodeConfig) error {
+	address := net.JoinHostPort(node.Address, node.Port)
+	dialer := &net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return fmt.Errorf("native dial failed: %w", err)
+	}
+	defer conn.Close()
+
+	switch node.Protocol {
+	case "ss":
+		if strings.TrimSpace(node.SS.Cipher) == "" || strings.TrimSpace(node.SS.Password) == "" {
+			return fmt.Errorf("ss cipher/password missing")
+		}
+		return nil
+	case "vmess":
+		if !node.VMESS.TLS {
+			return nil
+		}
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: firstNonEmpty(node.VMESS.ServerName, node.Address), InsecureSkipVerify: true})
+		defer tlsConn.Close()
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return fmt.Errorf("vmess tls handshake failed: %w", err)
+		}
+		return nil
+	case "vless":
+		if strings.EqualFold(node.VLESS.Security, "tls") || strings.EqualFold(node.VLESS.Security, "reality") {
+			tlsConn := tls.Client(conn, &tls.Config{ServerName: firstNonEmpty(node.VLESS.ServerName, node.Address), InsecureSkipVerify: node.VLESS.AllowInsecure})
+			defer tlsConn.Close()
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				return fmt.Errorf("vless tls handshake failed: %w", err)
+			}
+		}
+		return nil
+	case "hy2", "hysteria2":
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: firstNonEmpty(node.HY2.ServerName, node.Address), InsecureSkipVerify: node.HY2.AllowInsecure, NextProtos: nonEmptyALPN(node.HY2.ALPN)})
+		defer tlsConn.Close()
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return fmt.Errorf("hy2 tls handshake failed: %w", err)
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+func nonEmptyALPN(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 type externalKernelNodeConfig struct {
@@ -2126,6 +2222,51 @@ func parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr string) (kernelNod
 		node.Trojan.Network = n.Network
 		node.Trojan.Path = n.Path
 		node.Trojan.Host = n.Host
+	case "vmess":
+		n, ok := parseVMESSNode(proxyEntry)
+		if !ok {
+			return kernelNodeConfig{}, fmt.Errorf("invalid vmess entry")
+		}
+		node.Address = n.Add
+		node.Port = n.Port
+		node.VMESS.UUID = strings.TrimSpace(n.ID)
+		if aid, err := strconv.Atoi(strings.TrimSpace(n.Aid)); err == nil {
+			node.VMESS.AlterID = aid
+		}
+		node.VMESS.Security = firstNonEmpty(strings.TrimSpace(n.Type), "auto")
+		node.VMESS.Network = firstNonEmpty(strings.TrimSpace(n.Net), "tcp")
+		node.VMESS.Host = strings.TrimSpace(n.Host)
+		node.VMESS.Path = strings.TrimSpace(n.Path)
+		node.VMESS.ServerName = firstNonEmpty(strings.TrimSpace(n.SNI), strings.TrimSpace(n.Host), strings.TrimSpace(n.Add))
+		node.VMESS.TLS = strings.EqualFold(strings.TrimSpace(n.TLS), "tls")
+	case "vless":
+		n, ok := parseVLESSNode(proxyEntry)
+		if !ok {
+			return kernelNodeConfig{}, fmt.Errorf("invalid vless entry")
+		}
+		node.Address = n.Address
+		node.Port = n.Port
+		node.VLESS.UUID = n.UUID
+		node.VLESS.Flow = n.Flow
+		node.VLESS.Network = firstNonEmpty(n.Transport, "tcp")
+		node.VLESS.Host = n.Host
+		node.VLESS.Path = n.Path
+		node.VLESS.Security = n.Security
+		node.VLESS.ServerName = firstNonEmpty(n.SNI, n.Host, n.Address)
+		node.VLESS.AllowInsecure = strings.Contains(strings.ToLower(n.RawQuery), "insecure=1") || strings.Contains(strings.ToLower(n.RawQuery), "allowinsecure=1")
+	case "hy2", "hysteria2":
+		n, ok := parseHY2Node(proxyEntry)
+		if !ok {
+			return kernelNodeConfig{}, fmt.Errorf("invalid hy2 entry")
+		}
+		node.Address = n.Address
+		node.Port = n.Port
+		node.HY2.Password = n.Password
+		node.HY2.ServerName = firstNonEmpty(n.SNI, n.Address)
+		node.HY2.ALPN = n.ALPN
+		node.HY2.Obfs = n.Obfs
+		node.HY2.ObfsPassword = n.ObfsPassword
+		node.HY2.AllowInsecure = strings.Contains(strings.ToLower(n.RawQuery), "insecure=1") || strings.Contains(strings.ToLower(n.RawQuery), "allowinsecure=1")
 	}
 
 	if err := validateKernelNodeConfig(node); err != nil {
@@ -2172,6 +2313,18 @@ func validateKernelNodeConfig(node kernelNodeConfig) error {
 			if strings.TrimSpace(node.Trojan.Path) == "" || !strings.HasPrefix(node.Trojan.Path, "/") {
 				return fmt.Errorf("invalid trojan ws path")
 			}
+		}
+	case "vmess":
+		if strings.TrimSpace(node.VMESS.UUID) == "" {
+			return fmt.Errorf("invalid vmess entry missing id")
+		}
+	case "vless":
+		if strings.TrimSpace(node.VLESS.UUID) == "" {
+			return fmt.Errorf("invalid vless entry missing uuid")
+		}
+	case "hy2", "hysteria2":
+		if strings.TrimSpace(node.HY2.Password) == "" {
+			return fmt.Errorf("invalid hy2 entry missing password")
 		}
 	}
 	return nil
@@ -2331,13 +2484,33 @@ func (d *mainstreamUpstreamDialer) DialContext(ctx context.Context, network, add
 type mainstreamTCPConnectAdapter struct{}
 
 func (a *mainstreamTCPConnectAdapter) CheckAvailability(ctx context.Context, proxyScheme, proxyEntry, proxyAddr string) error {
+	proxyScheme = strings.ToLower(strings.TrimSpace(proxyScheme))
+	if proxyScheme == "ssr" || proxyScheme == "trojan" {
+		cmdEnv := map[string]string{"ssr": "DP_HEALTHCHECK_SSR_CMD", "trojan": "DP_HEALTHCHECK_TROJAN_CMD"}
+		cmd := strings.TrimSpace(os.Getenv(cmdEnv[proxyScheme]))
+		if cmd == "" {
+			return fmt.Errorf("%w: %s health check command not configured", errMainstreamCoreUnavailable, proxyScheme)
+		}
+		return runKernelHealthCommand(ctx, cmd)
+	}
+
 	backend, ok := resolveMainstreamCoreBackend(config.Detector.Core)
 	if !ok {
+		if proxyScheme == "vmess" || proxyScheme == "vless" || proxyScheme == "hy2" || proxyScheme == "hysteria2" || proxyScheme == "ss" {
+			node, err := parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr)
+			if err != nil {
+				return err
+			}
+			return performNativeProtocolHealthCheck(ctx, node)
+		}
 		return fmt.Errorf("%w: detector.core is empty", errMainstreamAdapterUnavailable)
 	}
 	node, err := parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr)
 	if err != nil {
 		return err
+	}
+	if proxyScheme == "vmess" || proxyScheme == "vless" || proxyScheme == "hy2" || proxyScheme == "hysteria2" || (proxyScheme == "ss" && strings.EqualFold(backend.Info().Name, "embedded-ss")) {
+		return performNativeProtocolHealthCheck(ctx, node)
 	}
 	node.Core = backend.Info().Name
 	if healthAware, ok := backend.(mainstreamHealthAwareBackend); ok {
