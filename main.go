@@ -53,7 +53,17 @@ type Config struct {
 		StageTwo   HealthCheckSettings `yaml:"stage_two"`
 	} `yaml:"health_check_two_stage"`
 	HealthCheckProtocolOverrides map[string]TwoStageHealthCheckSettings `yaml:"health_check_protocol_overrides"`
-	Ports                        struct {
+	TLSParamPolicy               struct {
+		DefaultAllowInsecure bool     `yaml:"default_allow_insecure"`
+		DefaultALPN          []string `yaml:"default_alpn"`
+	} `yaml:"tls_param_policy"`
+	CertVerifyWhitelist struct {
+		Enabled            bool     `yaml:"enabled"`
+		AllowedHosts       []string `yaml:"allowed_hosts"`
+		RequireInsecure    bool     `yaml:"require_insecure"`
+		EnforceStrictAudit bool     `yaml:"enforce_strict_audit"`
+	} `yaml:"cert_verify_whitelist"`
+	Ports struct {
 		SOCKS5Strict      string `yaml:"socks5_strict"`
 		SOCKS5Relaxed     string `yaml:"socks5_relaxed"`
 		HTTPStrict        string `yaml:"http_strict"`
@@ -392,15 +402,15 @@ func loadConfig(filename string) (*Config, error) {
 		},
 		"ss": {
 			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 10, TLSHandshakeThresholdSeconds: 6},
-			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 45, TLSHandshakeThresholdSeconds: 15},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 60, TLSHandshakeThresholdSeconds: 20},
 		},
 		"ssr": {
 			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 10, TLSHandshakeThresholdSeconds: 6},
-			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 45, TLSHandshakeThresholdSeconds: 15},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 60, TLSHandshakeThresholdSeconds: 20},
 		},
 		"trojan": {
 			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 10, TLSHandshakeThresholdSeconds: 6},
-			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 45, TLSHandshakeThresholdSeconds: 15},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 60, TLSHandshakeThresholdSeconds: 20},
 		},
 		"vmess": {
 			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 6, TLSHandshakeThresholdSeconds: 3},
@@ -408,11 +418,11 @@ func loadConfig(filename string) (*Config, error) {
 		},
 		"vless": {
 			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 6, TLSHandshakeThresholdSeconds: 3},
-			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 15, TLSHandshakeThresholdSeconds: 8},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 30, TLSHandshakeThresholdSeconds: 12},
 		},
 		"hy2": {
 			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 6, TLSHandshakeThresholdSeconds: 3},
-			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 15, TLSHandshakeThresholdSeconds: 8},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 30, TLSHandshakeThresholdSeconds: 12},
 		},
 	}
 	for scheme, defaults := range defaultProtocolOverrides {
@@ -430,6 +440,12 @@ func loadConfig(filename string) (*Config, error) {
 			override.StageTwo.TLSHandshakeThresholdSeconds = defaults.StageTwo.TLSHandshakeThresholdSeconds
 		}
 		cfg.HealthCheckProtocolOverrides[scheme] = override
+	}
+	if len(cfg.TLSParamPolicy.DefaultALPN) == 0 {
+		cfg.TLSParamPolicy.DefaultALPN = []string{"h2", "http/1.1"}
+	}
+	if !cfg.CertVerifyWhitelist.EnforceStrictAudit {
+		cfg.CertVerifyWhitelist.EnforceStrictAudit = true
 	}
 	if cfg.ProxySwitchIntervalMin == "" {
 		cfg.ProxySwitchIntervalMin = "30"
@@ -832,6 +848,9 @@ func parseClashSubscriptionForStrictRelaxed(content string) ([]string, bool) {
 			continue
 		}
 		entry := fmt.Sprintf("%s://%s", proxyType, net.JoinHostPort(p.Server, strconv.Itoa(p.Port)))
+		if normalized, ok := normalizeMixedProxyEntry(entry); ok {
+			entry = normalized
+		}
 		if !seen[entry] {
 			seen[entry] = true
 			result = append(result, entry)
@@ -1321,6 +1340,7 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 		if !mixedSupportedSchemes[scheme] {
 			return "", false
 		}
+		applyCriticalTLSParams(scheme, u)
 		if !validateMainstreamURI(scheme, u) {
 			recordParseFailureReasonTag(scheme, "invalid_userinfo")
 			return "", false
@@ -1347,6 +1367,85 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 	return "socks5://" + line, true
 }
 
+func defaultALPNForScheme(scheme string) []string {
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "hy2", "hysteria2":
+		return []string{"h3"}
+	default:
+		if len(config.TLSParamPolicy.DefaultALPN) == 0 {
+			return []string{"h2", "http/1.1"}
+		}
+		return config.TLSParamPolicy.DefaultALPN
+	}
+}
+
+func applyCriticalTLSParams(scheme string, u *url.URL) {
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	if scheme != "vless" && scheme != "trojan" && scheme != "hy2" && scheme != "hysteria2" {
+		return
+	}
+	q := u.Query()
+	sni := strings.TrimSpace(q.Get("sni"))
+	if sni == "" {
+		sni = strings.TrimSpace(q.Get("server_name"))
+	}
+	if sni == "" {
+		sni = strings.TrimSpace(u.Hostname())
+	}
+	if sni != "" {
+		q.Set("sni", sni)
+		q.Set("server_name", sni)
+	}
+	if strings.TrimSpace(q.Get("alpn")) == "" {
+		q.Set("alpn", strings.Join(defaultALPNForScheme(scheme), ","))
+	}
+	insecure := "false"
+	if config.TLSParamPolicy.DefaultAllowInsecure {
+		insecure = "true"
+	}
+	if strings.TrimSpace(q.Get("insecure")) == "" {
+		q.Set("insecure", insecure)
+		q.Set("allow_insecure", insecure)
+	}
+	u.RawQuery = q.Encode()
+}
+
+func shouldAllowInsecureByWhitelist(proxyEntry string) (bool, string) {
+	if !config.CertVerifyWhitelist.Enabled || len(config.CertVerifyWhitelist.AllowedHosts) == 0 {
+		return false, ""
+	}
+	u, parseErr := url.Parse(strings.TrimSpace(proxyEntry))
+	if parseErr != nil {
+		return false, ""
+	}
+	_, addr, _, _, err := parseMixedProxy(proxyEntry)
+	if err != nil {
+		return false, ""
+	}
+	host, _, splitErr := net.SplitHostPort(addr)
+	if splitErr != nil {
+		host = addr
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	if config.CertVerifyWhitelist.RequireInsecure {
+		insecure := strings.ToLower(strings.TrimSpace(u.Query().Get("insecure")))
+		allowInsecure := strings.ToLower(strings.TrimSpace(u.Query().Get("allow_insecure")))
+		if insecure != "true" && allowInsecure != "true" {
+			return false, host
+		}
+	}
+	for _, item := range config.CertVerifyWhitelist.AllowedHosts {
+		allowed := strings.ToLower(strings.TrimSpace(item))
+		if allowed == "" {
+			continue
+		}
+		if host == allowed {
+			return true, host
+		}
+	}
+	return false, host
+}
+
 func normalizeClashTLS(raw interface{}) string {
 	switch v := raw.(type) {
 	case bool:
@@ -1369,7 +1468,7 @@ func normalizeClashTLS(raw interface{}) string {
 }
 
 var mixedCommonQueryWhitelist = map[string]bool{
-	"sni": true, "alpn": true, "insecure": true, "security": true,
+	"sni": true, "server_name": true, "alpn": true, "insecure": true, "allow_insecure": true, "security": true,
 	"host": true, "path": true, "type": true, "network": true,
 	"flow": true, "pbk": true, "sid": true, "fp": true,
 	"serviceName": true, "mode": true, "auth": true,
@@ -1731,9 +1830,18 @@ func validateMainstreamURI(scheme string, u *url.URL) bool {
 		if u.User == nil || strings.TrimSpace(u.User.Username()) == "" {
 			return false
 		}
+		if strings.TrimSpace(query.Get("sni")) == "" || strings.TrimSpace(query.Get("alpn")) == "" {
+			return false
+		}
 		return true
 	case "trojan", "hy2", "hysteria2":
-		return u.User != nil && strings.TrimSpace(u.User.Username()) != ""
+		if u.User == nil || strings.TrimSpace(u.User.Username()) == "" {
+			return false
+		}
+		if strings.TrimSpace(query.Get("sni")) == "" || strings.TrimSpace(query.Get("alpn")) == "" {
+			return false
+		}
+		return true
 	case "hysteria":
 		return strings.TrimSpace(query.Get("auth")) != ""
 	case "tuic":
@@ -4656,6 +4764,15 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 	if err != nil {
 		if verifyErr != nil {
 			category, reasonCode := classifyHealthFailure(verifyErr)
+			if category == healthFailureCertVerify {
+				allow, host := shouldAllowInsecureByWhitelist(proxyEntry)
+				if config.CertVerifyWhitelist.EnforceStrictAudit {
+					log.Printf("[STRICT-AUDIT] strict_mode=%t scheme=%s host=%s cert_verify_failed whitelist_allow=%t", strictMode, scheme, host, allow)
+				}
+				if allow {
+					return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone, ErrorCode: ""}, Latency: latency}
+				}
+			}
 			errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
 			logMixedHealthFailure("stage2", scheme, category, errorCode, mixedFailPhaseTLSHandshake, verifyErr)
 			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, verifyErr)}, Latency: latency}
@@ -4700,9 +4817,49 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 	return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone, ErrorCode: ""}, Latency: latency}
 }
 
+func runUDPEgressAudit(proxies []string) {
+	udpSchemes := map[string]bool{"hy2": true, "hysteria": true, "hysteria2": true, "tuic": true}
+	unique := make(map[string]string)
+	for _, entry := range proxies {
+		scheme, addr, _, _, err := parseMixedProxy(entry)
+		if err != nil {
+			continue
+		}
+		scheme = strings.ToLower(strings.TrimSpace(scheme))
+		if !udpSchemes[scheme] {
+			continue
+		}
+		unique[addr] = scheme
+	}
+	if len(unique) == 0 {
+		return
+	}
+	pass, fail := 0, 0
+	for addr, scheme := range unique {
+		conn, err := net.DialTimeout("udp", addr, 2*time.Second)
+		if err != nil {
+			fail++
+			log.Printf("[UDP-AUDIT] scheme=%s addr=%s status=blocked err=%v (请检查云防火墙/NACL UDP 出网放通)", scheme, addr, err)
+			continue
+		}
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		_, writeErr := conn.Write([]byte{0x00})
+		_ = conn.Close()
+		if writeErr != nil {
+			fail++
+			log.Printf("[UDP-AUDIT] scheme=%s addr=%s status=blocked err=%v (请检查云防火墙/NACL UDP 出网放通)", scheme, addr, writeErr)
+			continue
+		}
+		pass++
+		log.Printf("[UDP-AUDIT] scheme=%s addr=%s status=ok", scheme, addr)
+	}
+	log.Printf("[UDP-AUDIT-SUMMARY] targets=%d pass=%d fail=%d", len(unique), pass, fail)
+}
+
 func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 	mixedHealthErrorCodeMetrics.Reset()
 	mixedStageMetrics.Reset()
+	runUDPEgressAudit(proxies)
 	if config.HealthCheckTwoStage.Enabled {
 		return healthCheckMixedProxiesTwoStage(proxies)
 	}

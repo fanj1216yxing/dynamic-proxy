@@ -60,3 +60,36 @@ func TestParserRegressionBase64ExportLike(t *testing.T) {
 	}
 	assertSchemeCoverage(t, entries, "vmess", "vless", "hy2", "ss", "trojan")
 }
+
+func TestNormalizeMixedProxyEntryCompletesCriticalTLSParams(t *testing.T) {
+	config = Config{}
+	config.TLSParamPolicy.DefaultALPN = []string{"h2", "http/1.1"}
+	entry, ok := normalizeMixedProxyEntry("trojan://pass@example.com:443")
+	if !ok {
+		t.Fatalf("expected trojan entry to normalize")
+	}
+	if !strings.Contains(entry, "sni=example.com") {
+		t.Fatalf("expected sni filled, got %s", entry)
+	}
+	if !strings.Contains(entry, "alpn=h2%2Chttp%2F1.1") {
+		t.Fatalf("expected alpn filled, got %s", entry)
+	}
+	if !strings.Contains(entry, "insecure=false") {
+		t.Fatalf("expected insecure default false, got %s", entry)
+	}
+}
+
+func TestShouldAllowInsecureByWhitelist(t *testing.T) {
+	config = Config{}
+	config.CertVerifyWhitelist.Enabled = true
+	config.CertVerifyWhitelist.RequireInsecure = true
+	config.CertVerifyWhitelist.AllowedHosts = []string{"allowed.example.com"}
+	allowed, host := shouldAllowInsecureByWhitelist("trojan://p@allowed.example.com:443?sni=allowed.example.com&alpn=h2&insecure=true")
+	if !allowed || host != "allowed.example.com" {
+		t.Fatalf("expected allowed host to pass whitelist, got allowed=%t host=%s", allowed, host)
+	}
+	allowed, _ = shouldAllowInsecureByWhitelist("trojan://p@allowed.example.com:443?sni=allowed.example.com&alpn=h2")
+	if allowed {
+		t.Fatalf("expected missing insecure=true to be denied when require_insecure=true")
+	}
+}
