@@ -684,3 +684,111 @@ func TestParseSpecialProxyURLMixed_MainstreamMalformedSkipsFallback(t *testing.T
 		}
 	}
 }
+
+type adapterDialRecorder struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+func (r *adapterDialRecorder) add(v string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.entries = append(r.entries, v)
+}
+
+func (r *adapterDialRecorder) hasPrefix(prefix string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, v := range r.entries {
+		if strings.HasPrefix(v, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+type mockMainstreamAdapter struct {
+	targetAddr string
+	recorder   *adapterDialRecorder
+}
+
+func (a *mockMainstreamAdapter) DialContext(ctx context.Context, proxyScheme, proxyEntry, proxyAddr, network, addr string) (net.Conn, error) {
+	if a.recorder != nil {
+		a.recorder.add(proxyScheme + "|" + proxyEntry + "|" + proxyAddr + "|" + addr)
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, a.targetAddr)
+}
+
+func TestMainstreamHealthChecks_UseAdapterDialBranchForSSSSRAndTrojan(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	oldFactory := mainstreamAdapterFactory
+	oldURL := mixedHealthCheckURL
+	oldConfig := config
+	defer func() {
+		mainstreamAdapterFactory = oldFactory
+		mixedHealthCheckURL = oldURL
+		config = oldConfig
+	}()
+
+	targetAddr := strings.TrimPrefix(srv.URL, "http://")
+	recorder := &adapterDialRecorder{}
+	mainstreamAdapterFactory = func() mainstreamDialAdapter {
+		return &mockMainstreamAdapter{targetAddr: targetAddr, recorder: recorder}
+	}
+	mixedHealthCheckURL = srv.URL
+	config.Detector.Core = "mihomo"
+
+	entries := []string{
+		"ss://YWVzLTI1Ni1nY206cGFzczEyMw@1.2.3.4:8388?plugin=v2ray-plugin&plugin-opts=mode%3Dwebsocket",
+		"ssr://ZXhhbXBsZS5jb206ODQ0MzphdXRoX3NoYTFfdjQ6YWVzLTI1Ni1jZmI6dGxzMS4yX3RpY2tldF9hdXRoOmNIZGtNVEl6Lz9vYmZzcGFyYW09YjJKbWN3JnByb3RvcGFyYW09Y0hKdmRHOQ",
+		"trojan://secret@8.8.8.8:443?sni=cdn.example.com&alpn=h2%2Ch3&allowInsecure=1&type=ws&path=%2Ftr",
+	}
+
+	for _, entry := range entries {
+		stage1 := checkMainstreamProxyHealthStage1(entry, HealthCheckSettings{TotalTimeoutSeconds: 2, TLSHandshakeThresholdSeconds: 2})
+		if !stage1.Healthy {
+			t.Fatalf("stage1 should use adapter dial branch for %s, got %+v", entry, stage1)
+		}
+		stage2 := checkMainstreamProxyHealthStage2(entry, false, HealthCheckSettings{TotalTimeoutSeconds: 2, TLSHandshakeThresholdSeconds: 2})
+		if !stage2.Status.Healthy {
+			t.Fatalf("stage2 should use adapter dial branch for %s, got %+v", entry, stage2.Status)
+		}
+	}
+
+	for _, prefix := range []string{"ss|", "ssr|", "trojan|"} {
+		if !recorder.hasPrefix(prefix) {
+			t.Fatalf("expected adapter recorder to include %s calls, got %+v", prefix, recorder.entries)
+		}
+	}
+}
+
+func TestParseKernelNodeConfig_MapsSSSSRAndTrojanFields(t *testing.T) {
+	ssNode, err := parseKernelNodeConfig("ss", "ss://YWVzLTI1Ni1nY206cGFzczEyMw@1.2.3.4:8388?plugin=v2ray-plugin&plugin-opts=mode%3Dwebsocket", "1.2.3.4:8388")
+	if err != nil {
+		t.Fatalf("parse ss kernel node failed: %v", err)
+	}
+	if ssNode.SS.Cipher != "aes-256-gcm" || ssNode.SS.Password != "pass123" || ssNode.SS.Plugin != "v2ray-plugin" || ssNode.SS.PluginOpts != "mode=websocket" {
+		t.Fatalf("unexpected ss node mapping: %+v", ssNode.SS)
+	}
+
+	ssrNode, err := parseKernelNodeConfig("ssr", "ssr://ZXhhbXBsZS5jb206ODQ0MzphdXRoX3NoYTFfdjQ6YWVzLTI1Ni1jZmI6dGxzMS4yX3RpY2tldF9hdXRoOmNIZGtNVEl6Lz9vYmZzcGFyYW09YjJKbWN3JnByb3RvcGFyYW09Y0hKdmRHOQ", "example.com:8443")
+	if err != nil {
+		t.Fatalf("parse ssr kernel node failed: %v", err)
+	}
+	if ssrNode.SSR.Protocol != "auth_sha1_v4" || ssrNode.SSR.Obfs != "tls1.2_ticket_auth" || ssrNode.SSR.ProtocolParam != "proto" || ssrNode.SSR.ObfsParam != "obfs" {
+		t.Fatalf("unexpected ssr node mapping: %+v", ssrNode.SSR)
+	}
+
+	trojanNode, err := parseKernelNodeConfig("trojan", "trojan://secret@8.8.8.8:443?sni=cdn.example.com&alpn=h2%2Ch3&allowInsecure=1&type=ws&path=%2Ftr&host=ws.example.com", "8.8.8.8:443")
+	if err != nil {
+		t.Fatalf("parse trojan kernel node failed: %v", err)
+	}
+	if trojanNode.Trojan.SNI != "cdn.example.com" || len(trojanNode.Trojan.ALPN) != 2 || !trojanNode.Trojan.AllowInsecure || trojanNode.Trojan.Network != "ws" || trojanNode.Trojan.Path != "/tr" || trojanNode.Trojan.Host != "ws.example.com" {
+		t.Fatalf("unexpected trojan node mapping: %+v", trojanNode.Trojan)
+	}
+}

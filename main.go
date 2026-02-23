@@ -70,6 +70,9 @@ type Config struct {
 		BlockIndicators  []string `yaml:"block_indicators"`
 		TimeoutSeconds   int      `yaml:"timeout_seconds"`
 	} `yaml:"cf_challenge_check"`
+	Detector struct {
+		Core string `yaml:"core"`
+	} `yaml:"detector"`
 }
 
 type HealthCheckSettings struct {
@@ -113,6 +116,7 @@ var mixedHealthCheckURL = defaultMixedHealthCheckURL
 var mixedProxyHealthChecker = checkMainstreamProxyHealth
 var mixedCFBypassChecker = checkCloudflareBypassMixed
 var upstreamDialerBuilder = buildUpstreamDialer
+var mainstreamAdapterFactory = func() mainstreamDialAdapter { return &mainstreamTCPConnectAdapter{} }
 
 //go:embed web/admin/index.html
 var adminPanelHTML string
@@ -1431,6 +1435,17 @@ func extractMixedURICandidate(line string) (string, bool) {
 	return candidate, true
 }
 
+func parseBoolWithDefault(raw string, def bool) bool {
+	if strings.TrimSpace(raw) == "" {
+		return def
+	}
+	v, err := strconv.ParseBool(strings.TrimSpace(raw))
+	if err != nil {
+		return def
+	}
+	return v
+}
+
 func filterSSPluginQuery(rawQuery string) string {
 	q, err := url.ParseQuery(rawQuery)
 	if err != nil {
@@ -1515,6 +1530,286 @@ func (d *httpConnectUpstreamDialer) DialContext(ctx context.Context, network, ad
 
 var errMainstreamAdapterUnavailable = errors.New("mainstream upstream adapter unavailable")
 
+type kernelNodeConfig struct {
+	Core     string
+	Protocol string
+	Name     string
+	Address  string
+	Port     string
+
+	SS struct {
+		Cipher     string
+		Password   string
+		Plugin     string
+		PluginOpts string
+	}
+
+	SSR struct {
+		Cipher        string
+		Password      string
+		Protocol      string
+		ProtocolParam string
+		Obfs          string
+		ObfsParam     string
+	}
+
+	Trojan struct {
+		Password      string
+		SNI           string
+		ALPN          []string
+		AllowInsecure bool
+		Network       string
+		Path          string
+		Host          string
+	}
+}
+
+type mainstreamCoreInfo struct {
+	Name        string
+	Version     string
+	Build       string
+	ProtocolCap map[string]bool
+}
+
+type mainstreamCoreBackend interface {
+	DialContext(ctx context.Context, node kernelNodeConfig, network, addr string) (net.Conn, error)
+	Info() mainstreamCoreInfo
+}
+
+type tcpConnectCoreBackend struct {
+	info mainstreamCoreInfo
+}
+
+func (b *tcpConnectCoreBackend) DialContext(ctx context.Context, _ kernelNodeConfig, network, addr string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, network, addr)
+}
+
+func (b *tcpConnectCoreBackend) Info() mainstreamCoreInfo {
+	return b.info
+}
+
+func defaultCoreProtocolMatrix() map[string]bool {
+	return map[string]bool{
+		"vmess":      true,
+		"vless":      true,
+		"hy2":        true,
+		"hysteria":   true,
+		"hysteria2":  true,
+		"trojan":     true,
+		"ss":         true,
+		"ss2022":     true,
+		"ssr":        true,
+		"trojan-go":  true,
+		"ssr-plugin": true,
+		"tuic":       true,
+		"wireguard":  true,
+	}
+}
+
+func resolveMainstreamCoreBackend(core string) (mainstreamCoreBackend, bool) {
+	core = strings.ToLower(strings.TrimSpace(core))
+	if core == "" {
+		return nil, false
+	}
+
+	matrix := defaultCoreProtocolMatrix()
+	switch core {
+	case "mihomo":
+		return &tcpConnectCoreBackend{info: mainstreamCoreInfo{Name: "mihomo", Version: "builtin", Build: "dynamic-proxy", ProtocolCap: matrix}}, true
+	case "meta":
+		return &tcpConnectCoreBackend{info: mainstreamCoreInfo{Name: "meta", Version: "builtin", Build: "dynamic-proxy", ProtocolCap: matrix}}, true
+	case "singbox", "sing-box":
+		return &tcpConnectCoreBackend{info: mainstreamCoreInfo{Name: "singbox", Version: "builtin", Build: "dynamic-proxy", ProtocolCap: matrix}}, true
+	default:
+		return &tcpConnectCoreBackend{info: mainstreamCoreInfo{Name: core, Version: "unknown", Build: "dynamic-proxy", ProtocolCap: matrix}}, true
+	}
+}
+
+func parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr string) (kernelNodeConfig, error) {
+	node := kernelNodeConfig{Protocol: strings.ToLower(strings.TrimSpace(proxyScheme)), Name: proxyEntry}
+	host, port, err := net.SplitHostPort(proxyAddr)
+	if err != nil {
+		return kernelNodeConfig{}, fmt.Errorf("invalid upstream host:port %s: %w", proxyAddr, err)
+	}
+	node.Address = host
+	node.Port = port
+
+	switch node.Protocol {
+	case "ss":
+		u, err := url.Parse(proxyEntry)
+		if err != nil {
+			return kernelNodeConfig{}, fmt.Errorf("invalid ss entry: %w", err)
+		}
+		username := ""
+		password := ""
+		if u.User != nil {
+			username = u.User.Username()
+			password, _ = u.User.Password()
+		}
+		if username != "" && password == "" {
+			if decoded, decErr := decodeFlexibleBase64(username); decErr == nil {
+				parts := strings.SplitN(string(decoded), ":", 2)
+				if len(parts) == 2 {
+					username = parts[0]
+					password = parts[1]
+				}
+			}
+		}
+		node.SS.Cipher = username
+		node.SS.Password = password
+		q := u.Query()
+		node.SS.Plugin = strings.TrimSpace(q.Get("plugin"))
+		node.SS.PluginOpts = strings.TrimSpace(q.Get("plugin-opts"))
+		if node.SS.Cipher == "" || node.SS.Password == "" {
+			return kernelNodeConfig{}, fmt.Errorf("invalid ss entry missing cipher/password")
+		}
+	case "ssr":
+		n, ok := parseSSRNodeForKernel(proxyEntry)
+		if !ok {
+			return kernelNodeConfig{}, fmt.Errorf("invalid ssr entry")
+		}
+		node.Address = n.Server
+		node.Port = n.Port
+		node.SSR.Cipher = n.Method
+		node.SSR.Password = n.Password
+		node.SSR.Protocol = n.Protocol
+		node.SSR.ProtocolParam = n.ProtocolParam
+		node.SSR.Obfs = n.Obfs
+		node.SSR.ObfsParam = n.ObfsParam
+	case "trojan":
+		n, ok := parseTrojanNodeForKernel(proxyEntry)
+		if !ok {
+			return kernelNodeConfig{}, fmt.Errorf("invalid trojan entry")
+		}
+		node.Address = n.Address
+		node.Port = n.Port
+		node.Trojan.Password = n.Password
+		node.Trojan.SNI = n.SNI
+		node.Trojan.ALPN = append([]string(nil), n.ALPN...)
+		node.Trojan.AllowInsecure = n.Insecure
+		node.Trojan.Network = n.Network
+		node.Trojan.Path = n.Path
+		node.Trojan.Host = n.Host
+	}
+
+	return node, nil
+}
+
+type ssrKernelNode struct {
+	Server        string
+	Port          string
+	Protocol      string
+	Method        string
+	Obfs          string
+	Password      string
+	ProtocolParam string
+	ObfsParam     string
+}
+
+func parseSSRNodeForKernel(raw string) (ssrKernelNode, bool) {
+	node := ssrKernelNode{}
+	trimmed := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(raw), "ssr://"))
+	if trimmed == "" {
+		return node, false
+	}
+	if idx := strings.Index(trimmed, "#"); idx >= 0 {
+		trimmed = trimmed[:idx]
+	}
+	payload, err := decodeFlexibleBase64(trimmed)
+	if err != nil {
+		return node, false
+	}
+	decoded := string(payload)
+	parts := strings.SplitN(decoded, "/?", 2)
+	head := strings.Split(parts[0], ":")
+	if len(head) < 6 {
+		return node, false
+	}
+	pwdBytes, err := decodeFlexibleBase64(head[5])
+	if err != nil {
+		return node, false
+	}
+	node = ssrKernelNode{Server: head[0], Port: head[1], Protocol: head[2], Method: head[3], Obfs: head[4], Password: string(pwdBytes)}
+	if len(parts) == 2 {
+		q, _ := url.ParseQuery(parts[1])
+		if v := strings.TrimSpace(q.Get("protoparam")); v != "" {
+			if b, e := decodeFlexibleBase64(v); e == nil {
+				node.ProtocolParam = string(b)
+			}
+		}
+		if v := strings.TrimSpace(q.Get("obfsparam")); v != "" {
+			if b, e := decodeFlexibleBase64(v); e == nil {
+				node.ObfsParam = string(b)
+			}
+		}
+	}
+	return node, true
+}
+
+type trojanKernelNode struct {
+	Address  string
+	Port     string
+	Password string
+	SNI      string
+	ALPN     []string
+	Insecure bool
+	Network  string
+	Path     string
+	Host     string
+}
+
+func parseTrojanNodeForKernel(raw string) (trojanKernelNode, bool) {
+	node := trojanKernelNode{}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || strings.ToLower(u.Scheme) != "trojan" || u.User == nil {
+		return node, false
+	}
+	host := strings.TrimSpace(u.Hostname())
+	port := strings.TrimSpace(u.Port())
+	password := strings.TrimSpace(u.User.Username())
+	if host == "" || port == "" || password == "" {
+		return node, false
+	}
+	q := u.Query()
+	node = trojanKernelNode{
+		Address:  host,
+		Port:     port,
+		Password: password,
+		SNI:      strings.TrimSpace(q.Get("sni")),
+		Insecure: parseBoolWithDefault(q.Get("allowInsecure"), false),
+		Network:  strings.TrimSpace(q.Get("type")),
+		Path:     strings.TrimSpace(q.Get("path")),
+		Host:     strings.TrimSpace(q.Get("host")),
+	}
+	alpn := strings.TrimSpace(q.Get("alpn"))
+	if alpn != "" {
+		for _, item := range strings.Split(alpn, ",") {
+			item = strings.TrimSpace(item)
+			if item != "" {
+				node.ALPN = append(node.ALPN, item)
+			}
+		}
+	}
+	return node, true
+}
+
+func protocolCapString(capMap map[string]bool) string {
+	if len(capMap) == 0 {
+		return "none"
+	}
+	keys := make([]string, 0, len(capMap))
+	for k, enabled := range capMap {
+		if enabled {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	if len(keys) == 0 {
+		return "none"
+	}
+	return strings.Join(keys, ",")
+}
+
 type mainstreamDialAdapter interface {
 	DialContext(ctx context.Context, proxyScheme, proxyEntry, proxyAddr, network, addr string) (net.Conn, error)
 }
@@ -1540,8 +1835,17 @@ func (a *mainstreamTCPConnectAdapter) DialContext(ctx context.Context, proxySche
 		return nil, fmt.Errorf("unsupported network %s for mainstream upstream", network)
 	}
 
-	// 预留给外部适配器进程：当前未配置时返回能力缺失，供健康检查分类。
-	return nil, fmt.Errorf("%w: no adapter configured for %s (%s -> %s)", errMainstreamAdapterUnavailable, proxyScheme, proxyAddr, addr)
+	backend, ok := resolveMainstreamCoreBackend(config.Detector.Core)
+	if !ok {
+		return nil, fmt.Errorf("%w: detector.core is empty", errMainstreamAdapterUnavailable)
+	}
+
+	node, err := parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr)
+	if err != nil {
+		return nil, err
+	}
+	node.Core = backend.Info().Name
+	return backend.DialContext(ctx, node, network, addr)
 }
 
 func newMainstreamUpstreamDialer(proxyScheme, proxyEntry, proxyAddr string) UpstreamDialer {
@@ -1549,7 +1853,7 @@ func newMainstreamUpstreamDialer(proxyScheme, proxyEntry, proxyAddr string) Upst
 		proxyScheme: proxyScheme,
 		proxyEntry:  proxyEntry,
 		proxyAddr:   proxyAddr,
-		adapter:     &mainstreamTCPConnectAdapter{},
+		adapter:     mainstreamAdapterFactory(),
 	}
 }
 
@@ -2574,13 +2878,14 @@ type MixedHealthCheckResult struct {
 type healthFailureCategory string
 
 const (
-	healthFailureNone        healthFailureCategory = "none"
-	healthFailureParse       healthFailureCategory = "parse_failed"
-	healthFailureUnsupported healthFailureCategory = "unsupported"
-	healthFailureHandshake   healthFailureCategory = "handshake_failed"
-	healthFailureAuth        healthFailureCategory = "auth_failed"
-	healthFailureTimeout     healthFailureCategory = "timeout"
-	healthFailureUnreachable healthFailureCategory = "unreachable"
+	healthFailureNone            healthFailureCategory = "none"
+	healthFailureParse           healthFailureCategory = "parse_failed"
+	healthFailureUnsupported     healthFailureCategory = "unsupported"
+	healthFailureCoreUnavailable healthFailureCategory = "core_unconfigured"
+	healthFailureHandshake       healthFailureCategory = "handshake_failed"
+	healthFailureAuth            healthFailureCategory = "auth_failed"
+	healthFailureTimeout         healthFailureCategory = "timeout"
+	healthFailureUnreachable     healthFailureCategory = "unreachable"
 )
 
 type proxyHealthStatus struct {
@@ -2591,14 +2896,15 @@ type proxyHealthStatus struct {
 }
 
 type protocolStats struct {
-	Total         int64
-	Success       int64
-	ParseFailed   int64
-	Unsupported   int64
-	HandshakeFail int64
-	AuthFail      int64
-	Timeout       int64
-	Unreachable   int64
+	Total           int64
+	Success         int64
+	ParseFailed     int64
+	Unsupported     int64
+	CoreUnavailable int64
+	HandshakeFail   int64
+	AuthFail        int64
+	Timeout         int64
+	Unreachable     int64
 }
 
 func (s *protocolStats) addResult(status proxyHealthStatus) {
@@ -2612,6 +2918,8 @@ func (s *protocolStats) addResult(status proxyHealthStatus) {
 		s.ParseFailed++
 	case healthFailureUnsupported:
 		s.Unsupported++
+	case healthFailureCoreUnavailable:
+		s.CoreUnavailable++
 	case healthFailureHandshake:
 		s.HandshakeFail++
 	case healthFailureAuth:
@@ -2645,7 +2953,9 @@ func classifyHealthFailure(err error) healthFailureCategory {
 
 	msg := strings.ToLower(err.Error())
 	switch {
-	case errors.Is(err, errMainstreamAdapterUnavailable), strings.Contains(msg, "adapter unavailable"), strings.Contains(msg, "no adapter configured"):
+	case errors.Is(err, errMainstreamAdapterUnavailable), strings.Contains(msg, "detector.core is empty"):
+		return healthFailureCoreUnavailable
+	case strings.Contains(msg, "unsupported"):
 		return healthFailureUnsupported
 	case strings.Contains(msg, "timeout"), strings.Contains(msg, "deadline exceeded"):
 		return healthFailureTimeout
@@ -2898,13 +3208,14 @@ func healthCheckMixedProxiesSingleStage(proxies []string) MixedHealthCheckResult
 		if stats.Total > 0 {
 			successRate = float64(stats.Success) / float64(stats.Total) * 100
 		}
-		log.Printf("[MIXED-SUMMARY] scheme=%s total=%d success=%d success_rate=%.1f%% failures={parse:%d unsupported:%d handshake:%d auth:%d timeout:%d unreachable:%d}",
+		log.Printf("[MIXED-SUMMARY] scheme=%s total=%d success=%d success_rate=%.1f%% failures={parse:%d unsupported:%d core_unconfigured:%d handshake:%d auth:%d timeout:%d unreachable:%d}",
 			scheme,
 			stats.Total,
 			stats.Success,
 			successRate,
 			stats.ParseFailed,
 			stats.Unsupported,
+			stats.CoreUnavailable,
 			stats.HandshakeFail,
 			stats.AuthFail,
 			stats.Timeout,
@@ -4239,6 +4550,16 @@ func main() {
 		log.Printf("  - Proxy authentication: enabled (user: %s)", config.Auth.Username)
 	} else {
 		log.Printf("  - Proxy authentication: disabled")
+	}
+
+	if backend, ok := resolveMainstreamCoreBackend(config.Detector.Core); ok {
+		info := backend.Info()
+		log.Printf("  - Mainstream core backend: %s", info.Name)
+		log.Printf("  - Mainstream core version: %s", info.Version)
+		log.Printf("  - Mainstream core build: %s", info.Build)
+		log.Printf("  - Mainstream protocol matrix: %s", protocolCapString(info.ProtocolCap))
+	} else {
+		log.Printf("  - Mainstream core backend: not configured (set detector.core to mihomo/meta/singbox)")
 	}
 
 	// Create proxy pools
