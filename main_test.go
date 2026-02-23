@@ -308,3 +308,51 @@ func TestMixedSchedulerComparisonMetrics(t *testing.T) {
 		t.Fatalf("healthy count mismatch")
 	}
 }
+
+func TestMixedHealthSettingsForProtocol_UsesOverrides(t *testing.T) {
+	config = Config{}
+	config.HealthCheckTwoStage.StageOne = HealthCheckSettings{TotalTimeoutSeconds: 4, TLSHandshakeThresholdSeconds: 2}
+	config.HealthCheckTwoStage.StageTwo = HealthCheckSettings{TotalTimeoutSeconds: 8, TLSHandshakeThresholdSeconds: 4}
+	config.HealthCheckProtocolOverrides = map[string]TwoStageHealthCheckSettings{
+		"vmess": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 6, TLSHandshakeThresholdSeconds: 3},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 15, TLSHandshakeThresholdSeconds: 8},
+		},
+	}
+
+	stage1 := mixedHealthSettingsForProtocol("vmess", 1)
+	stage2 := mixedHealthSettingsForProtocol("vmess", 2)
+	fallback := mixedHealthSettingsForProtocol("socks5", 2)
+
+	if stage1.TotalTimeoutSeconds != 6 || stage1.TLSHandshakeThresholdSeconds != 3 {
+		t.Fatalf("unexpected vmess stage1 override: %+v", stage1)
+	}
+	if stage2.TotalTimeoutSeconds != 15 || stage2.TLSHandshakeThresholdSeconds != 8 {
+		t.Fatalf("unexpected vmess stage2 override: %+v", stage2)
+	}
+	if fallback.TotalTimeoutSeconds != 8 || fallback.TLSHandshakeThresholdSeconds != 4 {
+		t.Fatalf("unexpected fallback stage2 settings: %+v", fallback)
+	}
+}
+
+func TestHealthCheckMixedProxies_TwoStageStage1FastDrop(t *testing.T) {
+	proxyAddr, stop := startBlackholeServer(t)
+	defer stop()
+
+	config = Config{HealthCheckConcurrency: 2}
+	config.HealthCheckTwoStage.Enabled = true
+	config.HealthCheckTwoStage.StageOne = HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1}
+	config.HealthCheckTwoStage.StageTwo = HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1}
+	config.HealthCheckProtocolOverrides = map[string]TwoStageHealthCheckSettings{}
+
+	start := time.Now()
+	result := healthCheckMixedProxies([]string{"socks5://" + proxyAddr})
+	elapsed := time.Since(start)
+
+	if len(result.Healthy) != 0 {
+		t.Fatalf("expected stage1 drop for blackhole proxy")
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("two-stage mixed health check should stop quickly, got %v", elapsed)
+	}
+}

@@ -48,6 +48,7 @@ type Config struct {
 		StageOne HealthCheckSettings `yaml:"stage_one"`
 		StageTwo HealthCheckSettings `yaml:"stage_two"`
 	} `yaml:"health_check_two_stage"`
+	HealthCheckProtocolOverrides map[string]TwoStageHealthCheckSettings `yaml:"health_check_protocol_overrides"`
 	Ports struct {
 		SOCKS5Strict      string `yaml:"socks5_strict"`
 		SOCKS5Relaxed     string `yaml:"socks5_relaxed"`
@@ -74,6 +75,11 @@ type Config struct {
 type HealthCheckSettings struct {
 	TotalTimeoutSeconds          int `yaml:"total_timeout_seconds"`
 	TLSHandshakeThresholdSeconds int `yaml:"tls_handshake_threshold_seconds"`
+}
+
+type TwoStageHealthCheckSettings struct {
+	StageOne HealthCheckSettings `yaml:"stage_one"`
+	StageTwo HealthCheckSettings `yaml:"stage_two"`
 }
 
 type timeoutForwardDialer struct {
@@ -177,6 +183,39 @@ func loadConfig(filename string) (*Config, error) {
 	}
 	if cfg.HealthCheckTwoStage.StageTwo.TLSHandshakeThresholdSeconds <= 0 {
 		cfg.HealthCheckTwoStage.StageTwo.TLSHandshakeThresholdSeconds = 4
+	}
+	if cfg.HealthCheckProtocolOverrides == nil {
+		cfg.HealthCheckProtocolOverrides = make(map[string]TwoStageHealthCheckSettings)
+	}
+	defaultProtocolOverrides := map[string]TwoStageHealthCheckSettings{
+		"vmess": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 6, TLSHandshakeThresholdSeconds: 3},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 15, TLSHandshakeThresholdSeconds: 8},
+		},
+		"vless": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 6, TLSHandshakeThresholdSeconds: 3},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 15, TLSHandshakeThresholdSeconds: 8},
+		},
+		"hy2": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 6, TLSHandshakeThresholdSeconds: 3},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 15, TLSHandshakeThresholdSeconds: 8},
+		},
+	}
+	for scheme, defaults := range defaultProtocolOverrides {
+		override := cfg.HealthCheckProtocolOverrides[scheme]
+		if override.StageOne.TotalTimeoutSeconds <= 0 {
+			override.StageOne.TotalTimeoutSeconds = defaults.StageOne.TotalTimeoutSeconds
+		}
+		if override.StageOne.TLSHandshakeThresholdSeconds <= 0 {
+			override.StageOne.TLSHandshakeThresholdSeconds = defaults.StageOne.TLSHandshakeThresholdSeconds
+		}
+		if override.StageTwo.TotalTimeoutSeconds <= 0 {
+			override.StageTwo.TotalTimeoutSeconds = defaults.StageTwo.TotalTimeoutSeconds
+		}
+		if override.StageTwo.TLSHandshakeThresholdSeconds <= 0 {
+			override.StageTwo.TLSHandshakeThresholdSeconds = defaults.StageTwo.TLSHandshakeThresholdSeconds
+		}
+		cfg.HealthCheckProtocolOverrides[scheme] = override
 	}
 	if cfg.ProxySwitchIntervalMin == "" {
 		cfg.ProxySwitchIntervalMin = "30"
@@ -2552,6 +2591,50 @@ func classifyHealthFailure(err error) healthFailureCategory {
 }
 
 func checkMainstreamProxyHealth(proxyEntry string, strictMode bool) proxyHealthStatus {
+	return checkMainstreamProxyHealthStage2(proxyEntry, strictMode, config.HealthCheck).Status
+}
+
+type mixedStageCheckResult struct {
+	Status  proxyHealthStatus
+	Latency time.Duration
+}
+
+func mixedHealthTargetAddr() string {
+	u, err := url.Parse(mixedHealthCheckURL)
+	if err != nil || u.Host == "" {
+		return "www.google.com:443"
+	}
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		if strings.EqualFold(u.Scheme, "http") {
+			port = "80"
+		} else {
+			port = "443"
+		}
+	}
+	if host == "" {
+		host = "www.google.com"
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func mixedHealthSettingsForProtocol(scheme string, stage int) HealthCheckSettings {
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	override, ok := config.HealthCheckProtocolOverrides[scheme]
+	if !ok {
+		if stage == 1 {
+			return config.HealthCheckTwoStage.StageOne
+		}
+		return config.HealthCheckTwoStage.StageTwo
+	}
+	if stage == 1 {
+		return override.StageOne
+	}
+	return override.StageTwo
+}
+
+func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSettings) proxyHealthStatus {
 	dialer, scheme, err := buildUpstreamDialer(proxyEntry)
 	if scheme == "" {
 		scheme = "unknown"
@@ -2563,32 +2646,73 @@ func checkMainstreamProxyHealth(proxyEntry string, strictMode bool) proxyHealthS
 		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: classifyHealthFailure(err), Reason: err.Error()}
 	}
 
-	totalTimeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
-	threshold := time.Duration(config.HealthCheck.TLSHandshakeThresholdSeconds) * time.Second
+	totalTimeout := time.Duration(settings.TotalTimeoutSeconds) * time.Second
+	threshold := time.Duration(settings.TLSHandshakeThresholdSeconds) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
 	defer cancel()
 
 	start := time.Now()
-	conn, err := dialer.DialContext(ctx, "tcp", "www.google.com:443")
+	conn, err := dialer.DialContext(ctx, "tcp", mixedHealthTargetAddr())
 	if err != nil {
 		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: classifyHealthFailure(err), Reason: err.Error()}
 	}
-	defer conn.Close()
-
-	tlsConn := tls.Client(conn, &tls.Config{ServerName: "www.google.com", InsecureSkipVerify: !strictMode})
-	if err := tlsConn.Handshake(); err != nil {
-		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: classifyHealthFailure(err), Reason: err.Error()}
-	}
-	_ = tlsConn.Close()
+	_ = conn.Close()
 
 	if time.Since(start) > threshold {
-		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, Reason: "tls handshake exceeded threshold"}
+		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, Reason: "stage1 tunnel connect exceeded threshold"}
 	}
 
 	return proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone}
 }
 
+func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settings HealthCheckSettings) mixedStageCheckResult {
+	dialer, scheme, err := buildUpstreamDialer(proxyEntry)
+	if scheme == "" {
+		scheme = "unknown"
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "invalid") {
+			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, Reason: err.Error()}}
+		}
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: classifyHealthFailure(err), Reason: err.Error()}}
+	}
+
+	totalTimeout := time.Duration(settings.TotalTimeoutSeconds) * time.Second
+	threshold := time.Duration(settings.TLSHandshakeThresholdSeconds) * time.Second
+
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: !strictMode},
+	}
+	transport.DialContext = dialer.DialContext
+
+	client := &http.Client{Transport: transport, Timeout: totalTimeout}
+	start := time.Now()
+	resp, err := client.Get(mixedHealthCheckURL)
+	latency := time.Since(start)
+	if err != nil {
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: classifyHealthFailure(err), Reason: err.Error()}, Latency: latency}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 500 {
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureUnreachable, Reason: fmt.Sprintf("unexpected status: %d", resp.StatusCode)}, Latency: latency}
+	}
+
+	if latency > threshold {
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, Reason: "stage2 http verification exceeded threshold"}, Latency: latency}
+	}
+
+	return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone}, Latency: latency}
+}
+
 func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
+	if config.HealthCheckTwoStage.Enabled {
+		return healthCheckMixedProxiesTwoStage(proxies)
+	}
+	return healthCheckMixedProxiesSingleStage(proxies)
+}
+
+func healthCheckMixedProxiesSingleStage(proxies []string) MixedHealthCheckResult {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	proxies = reorderMixedHealthCheckQueue(proxies)
@@ -2739,6 +2863,160 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 
 	sort.Strings(cfPassHealthy)
 
+	return MixedHealthCheckResult{Healthy: mixedHealthy, CFPass: cfPassHealthy}
+}
+
+
+type mixedTwoStageStats struct {
+	Total      int64
+	Stage1Pass int64
+	Stage2Pass int64
+	DropReason map[string]int64
+}
+
+func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
+	proxies = reorderMixedHealthCheckQueue(proxies)
+	if len(proxies) == 0 {
+		return MixedHealthCheckResult{}
+	}
+
+	log.Printf("[MIXED-2STAGE] enabled stage1 timeout=%ds tls_threshold=%ds, stage2 timeout=%ds tls_threshold=%ds",
+		config.HealthCheckTwoStage.StageOne.TotalTimeoutSeconds,
+		config.HealthCheckTwoStage.StageOne.TLSHandshakeThresholdSeconds,
+		config.HealthCheckTwoStage.StageTwo.TotalTimeoutSeconds,
+		config.HealthCheckTwoStage.StageTwo.TLSHandshakeThresholdSeconds,
+	)
+
+	workerCount := config.HealthCheckConcurrency
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+
+	stageStats := make(map[string]*mixedTwoStageStats)
+	getStageStats := func(scheme string) *mixedTwoStageStats {
+		if scheme == "" {
+			scheme = "unknown"
+		}
+		st, ok := stageStats[scheme]
+		if !ok {
+			st = &mixedTwoStageStats{DropReason: make(map[string]int64)}
+			stageStats[scheme] = st
+		}
+		return st
+	}
+
+	stage1Candidates := make([]string, 0, len(proxies))
+	var mu sync.Mutex
+	jobs := make(chan string, workerCount*4)
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for entry := range jobs {
+				scheme := "unknown"
+				if parsedScheme, _, _, _, err := parseMixedProxy(entry); err == nil && parsedScheme != "" {
+					scheme = parsedScheme
+				}
+				settings := mixedHealthSettingsForProtocol(scheme, 1)
+				status := checkMainstreamProxyHealthStage1(entry, settings)
+				mu.Lock()
+				st := getStageStats(status.Scheme)
+				st.Total++
+				if status.Healthy {
+					st.Stage1Pass++
+					stage1Candidates = append(stage1Candidates, entry)
+				} else {
+					st.DropReason[string(status.Category)]++
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, entry := range proxies {
+		jobs <- entry
+	}
+	close(jobs)
+	wg.Wait()
+
+	log.Printf("[MIXED-2STAGE] stage1 complete: stage1_pass=%d/%d", len(stage1Candidates), len(proxies))
+	if len(stage1Candidates) == 0 {
+		protocols := make([]string, 0, len(stageStats))
+		for scheme := range stageStats {
+			protocols = append(protocols, scheme)
+		}
+		sort.Strings(protocols)
+		for _, scheme := range protocols {
+			st := stageStats[scheme]
+			log.Printf("[MIXED-2STAGE] scheme=%s stage1_pass=%d stage2_pass=%d drop_reason=%v", scheme, st.Stage1Pass, st.Stage2Pass, st.DropReason)
+		}
+		return MixedHealthCheckResult{}
+	}
+
+	mixedHealthy := make([]string, 0, len(stage1Candidates))
+	cfPassHealthy := make([]string, 0)
+	latencies := make([]time.Duration, 0, len(stage1Candidates))
+
+	jobs2 := make(chan string, workerCount*4)
+	wg = sync.WaitGroup{}
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for entry := range jobs2 {
+				scheme := "unknown"
+				if parsedScheme, _, _, _, err := parseMixedProxy(entry); err == nil && parsedScheme != "" {
+					scheme = parsedScheme
+				}
+				settings := mixedHealthSettingsForProtocol(scheme, 2)
+				result := checkMainstreamProxyHealthStage2(entry, false, settings)
+				mu.Lock()
+				st := getStageStats(result.Status.Scheme)
+				if result.Status.Healthy {
+					st.Stage2Pass++
+					mixedHealthy = append(mixedHealthy, entry)
+					latencies = append(latencies, result.Latency)
+					if config.CFChallengeCheck.Enabled && mixedCFBypassChecker(entry) {
+						cfPassHealthy = append(cfPassHealthy, entry)
+					}
+				} else {
+					st.DropReason[string(result.Status.Category)]++
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, entry := range stage1Candidates {
+		jobs2 <- entry
+	}
+	close(jobs2)
+	wg.Wait()
+
+	if len(latencies) > 0 {
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		q := func(p float64) time.Duration {
+			idx := int(float64(len(latencies)-1) * p)
+			return latencies[idx]
+		}
+		totalLatency := time.Duration(0)
+		for _, d := range latencies {
+			totalLatency += d
+		}
+		avgLatency := totalLatency / time.Duration(len(latencies))
+		log.Printf("[MIXED-2STAGE-LATENCY] count=%d p50=%s p90=%s p99=%s avg=%s", len(latencies), q(0.50), q(0.90), q(0.99), avgLatency)
+	}
+
+	protocols := make([]string, 0, len(stageStats))
+	for scheme := range stageStats {
+		protocols = append(protocols, scheme)
+	}
+	sort.Strings(protocols)
+	for _, scheme := range protocols {
+		st := stageStats[scheme]
+		log.Printf("[MIXED-2STAGE] scheme=%s stage1_pass=%d stage2_pass=%d drop_reason=%v", scheme, st.Stage1Pass, st.Stage2Pass, st.DropReason)
+	}
+
+	sort.Strings(cfPassHealthy)
 	return MixedHealthCheckResult{Healthy: mixedHealthy, CFPass: cfPassHealthy}
 }
 
