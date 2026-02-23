@@ -5,10 +5,12 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -899,5 +901,73 @@ func TestParseKernelNodeConfig_TrojanInsecureCompatibility(t *testing.T) {
 	}
 	if !node.Trojan.AllowInsecure {
 		t.Fatalf("expected insecure compatibility to map to allowInsecure")
+	}
+}
+
+func TestResolveMainstreamCoreBackend_UsesExternalKernelBackendForKnownCores(t *testing.T) {
+	t.Setenv("DP_MIHOMO_SIDECAR_ADDR", "127.0.0.1:18080")
+	t.Setenv("DP_META_SIDECAR_ADDR", "127.0.0.1:28080")
+	t.Setenv("DP_SINGBOX_SIDECAR_ADDR", "127.0.0.1:38080")
+
+	for _, core := range []string{"mihomo", "meta", "singbox"} {
+		backend, ok := resolveMainstreamCoreBackend(core)
+		if !ok {
+			t.Fatalf("expected backend for core %s", core)
+		}
+		if _, ok := backend.(*externalKernelBackend); !ok {
+			t.Fatalf("expected externalKernelBackend for core %s, got %T", core, backend)
+		}
+	}
+}
+
+func TestMainstreamUpstreamDialer_ExternalKernelUnavailableReturnsCoreError(t *testing.T) {
+	oldFactory := mainstreamAdapterFactory
+	oldConfig := config
+	defer func() {
+		mainstreamAdapterFactory = oldFactory
+		config = oldConfig
+	}()
+
+	_ = os.Unsetenv("DP_MIHOMO_SIDECAR_ADDR")
+	config.Detector.Core = "mihomo"
+	mainstreamAdapterFactory = func() mainstreamDialAdapter { return &mainstreamTCPConnectAdapter{} }
+
+	d := newMainstreamUpstreamDialer("trojan", "trojan://secret@1.1.1.1:443?sni=example.com", "1.1.1.1:443")
+	_, err := d.DialContext(context.Background(), "tcp", "example.com:443")
+	if err == nil {
+		t.Fatalf("expected unavailable core error")
+	}
+	if !errors.Is(err, errMainstreamCoreUnavailable) {
+		t.Fatalf("expected errMainstreamCoreUnavailable, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "code=core_unavailable") {
+		t.Fatalf("expected standard core error code, got %v", err)
+	}
+}
+
+func TestExternalKernelBackend_ProtocolSpecificHealthCheckCommands(t *testing.T) {
+	backend := &externalKernelBackend{
+		sidecarAddr: "127.0.0.1:9",
+		protocolHealthChecks: map[string]string{
+			"ss":     "exit 0",
+			"ssr":    "exit 0",
+			"trojan": "exit 0",
+		},
+	}
+
+	nodes := []kernelNodeConfig{
+		{Protocol: "ss", SS: struct {
+			Cipher     string
+			Password   string
+			Plugin     string
+			PluginOpts string
+		}{Cipher: "aes-256-gcm", Password: "pass"}},
+		{Protocol: "ssr"},
+		{Protocol: "trojan"},
+	}
+	for _, node := range nodes {
+		if err := backend.HealthCheck(context.Background(), node); err != nil {
+			t.Fatalf("expected protocol health check to pass for %s: %v", node.Protocol, err)
+		}
 	}
 }

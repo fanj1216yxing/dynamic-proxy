@@ -19,6 +19,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"regexp"
 	"sort"
@@ -1559,6 +1560,7 @@ func (d *httpConnectUpstreamDialer) DialContext(ctx context.Context, network, ad
 }
 
 var errMainstreamAdapterUnavailable = errors.New("mainstream upstream adapter unavailable")
+var errMainstreamCoreUnavailable = errors.New("mainstream core unavailable")
 
 type kernelNodeConfig struct {
 	Core     string
@@ -1606,6 +1608,10 @@ type mainstreamCoreBackend interface {
 	Info() mainstreamCoreInfo
 }
 
+type mainstreamHealthAwareBackend interface {
+	HealthCheck(ctx context.Context, node kernelNodeConfig) error
+}
+
 type tcpConnectCoreBackend struct {
 	info mainstreamCoreInfo
 }
@@ -1615,6 +1621,198 @@ func (b *tcpConnectCoreBackend) DialContext(ctx context.Context, _ kernelNodeCon
 }
 
 func (b *tcpConnectCoreBackend) Info() mainstreamCoreInfo {
+	return b.info
+}
+
+type embeddedSSBackend struct {
+	info mainstreamCoreInfo
+}
+
+func (b *embeddedSSBackend) HealthCheck(ctx context.Context, node kernelNodeConfig) error {
+	if node.Protocol != "ss" {
+		return fmt.Errorf("embedded ss backend unsupported protocol=%s", node.Protocol)
+	}
+	if strings.TrimSpace(node.SS.Cipher) == "" || strings.TrimSpace(node.SS.Password) == "" {
+		return fmt.Errorf("embedded ss backend missing cipher/password")
+	}
+	return nil
+}
+
+func (b *embeddedSSBackend) DialContext(ctx context.Context, node kernelNodeConfig, network, addr string) (net.Conn, error) {
+	if network != "tcp" {
+		return nil, fmt.Errorf("embedded ss backend unsupported network=%s", network)
+	}
+	if err := b.HealthCheck(ctx, node); err != nil {
+		return nil, err
+	}
+
+	proxyConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(node.Address, node.Port))
+	if err != nil {
+		return nil, err
+	}
+
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(node.SS.Cipher + ":" + node.SS.Password))
+	handshake := fmt.Sprintf("EMBEDDED-SS/1 cipher=%s auth=%x target=%s\n", node.SS.Cipher, h.Sum64(), addr)
+	if _, err := io.WriteString(proxyConn, handshake); err != nil {
+		_ = proxyConn.Close()
+		return nil, fmt.Errorf("embedded ss handshake failed: %w", err)
+	}
+
+	return proxyConn, nil
+}
+
+func (b *embeddedSSBackend) Info() mainstreamCoreInfo {
+	return b.info
+}
+
+type externalKernelNodeConfig struct {
+	Protocol string
+	Name     string
+	Server   string
+	Port     string
+
+	Shadowsocks struct {
+		Cipher   string
+		Password string
+	}
+
+	ShadowsocksR struct {
+		Cipher        string
+		Password      string
+		Protocol      string
+		ProtocolParam string
+		Obfs          string
+		ObfsParam     string
+	}
+
+	Trojan struct {
+		Password      string
+		SNI           string
+		ALPN          []string
+		AllowInsecure bool
+		Network       string
+		Path          string
+		Host          string
+	}
+}
+
+func mapKernelNodeToExternal(node kernelNodeConfig) externalKernelNodeConfig {
+	out := externalKernelNodeConfig{Protocol: node.Protocol, Name: node.Name, Server: node.Address, Port: node.Port}
+	out.Shadowsocks.Cipher = node.SS.Cipher
+	out.Shadowsocks.Password = node.SS.Password
+	out.ShadowsocksR.Cipher = node.SSR.Cipher
+	out.ShadowsocksR.Password = node.SSR.Password
+	out.ShadowsocksR.Protocol = node.SSR.Protocol
+	out.ShadowsocksR.ProtocolParam = node.SSR.ProtocolParam
+	out.ShadowsocksR.Obfs = node.SSR.Obfs
+	out.ShadowsocksR.ObfsParam = node.SSR.ObfsParam
+	out.Trojan.Password = node.Trojan.Password
+	out.Trojan.SNI = node.Trojan.SNI
+	out.Trojan.ALPN = append([]string(nil), node.Trojan.ALPN...)
+	out.Trojan.AllowInsecure = node.Trojan.AllowInsecure
+	out.Trojan.Network = node.Trojan.Network
+	out.Trojan.Path = node.Trojan.Path
+	out.Trojan.Host = node.Trojan.Host
+	return out
+}
+
+type externalKernelBackend struct {
+	info                 mainstreamCoreInfo
+	sidecarAddr          string
+	healthCheckCmd       string
+	protocolHealthChecks map[string]string
+}
+
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
+}
+
+func (b *externalKernelBackend) protocolHealthCommand(protocol string) string {
+	if b.protocolHealthChecks == nil {
+		return ""
+	}
+	return strings.TrimSpace(b.protocolHealthChecks[strings.ToLower(strings.TrimSpace(protocol))])
+}
+
+func runKernelHealthCommand(ctx context.Context, cmd string) error {
+	if strings.TrimSpace(cmd) == "" {
+		return nil
+	}
+	out, err := exec.CommandContext(ctx, "bash", "-lc", cmd).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("health check command failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (b *externalKernelBackend) HealthCheck(ctx context.Context, node kernelNodeConfig) error {
+	if strings.TrimSpace(b.sidecarAddr) == "" {
+		return fmt.Errorf("%w: code=core_unavailable sidecar_addr_missing core=%s", errMainstreamCoreUnavailable, b.info.Name)
+	}
+
+	if cmd := b.protocolHealthCommand(node.Protocol); cmd != "" {
+		if err := runKernelHealthCommand(ctx, cmd); err != nil {
+			return fmt.Errorf("%w: code=core_unavailable protocol=%s %v", errMainstreamCoreUnavailable, node.Protocol, err)
+		}
+		return nil
+	}
+	if strings.TrimSpace(b.healthCheckCmd) != "" {
+		if err := runKernelHealthCommand(ctx, b.healthCheckCmd); err != nil {
+			return fmt.Errorf("%w: code=core_unavailable %v", errMainstreamCoreUnavailable, err)
+		}
+		return nil
+	}
+
+	probeConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", b.sidecarAddr)
+	if err != nil {
+		return fmt.Errorf("%w: code=core_unavailable sidecar_probe_failed=%v", errMainstreamCoreUnavailable, err)
+	}
+	_ = probeConn.Close()
+	return nil
+}
+
+func (b *externalKernelBackend) DialContext(ctx context.Context, node kernelNodeConfig, network, addr string) (net.Conn, error) {
+	if network != "tcp" {
+		return nil, fmt.Errorf("external kernel backend unsupported network=%s", network)
+	}
+	if err := b.HealthCheck(ctx, node); err != nil {
+		return nil, err
+	}
+
+	_ = mapKernelNodeToExternal(node)
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", b.sidecarAddr)
+	if err != nil {
+		return nil, fmt.Errorf("%w: code=core_unavailable sidecar_dial_failed=%v", errMainstreamCoreUnavailable, err)
+	}
+
+	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n\r\n", addr, addr)
+	if _, err := io.WriteString(conn, connectReq); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("external kernel CONNECT write failed: %w", err)
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("external kernel CONNECT response invalid: %w", err)
+	}
+	if resp.StatusCode/100 != 2 {
+		_ = resp.Body.Close()
+		_ = conn.Close()
+		return nil, fmt.Errorf("external kernel CONNECT failed status=%s", resp.Status)
+	}
+	_ = resp.Body.Close()
+	return &bufferedConn{Conn: conn, r: br}, nil
+}
+
+func (b *externalKernelBackend) Info() mainstreamCoreInfo {
 	return b.info
 }
 
@@ -1645,11 +1843,13 @@ func resolveMainstreamCoreBackend(core string) (mainstreamCoreBackend, bool) {
 	matrix := defaultCoreProtocolMatrix()
 	switch core {
 	case "mihomo":
-		return &tcpConnectCoreBackend{info: mainstreamCoreInfo{Name: "mihomo", Version: "builtin", Build: "dynamic-proxy", ProtocolCap: matrix}}, true
+		return &externalKernelBackend{info: mainstreamCoreInfo{Name: "mihomo", Version: "builtin", Build: "dynamic-proxy", ProtocolCap: matrix}, sidecarAddr: strings.TrimSpace(os.Getenv("DP_MIHOMO_SIDECAR_ADDR")), healthCheckCmd: strings.TrimSpace(os.Getenv("DP_MIHOMO_HEALTHCHECK_CMD")), protocolHealthChecks: map[string]string{"ss": strings.TrimSpace(os.Getenv("DP_HEALTHCHECK_SS_CMD")), "ssr": strings.TrimSpace(os.Getenv("DP_HEALTHCHECK_SSR_CMD")), "trojan": strings.TrimSpace(os.Getenv("DP_HEALTHCHECK_TROJAN_CMD"))}}, true
 	case "meta":
-		return &tcpConnectCoreBackend{info: mainstreamCoreInfo{Name: "meta", Version: "builtin", Build: "dynamic-proxy", ProtocolCap: matrix}}, true
+		return &externalKernelBackend{info: mainstreamCoreInfo{Name: "meta", Version: "builtin", Build: "dynamic-proxy", ProtocolCap: matrix}, sidecarAddr: strings.TrimSpace(os.Getenv("DP_META_SIDECAR_ADDR")), healthCheckCmd: strings.TrimSpace(os.Getenv("DP_META_HEALTHCHECK_CMD")), protocolHealthChecks: map[string]string{"ss": strings.TrimSpace(os.Getenv("DP_HEALTHCHECK_SS_CMD")), "ssr": strings.TrimSpace(os.Getenv("DP_HEALTHCHECK_SSR_CMD")), "trojan": strings.TrimSpace(os.Getenv("DP_HEALTHCHECK_TROJAN_CMD"))}}, true
 	case "singbox", "sing-box":
-		return &tcpConnectCoreBackend{info: mainstreamCoreInfo{Name: "singbox", Version: "builtin", Build: "dynamic-proxy", ProtocolCap: matrix}}, true
+		return &externalKernelBackend{info: mainstreamCoreInfo{Name: "singbox", Version: "builtin", Build: "dynamic-proxy", ProtocolCap: matrix}, sidecarAddr: strings.TrimSpace(os.Getenv("DP_SINGBOX_SIDECAR_ADDR")), healthCheckCmd: strings.TrimSpace(os.Getenv("DP_SINGBOX_HEALTHCHECK_CMD")), protocolHealthChecks: map[string]string{"ss": strings.TrimSpace(os.Getenv("DP_HEALTHCHECK_SS_CMD")), "ssr": strings.TrimSpace(os.Getenv("DP_HEALTHCHECK_SSR_CMD")), "trojan": strings.TrimSpace(os.Getenv("DP_HEALTHCHECK_TROJAN_CMD"))}}, true
+	case "embedded-ss", "embedded_ss":
+		return &embeddedSSBackend{info: mainstreamCoreInfo{Name: "embedded-ss", Version: "builtin", Build: "dynamic-proxy", ProtocolCap: matrix}}, true
 	default:
 		return &tcpConnectCoreBackend{info: mainstreamCoreInfo{Name: core, Version: "unknown", Build: "dynamic-proxy", ProtocolCap: matrix}}, true
 	}
@@ -1855,10 +2055,35 @@ func (d *mainstreamUpstreamDialer) DialContext(ctx context.Context, network, add
 	if d.adapter == nil {
 		return nil, fmt.Errorf("%w: %s", errMainstreamAdapterUnavailable, d.proxyScheme)
 	}
+	if checker, ok := d.adapter.(interface {
+		CheckAvailability(ctx context.Context, proxyScheme, proxyEntry, proxyAddr string) error
+	}); ok {
+		if err := checker.CheckAvailability(ctx, d.proxyScheme, d.proxyEntry, d.proxyAddr); err != nil {
+			return nil, err
+		}
+	}
 	return d.adapter.DialContext(ctx, d.proxyScheme, d.proxyEntry, d.proxyAddr, network, addr)
 }
 
 type mainstreamTCPConnectAdapter struct{}
+
+func (a *mainstreamTCPConnectAdapter) CheckAvailability(ctx context.Context, proxyScheme, proxyEntry, proxyAddr string) error {
+	backend, ok := resolveMainstreamCoreBackend(config.Detector.Core)
+	if !ok {
+		return fmt.Errorf("%w: detector.core is empty", errMainstreamAdapterUnavailable)
+	}
+	node, err := parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr)
+	if err != nil {
+		return err
+	}
+	node.Core = backend.Info().Name
+	if healthAware, ok := backend.(mainstreamHealthAwareBackend); ok {
+		if err := healthAware.HealthCheck(ctx, node); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func (a *mainstreamTCPConnectAdapter) DialContext(ctx context.Context, proxyScheme, proxyEntry, proxyAddr, network, addr string) (net.Conn, error) {
 	if network != "tcp" {
@@ -3033,7 +3258,7 @@ func classifyHealthFailure(err error) (healthFailureCategory, string) {
 
 	msg := strings.ToLower(err.Error())
 	switch {
-	case errors.Is(err, errMainstreamAdapterUnavailable), strings.Contains(msg, "detector.core is empty"):
+	case errors.Is(err, errMainstreamAdapterUnavailable), errors.Is(err, errMainstreamCoreUnavailable), strings.Contains(msg, "detector.core is empty"):
 		return healthFailureCoreUnavailable, "core_unconfigured"
 	case strings.Contains(msg, "unsupported"):
 		return healthFailureUnsupported, "unsupported"
