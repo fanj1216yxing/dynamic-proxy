@@ -4121,6 +4121,33 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 	var mu sync.Mutex
 	jobs := make(chan string, workerCount*4)
 	var wg sync.WaitGroup
+	var stage1Checked int64
+	var stage1Pass int64
+	stage1Done := make(chan struct{})
+	go func(total int) {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		lastChecked := int64(0)
+		for {
+			select {
+			case <-stage1Done:
+				return
+			case <-ticker.C:
+				checked := atomic.LoadInt64(&stage1Checked)
+				if checked == lastChecked {
+					continue
+				}
+				lastChecked = checked
+				progress := 0.0
+				if total > 0 {
+					progress = float64(checked) / float64(total) * 100
+				}
+				pass := atomic.LoadInt64(&stage1Pass)
+				log.Printf("[MIXED-2STAGE] stage1 progress: %.1f%% (%d/%d), pass=%d", progress, checked, total, pass)
+			}
+		}
+	}(len(proxies))
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func() {
@@ -4138,10 +4165,12 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 				if status.Healthy {
 					st.Stage1Pass++
 					stage1Candidates = append(stage1Candidates, entry)
+					atomic.AddInt64(&stage1Pass, 1)
 				} else {
 					st.DropReason[string(status.Category)]++
 					mixedHealthErrorCodeMetrics.Add(status.ErrorCode)
 				}
+				atomic.AddInt64(&stage1Checked, 1)
 				mu.Unlock()
 			}
 		}()
@@ -4151,6 +4180,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 	}
 	close(jobs)
 	wg.Wait()
+	close(stage1Done)
 
 	log.Printf("[MIXED-2STAGE] stage1 complete: stage1_pass=%d/%d", len(stage1Candidates), len(proxies))
 	if len(stage1Candidates) == 0 {
@@ -4172,6 +4202,33 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 
 	jobs2 := make(chan string, workerCount*4)
 	wg = sync.WaitGroup{}
+	var stage2Checked int64
+	var stage2Pass int64
+	stage2Done := make(chan struct{})
+	go func(total int) {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		lastChecked := int64(0)
+		for {
+			select {
+			case <-stage2Done:
+				return
+			case <-ticker.C:
+				checked := atomic.LoadInt64(&stage2Checked)
+				if checked == lastChecked {
+					continue
+				}
+				lastChecked = checked
+				progress := 0.0
+				if total > 0 {
+					progress = float64(checked) / float64(total) * 100
+				}
+				pass := atomic.LoadInt64(&stage2Pass)
+				log.Printf("[MIXED-2STAGE] stage2 progress: %.1f%% (%d/%d), pass=%d", progress, checked, total, pass)
+			}
+		}
+	}(len(stage1Candidates))
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func() {
@@ -4188,6 +4245,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 				if result.Status.Healthy {
 					st.Stage2Pass++
 					mixedHealthy = append(mixedHealthy, entry)
+					atomic.AddInt64(&stage2Pass, 1)
 					latencies = append(latencies, result.Latency)
 					if config.CFChallengeCheck.Enabled && mixedCFBypassChecker(entry) {
 						cfPassHealthy = append(cfPassHealthy, entry)
@@ -4196,6 +4254,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 					st.DropReason[string(result.Status.Category)]++
 					mixedHealthErrorCodeMetrics.Add(result.Status.ErrorCode)
 				}
+				atomic.AddInt64(&stage2Checked, 1)
 				mu.Unlock()
 			}
 		}()
@@ -4205,6 +4264,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 	}
 	close(jobs2)
 	wg.Wait()
+	close(stage2Done)
 
 	if len(latencies) > 0 {
 		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
