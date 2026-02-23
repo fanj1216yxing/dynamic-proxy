@@ -1,12 +1,24 @@
 package main
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func resetRuntimeHealthForTest() {
 	runtimeHealth = newRuntimeHealthState()
+}
+
+func resetMixedStageMetricsForTest(t *testing.T) {
+	t.Helper()
+	original := mixedStageMetrics
+	mixedStageMetrics = newStagePromMetrics()
+	t.Cleanup(func() {
+		mixedStageMetrics = original
+	})
 }
 
 func assertSchemeCoverage(t *testing.T, entries []string, wanted ...string) {
@@ -136,5 +148,104 @@ func TestEvaluateMainstreamHealthAlertAndSLO(t *testing.T) {
 	})
 	if status3 != "ok" || len(reasons3) != 0 {
 		t.Fatalf("expected ok with no reasons, got %s (%v)", status3, reasons3)
+	}
+}
+
+func TestBuildStageFunnelByProtocolIncludesCheckedAndPass(t *testing.T) {
+	resetMixedStageMetricsForTest(t)
+
+	mixedStageMetrics.AddInput("vless")
+	mixedStageMetrics.AddInput("vless")
+	mixedStageMetrics.AddInput("trojan")
+	mixedStageMetrics.AddStageResult("vless", "stage1", true, "", 20*time.Millisecond)
+	mixedStageMetrics.AddStageResult("vless", "stage1", false, "DP-GEN-201", 0)
+	mixedStageMetrics.AddStageResult("vless", "stage2", false, "DP-GEN-201", 0)
+	mixedStageMetrics.AddStageResult("trojan", "stage1", false, "DP-TRJ-101", 0)
+
+	funnel := buildStageFunnelByProtocol()
+	vless := funnel["vless"]
+	if vless["input"] != 2 || vless["stage1"] != 2 || vless["stage2"] != 1 || vless["stage1_pass"] != 1 || vless["stage2_pass"] != 0 {
+		t.Fatalf("unexpected vless funnel: %#v", vless)
+	}
+	trojan := funnel["trojan"]
+	if trojan["input"] != 1 || trojan["stage1"] != 1 || trojan["stage2"] != 0 || trojan["stage1_pass"] != 0 || trojan["stage2_pass"] != 0 {
+		t.Fatalf("unexpected trojan funnel: %#v", trojan)
+	}
+}
+
+func TestStagePromMetricsConcurrentWriteConsistency(t *testing.T) {
+	m := newStagePromMetrics()
+	const workers = 8
+	const loops = 200
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < loops; i++ {
+				m.AddInput("ss")
+				healthy := (workerID+i)%2 == 0
+				m.AddStageResult("ss", "stage1", healthy, "DP-SS-201", time.Millisecond)
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	snapshot := m.Snapshot()
+	inputRaw, _ := snapshot["input"].(map[string]int64)
+	checkedRaw, _ := snapshot["checked"].(map[string]map[string]int64)
+	passRaw, _ := snapshot["pass"].(map[string]map[string]int64)
+
+	expectedTotal := int64(workers * loops)
+	if inputRaw["ss"] != expectedTotal {
+		t.Fatalf("unexpected input total: got=%d want=%d", inputRaw["ss"], expectedTotal)
+	}
+	if checkedRaw["ss"]["stage1"] != expectedTotal {
+		t.Fatalf("unexpected checked total: got=%d want=%d", checkedRaw["ss"]["stage1"], expectedTotal)
+	}
+	if passRaw["ss"]["stage1"] <= 0 || passRaw["ss"]["stage1"] >= expectedTotal {
+		t.Fatalf("unexpected pass total: got=%d expected between 1 and %d", passRaw["ss"]["stage1"], expectedTotal-1)
+	}
+}
+
+func TestClassifyHealthFailureCoreUnavailable(t *testing.T) {
+	err := fmt.Errorf("%w: code=core_unavailable sidecar_addr_missing core=singbox", errMainstreamCoreUnavailable)
+	category, reason := classifyHealthFailure(err)
+	if category != healthFailureCoreUnavailable || reason != "core_unconfigured" {
+		t.Fatalf("unexpected classification: category=%s reason=%s", category, reason)
+	}
+}
+
+func TestBuildStageFunnelCoverageAllMainstreamProtocols(t *testing.T) {
+	resetMixedStageMetricsForTest(t)
+	protocols := []string{"hy2", "hysteria", "hysteria2", "ss", "ssr", "trojan", "tuic", "vless"}
+	for i, protocol := range protocols {
+		mixedStageMetrics.AddInput(protocol)
+		stage1Healthy := i%3 != 0
+		mixedStageMetrics.AddStageResult(protocol, "stage1", stage1Healthy, "DP-GEN-201", 10*time.Millisecond)
+		if stage1Healthy {
+			mixedStageMetrics.AddStageResult(protocol, "stage2", i%2 == 0, "DP-GEN-201", 15*time.Millisecond)
+		}
+	}
+
+	funnel := buildStageFunnelByProtocol()
+	for _, protocol := range protocols {
+		row, ok := funnel[protocol]
+		if !ok {
+			t.Fatalf("protocol %s missing in funnel", protocol)
+		}
+		if row["input"] != 1 {
+			t.Fatalf("protocol %s input want=1 got=%d", protocol, row["input"])
+		}
+		if row["stage1"] != 1 {
+			t.Fatalf("protocol %s stage1 checked want=1 got=%d", protocol, row["stage1"])
+		}
+		if row["stage1_pass"] < 0 || row["stage1_pass"] > 1 {
+			t.Fatalf("protocol %s invalid stage1_pass=%d", protocol, row["stage1_pass"])
+		}
+		if row["stage2_pass"] < 0 || row["stage2_pass"] > row["stage2"] {
+			t.Fatalf("protocol %s invalid stage2_pass=%d stage2=%d", protocol, row["stage2_pass"], row["stage2"])
+		}
 	}
 }
