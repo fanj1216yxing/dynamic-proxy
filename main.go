@@ -1663,6 +1663,27 @@ type UpstreamDialer interface {
 	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
+type dialPhase struct {
+	ProxyDial  time.Duration
+	TCPConnect time.Duration
+}
+
+type dialPhaseContextKey struct{}
+
+func withDialPhase(ctx context.Context) (context.Context, *dialPhase) {
+	phase := &dialPhase{}
+	return context.WithValue(ctx, dialPhaseContextKey{}, phase), phase
+}
+
+func setDialPhase(ctx context.Context, phase dialPhase) {
+	v := ctx.Value(dialPhaseContextKey{})
+	recorder, ok := v.(*dialPhase)
+	if !ok || recorder == nil {
+		return
+	}
+	*recorder = phase
+}
+
 type socksUpstreamDialer struct {
 	proxyAddr string
 	auth      *proxy.Auth
@@ -1706,10 +1727,12 @@ func (d *socksUpstreamDialer) DialContext(ctx context.Context, network, addr str
 			adapterMetrics.AddDial("socks5", "error", "dial_failed", time.Since(start))
 			return nil, result.err
 		}
+		dialCost := time.Since(start)
+		setDialPhase(ctx, dialPhase{ProxyDial: dialCost, TCPConnect: dialCost})
 		if deadline, ok := ctx.Deadline(); ok {
 			_ = result.conn.SetDeadline(deadline)
 		}
-		adapterMetrics.AddDial("socks5", "success", "", time.Since(start))
+		adapterMetrics.AddDial("socks5", "success", "", dialCost)
 		return result.conn, nil
 	}
 }
@@ -3812,7 +3835,8 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 		errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_request")
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, reqErr)}}
 	}
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+	reqCtx, dialPhaseMetric := withDialPhase(req.Context())
+	req = req.WithContext(httptrace.WithClientTrace(reqCtx, &httptrace.ClientTrace{
 		DNSStart: func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
 		DNSDone: func(httptrace.DNSDoneInfo) {
 			if !dnsStart.IsZero() {
@@ -3874,9 +3898,13 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 		errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "stage2_tls_threshold_timeout")
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, errors.New("stage2 tls handshake exceeded threshold"))}, Latency: latency}
 	}
+	proxyDial := dialPhaseMetric.ProxyDial
+	if phase.TCPConnect == 0 && dialPhaseMetric.TCPConnect > 0 {
+		phase.TCPConnect = dialPhaseMetric.TCPConnect
+	}
 
-	log.Printf("[MIXED-TLS-PHASE] scheme=%s dns=%s tcp_connect=%s tls_clienthello=%s cert_verify=%s first_byte=%s",
-		scheme, phase.DNS, phase.TCPConnect, phase.TLSHello, phase.CertVerify, phase.FirstByte)
+	log.Printf("[MIXED-TLS-PHASE] scheme=%s dns=%s tcp_connect=%s proxy_dial=%s tls_clienthello=%s cert_verify=%s first_byte=%s",
+		scheme, phase.DNS, phase.TCPConnect, proxyDial, phase.TLSHello, phase.CertVerify, phase.FirstByte)
 
 	return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone, ErrorCode: ""}, Latency: latency}
 }
