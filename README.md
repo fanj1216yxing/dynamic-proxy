@@ -138,7 +138,7 @@ health_check_protocol_overrides:
 
 # 主流协议内核配置
 detector:
-  core: ""                 # 可选: mihomo | meta | singbox；为空时主流协议拨号不启用
+  core: "singbox"          # 建议显式设置已部署核心: mihomo | meta | singbox
 
 # 服务器端口
 ports:
@@ -171,7 +171,7 @@ auth:
 | `health_check_two_stage.stage_one.*` | 第一阶段快速筛选超时参数 | 4秒 / 2秒 |
 | `health_check_two_stage.stage_two.*` | 第二阶段精细检测超时参数 | 8秒 / 4秒 |
 | `health_check_protocol_overrides.<scheme>.*` | 协议专用两阶段超时（优先级最高） | 按协议建议值 |
-| `detector.core` | 主流协议内核后端（mihomo/meta/singbox） | 空（未启用） |
+| `detector.core` | 主流协议内核后端（mihomo/meta/singbox） | `singbox`（示例） |
 | `ports.socks5_strict` | SOCKS5服务器端口（启用SSL验证） | :17283 |
 | `ports.socks5_relaxed` | SOCKS5服务器端口（禁用SSL验证） | :17284 |
 | `ports.http_strict` | HTTP代理服务器端口（启用SSL验证） | :17285 |
@@ -191,6 +191,18 @@ auth:
 - **vmess/vless/hy2（平衡档）**：建议 `stage_one=6s`、`stage_two=15s`。
 
 > 命中策略优先级：`health_check_protocol_overrides` > `health_check_two_stage` > `health_check`。
+
+#### 外部核心 sidecar 环境变量
+
+当 `detector.core` 使用 `singbox` / `mihomo` / `meta` 时，建议至少配置对应 sidecar 地址：
+
+- `DP_SINGBOX_SIDECAR_ADDR`（或 `DP_MIHOMO_SIDECAR_ADDR` / `DP_META_SIDECAR_ADDR`）
+- `DP_SINGBOX_HEALTHCHECK_CMD`（或对应 `DP_MIHOMO_HEALTHCHECK_CMD` / `DP_META_HEALTHCHECK_CMD`，可选）
+- `DP_HEALTHCHECK_SS_CMD`
+- `DP_HEALTHCHECK_SSR_CMD`
+- `DP_HEALTHCHECK_TROJAN_CMD`
+
+程序启动时会输出 `[CORE-SELF-CHECK]` 摘要：核心类型、sidecar 地址、以及每个协议 healthcheck command 是否存在；若存在 `core_unconfigured` 风险会在首屏日志提示。
 
 ### 使用方法
 
