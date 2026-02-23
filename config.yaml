@@ -33,7 +33,7 @@ special_proxy_list_urls:
 health_check_concurrency: 2000
 
 # 代理池更新间隔（分钟）
-update_interval_minutes: 5
+update_interval_minutes: 360
 
 # 自动轮换间隔（分钟）
 # 默认 30，填 now 表示每次请求都轮换一次代理
