@@ -40,13 +40,15 @@ import (
 
 // Config represents the application configuration
 type Config struct {
-	ProxyListURLs          []string            `yaml:"proxy_list_urls"`
-	SpecialProxyListUrls   []string            `yaml:"special_proxy_list_urls"` // 支持复杂格式的代理URL列表
-	HealthCheckConcurrency int                 `yaml:"health_check_concurrency"`
-	UpdateIntervalMinutes  int                 `yaml:"update_interval_minutes"`
-	ProxySwitchIntervalMin string              `yaml:"proxy_switch_interval_min"`
-	HealthCheck            HealthCheckSettings `yaml:"health_check"`
-	HealthCheckTwoStage    struct {
+	ProxyListURLs           []string                `yaml:"proxy_list_urls"`
+	SubscriptionUseEnvProxy bool                    `yaml:"subscription_use_env_proxy"`
+	SubscriptionProxy       SubscriptionProxyConfig `yaml:"subscription_proxy"`
+	SpecialProxyListUrls    []string                `yaml:"special_proxy_list_urls"` // 支持复杂格式的代理URL列表
+	HealthCheckConcurrency  int                     `yaml:"health_check_concurrency"`
+	UpdateIntervalMinutes   int                     `yaml:"update_interval_minutes"`
+	ProxySwitchIntervalMin  string                  `yaml:"proxy_switch_interval_min"`
+	HealthCheck             HealthCheckSettings     `yaml:"health_check"`
+	HealthCheckTwoStage     struct {
 		Enabled    bool                `yaml:"enabled"`
 		StrictMode *bool               `yaml:"strict_mode"`
 		StageOne   HealthCheckSettings `yaml:"stage_one"`
@@ -111,6 +113,11 @@ type Config struct {
 	Alerting struct {
 		ZeroMainstreamToleranceCycles int `yaml:"zero_mainstream_tolerance_cycles"`
 	} `yaml:"alerting"`
+}
+
+type SubscriptionProxyConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	URL     string `yaml:"url"`
 }
 
 type HealthCheckSettings struct {
@@ -387,6 +394,53 @@ func retryBackoff(attempt int) time.Duration {
 var simpleProxyRegex = regexp.MustCompile(`([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})`)
 var mixedURITokenRegex = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://\S+)`)
 
+func normalizeSubscriptionProxyURL(raw string) (string, error) {
+	proxyURL := strings.TrimSpace(raw)
+	if proxyURL == "" {
+		return "", nil
+	}
+	if !strings.Contains(proxyURL, "://") {
+		proxyURL = "http://" + proxyURL
+	}
+
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid subscription_proxy.url: %w", err)
+	}
+
+	switch strings.ToLower(strings.TrimSpace(parsed.Scheme)) {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return "", fmt.Errorf("subscription_proxy.url must use http/https/socks5/socks5h scheme")
+	}
+
+	if strings.TrimSpace(parsed.Host) == "" {
+		return "", fmt.Errorf("subscription_proxy.url must include host:port")
+	}
+
+	return parsed.String(), nil
+}
+
+func resolveSubscriptionProxyTransport() (func(*http.Request) (*url.URL, error), string) {
+	if config.SubscriptionProxy.Enabled {
+		if proxyURL := strings.TrimSpace(config.SubscriptionProxy.URL); proxyURL != "" {
+			parsed, err := url.Parse(proxyURL)
+			if err == nil {
+				return http.ProxyURL(parsed), "config_override"
+			}
+			log.Printf("[CONFIG] invalid subscription_proxy.url=%q at runtime: %v, fallback to direct/env", proxyURL, err)
+		}
+		if config.SubscriptionUseEnvProxy {
+			return http.ProxyFromEnvironment, "env_proxy"
+		}
+		return nil, "direct"
+	}
+	if config.SubscriptionUseEnvProxy {
+		return http.ProxyFromEnvironment, "env_proxy"
+	}
+	return nil, "direct"
+}
+
 // loadConfig loads configuration from config.yaml
 func loadConfig(filename string) (*Config, error) {
 	data, err := os.ReadFile(filename)
@@ -566,6 +620,15 @@ func loadConfig(filename string) (*Config, error) {
 	cfg.ProtocolSLO.MinHealthy = normalizedSLO
 	if cfg.Alerting.ZeroMainstreamToleranceCycles <= 0 {
 		cfg.Alerting.ZeroMainstreamToleranceCycles = 1
+	}
+	cfg.SubscriptionProxy.URL = strings.TrimSpace(cfg.SubscriptionProxy.URL)
+	if normalizedProxyURL, err := normalizeSubscriptionProxyURL(cfg.SubscriptionProxy.URL); err != nil {
+		return nil, err
+	} else {
+		cfg.SubscriptionProxy.URL = normalizedProxyURL
+	}
+	if cfg.SubscriptionProxy.Enabled && cfg.SubscriptionProxy.URL == "" && !cfg.SubscriptionUseEnvProxy {
+		return nil, fmt.Errorf("subscription_proxy.enabled=true requires subscription_proxy.url or subscription_use_env_proxy=true")
 	}
 
 	if cfg.CFChallengeCheck.Enabled {
@@ -2957,38 +3020,53 @@ func (d *mainstreamUpstreamDialer) DialContext(ctx context.Context, network, add
 
 type mainstreamTCPConnectAdapter struct{}
 
+func supportsNativeAvailabilityFallback(proxyScheme string) bool {
+	switch strings.ToLower(strings.TrimSpace(proxyScheme)) {
+	case "vmess", "vless", "hy2", "hysteria", "hysteria2", "ss", "ssr", "trojan", "tuic", "wg", "wireguard":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldPreferNativeAvailabilityProbe(proxyScheme, backendName string) bool {
+	proxyScheme = strings.ToLower(strings.TrimSpace(proxyScheme))
+	backendName = strings.ToLower(strings.TrimSpace(backendName))
+	switch proxyScheme {
+	case "vmess", "vless", "hy2", "hysteria2":
+		return true
+	case "ss":
+		return backendName == "embedded-ss"
+	default:
+		return false
+	}
+}
+
 func (a *mainstreamTCPConnectAdapter) CheckAvailability(ctx context.Context, proxyScheme, proxyEntry, proxyAddr string) error {
 	proxyScheme = strings.ToLower(strings.TrimSpace(proxyScheme))
-	if proxyScheme == "ssr" || proxyScheme == "trojan" {
-		cmdEnv := map[string]string{"ssr": "DP_HEALTHCHECK_SSR_CMD", "trojan": "DP_HEALTHCHECK_TROJAN_CMD"}
-		cmd := strings.TrimSpace(os.Getenv(cmdEnv[proxyScheme]))
-		if cmd == "" {
-			return fmt.Errorf("%w: %s health check command not configured", errMainstreamCoreUnavailable, proxyScheme)
-		}
-		return runKernelHealthCommand(ctx, cmd)
-	}
-
-	backend, ok := resolveMainstreamCoreBackend(config.Detector.Core)
-	if !ok {
-		if proxyScheme == "vmess" || proxyScheme == "vless" || proxyScheme == "hy2" || proxyScheme == "hysteria2" || proxyScheme == "ss" {
-			node, err := parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr)
-			if err != nil {
-				return err
-			}
-			return performNativeProtocolHealthCheck(ctx, node)
-		}
-		return fmt.Errorf("%w: detector.core is empty", errMainstreamAdapterUnavailable)
-	}
 	node, err := parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr)
 	if err != nil {
 		return err
 	}
-	if proxyScheme == "vmess" || proxyScheme == "vless" || proxyScheme == "hy2" || proxyScheme == "hysteria2" || (proxyScheme == "ss" && strings.EqualFold(backend.Info().Name, "embedded-ss")) {
+
+	backend, ok := resolveMainstreamCoreBackend(config.Detector.Core)
+	if !ok {
+		if supportsNativeAvailabilityFallback(proxyScheme) {
+			return performNativeProtocolHealthCheck(ctx, node)
+		}
+		return fmt.Errorf("%w: detector.core is empty", errMainstreamAdapterUnavailable)
+	}
+
+	if shouldPreferNativeAvailabilityProbe(proxyScheme, backend.Info().Name) {
 		return performNativeProtocolHealthCheck(ctx, node)
 	}
+
 	node.Core = backend.Info().Name
 	if healthAware, ok := backend.(mainstreamHealthAwareBackend); ok {
 		if err := healthAware.HealthCheck(ctx, node); err != nil {
+			if category, _ := classifyHealthFailure(err); category == healthFailureCoreUnavailable && supportsNativeAvailabilityFallback(proxyScheme) {
+				return performNativeProtocolHealthCheck(ctx, node)
+			}
 			return err
 		}
 	}
@@ -3102,16 +3180,24 @@ func parseSpecialProxyURLMixed(content string) []string {
 	return proxies
 }
 
+func subscriptionHTTPClient() *http.Client {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
+	if proxyFunc, _ := resolveSubscriptionProxyTransport(); proxyFunc != nil {
+		transport.Proxy = proxyFunc
+	}
+
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+	}
+}
+
 func fetchProxyList() ([]string, error) {
 	log.Println("fetchProxyList: strict/relaxed SOCKS pool only (socks5/socks5h)")
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // Disable certificate verification
-			},
-		},
-	}
+	client := subscriptionHTTPClient()
 
 	allProxies := make([]string, 0)
 	proxySet := make(map[string]bool) // 用于去重
@@ -3214,12 +3300,7 @@ func fetchProxyList() ([]string, error) {
 
 func fetchMixedProxyList() ([]string, error) {
 	log.Println("fetchMixedProxyList: mixed multi-scheme pool (http/https/socks and mainstream schemes)")
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	client := subscriptionHTTPClient()
 
 	allProxies := make([]string, 0)
 	proxySet := make(map[string]bool)
@@ -3301,12 +3382,7 @@ func fetchAndProcessSocksProxyBatches(batchSize int, onBatch func([]string)) err
 		batchSize = healthCheckBatchSize
 	}
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	client := subscriptionHTTPClient()
 
 	seen := make(map[string]bool)
 	batch := make([]string, 0, batchSize)
@@ -3423,10 +3499,7 @@ func fetchAndProcessMixedProxyBatches(batchSize int, onBatch func([]string)) err
 		batchSize = healthCheckBatchSize
 	}
 
-	client := &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-	}
+	client := subscriptionHTTPClient()
 
 	seen := make(map[string]bool)
 	batch := make([]string, 0, batchSize)
@@ -4698,6 +4771,39 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 	defer cancel()
 
 	start := time.Now()
+	if md, ok := dialer.(*mainstreamUpstreamDialer); ok {
+		if md.adapter == nil {
+			err := fmt.Errorf("%w: %s", errMainstreamAdapterUnavailable, md.proxyScheme)
+			category, reasonCode := classifyHealthFailure(err)
+			errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
+			logMixedHealthFailure("stage1", scheme, category, errorCode, mixedFailPhaseDialerBuild, err)
+			return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}
+		}
+		if checker, ok := md.adapter.(interface {
+			CheckAvailability(ctx context.Context, proxyScheme, proxyEntry, proxyAddr string) error
+		}); ok {
+			if err := checker.CheckAvailability(ctx, md.proxyScheme, md.proxyEntry, md.proxyAddr); err != nil {
+				failPhase := mixedFailPhaseDialerBuild
+				if category, _ := classifyHealthFailure(err); category == healthFailureCoreUnavailable {
+					failPhase = mixedFailPhaseCoreCheck
+				}
+				category, reasonCode := classifyHealthFailure(err)
+				errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
+				logMixedHealthFailure("stage1", scheme, category, errorCode, failPhase, err)
+				return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}
+			}
+
+			if time.Since(start) > threshold {
+				errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "stage1_connect_timeout")
+				timeoutErr := errors.New("stage1 availability probe exceeded threshold")
+				logMixedHealthFailure("stage1", scheme, healthFailureTimeout, errorCode, mixedFailPhaseCoreCheck, timeoutErr)
+				return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, timeoutErr)}
+			}
+
+			return proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone, ErrorCode: ""}
+		}
+	}
+
 	conn, err := dialer.DialContext(ctx, "tcp", mixedHealthTargetAddr())
 	if err != nil {
 		category, reasonCode := classifyHealthFailure(err)
@@ -4741,6 +4847,47 @@ func checkMainstreamProxyHealthStage1WithHardTimeout(proxyEntry string, settings
 		logMixedHealthFailure("stage1", scheme, healthFailureTimeout, errorCode, mixedFailPhaseTCPConnect, timeoutErr)
 		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, timeoutErr)}
 	}
+}
+
+func tryStage2NativeFallbackOnCoreUnavailable(proxyEntry, scheme string, totalTimeout, latency time.Duration) (mixedStageCheckResult, bool) {
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	if !supportsNativeAvailabilityFallback(scheme) {
+		return mixedStageCheckResult{}, false
+	}
+
+	parsedScheme, proxyAddr, _, _, err := parseMixedProxy(proxyEntry)
+	if err != nil {
+		return mixedStageCheckResult{}, false
+	}
+	parsedScheme = strings.ToLower(strings.TrimSpace(parsedScheme))
+	if parsedScheme == "" {
+		parsedScheme = scheme
+	}
+	if !supportsNativeAvailabilityFallback(parsedScheme) {
+		return mixedStageCheckResult{}, false
+	}
+
+	node, err := parseKernelNodeConfig(parsedScheme, proxyEntry, proxyAddr)
+	if err != nil {
+		return mixedStageCheckResult{}, false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
+	defer cancel()
+
+	start := time.Now()
+	if err := performNativeProtocolHealthCheck(ctx, node); err != nil {
+		return mixedStageCheckResult{}, false
+	}
+	if latency <= 0 {
+		latency = time.Since(start)
+	}
+
+	log.Printf("[MIXED-2STAGE-FALLBACK] scheme=%s reason=core_unconfigured mode=native_probe", parsedScheme)
+	return mixedStageCheckResult{
+		Status:  proxyHealthStatus{Healthy: true, Scheme: parsedScheme, Category: healthFailureNone, ErrorCode: ""},
+		Latency: latency,
+	}, true
 }
 
 func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settings HealthCheckSettings) mixedStageCheckResult {
@@ -4877,6 +5024,11 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}, Latency: latency}
 		}
 		category, reasonCode := classifyHealthFailure(err)
+		if category == healthFailureCoreUnavailable {
+			if fallback, ok := tryStage2NativeFallbackOnCoreUnavailable(proxyEntry, scheme, totalTimeout, latency); ok {
+				return fallback
+			}
+		}
 		errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
 		phase := mixedFailPhaseHTTPRequest
 		if !tlsHandshakeDone {
@@ -7071,6 +7223,14 @@ func main() {
 	log.Printf("  - Proxy sources: %d", len(config.ProxyListURLs))
 	for i, url := range config.ProxyListURLs {
 		log.Printf("    [%d] %s", i+1, url)
+	}
+	log.Printf("  - Subscription env proxy: %t", config.SubscriptionUseEnvProxy)
+	_, subscriptionProxyMode := resolveSubscriptionProxyTransport()
+	log.Printf("  - Subscription fetch proxy mode: %s", subscriptionProxyMode)
+	if config.SubscriptionProxy.Enabled {
+		log.Printf("  - Subscription proxy override: enabled=true url=%s", strings.TrimSpace(config.SubscriptionProxy.URL))
+	} else {
+		log.Printf("  - Subscription proxy override: enabled=false")
 	}
 	log.Printf("  - Health check concurrency: %d", config.HealthCheckConcurrency)
 	log.Printf("  - Update interval: %d minutes", config.UpdateIntervalMinutes)

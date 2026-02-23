@@ -1,7 +1,13 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +25,10 @@ func resetMixedStageMetricsForTest(t *testing.T) {
 	t.Cleanup(func() {
 		mixedStageMetrics = original
 	})
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }
 
 func assertSchemeCoverage(t *testing.T, entries []string, wanted ...string) {
@@ -219,7 +229,7 @@ func TestClassifyHealthFailureCoreUnavailable(t *testing.T) {
 
 func TestBuildStageFunnelCoverageAllMainstreamProtocols(t *testing.T) {
 	resetMixedStageMetricsForTest(t)
-	protocols := []string{"hy2", "hysteria", "hysteria2", "ss", "ssr", "trojan", "tuic", "vless"}
+	protocols := []string{"hy2", "hysteria", "hysteria2", "ss", "ssr", "trojan", "tuic", "vless", "vmess"}
 	for i, protocol := range protocols {
 		mixedStageMetrics.AddInput(protocol)
 		stage1Healthy := i%3 != 0
@@ -247,5 +257,316 @@ func TestBuildStageFunnelCoverageAllMainstreamProtocols(t *testing.T) {
 		if row["stage2_pass"] < 0 || row["stage2_pass"] > row["stage2"] {
 			t.Fatalf("protocol %s invalid stage2_pass=%d stage2=%d", protocol, row["stage2_pass"], row["stage2"])
 		}
+	}
+}
+
+type testDirectDialer struct {
+	target string
+}
+
+func (d *testDirectDialer) DialContext(ctx context.Context, network, _ string) (net.Conn, error) {
+	var nd net.Dialer
+	return nd.DialContext(ctx, network, d.target)
+}
+
+func TestHealthCheckMixedProxiesTwoStageBoundaryInputZero(t *testing.T) {
+	resetMixedStageMetricsForTest(t)
+	config = Config{}
+	config.HealthCheckTwoStage.Enabled = true
+	config.HealthCheckTwoStage.StageOne = HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1}
+	config.HealthCheckTwoStage.StageTwo = HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1}
+	config.HealthCheckConcurrency = 1
+
+	result := healthCheckMixedProxiesTwoStage(nil)
+	if len(result.Healthy) != 0 || len(result.CFPass) != 0 {
+		t.Fatalf("expected empty result for input=0, got %#v", result)
+	}
+
+	funnel := buildStageFunnelByProtocol()
+	if len(funnel) != 0 {
+		t.Fatalf("expected empty funnel for input=0, got %#v", funnel)
+	}
+}
+
+func TestHealthCheckMixedProxiesTwoStageBoundaryInputOne(t *testing.T) {
+	resetMixedStageMetricsForTest(t)
+	config = Config{}
+	config.HealthCheckTwoStage.Enabled = true
+	config.HealthCheckTwoStage.StrictMode = boolPtr(false)
+	config.HealthCheckTwoStage.StageOne = HealthCheckSettings{TotalTimeoutSeconds: 2, TLSHandshakeThresholdSeconds: 2}
+	config.HealthCheckTwoStage.StageTwo = HealthCheckSettings{TotalTimeoutSeconds: 2, TLSHandshakeThresholdSeconds: 2}
+	config.HealthCheckConcurrency = 1
+	config.CFChallengeCheck.Enabled = false
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+	mixedHealthCheckURL = srv.URL
+	t.Cleanup(func() {
+		mixedHealthCheckURL = defaultMixedHealthCheckURL
+	})
+
+	origBuilder := upstreamDialerBuilder
+	upstreamDialerBuilder = func(entry string) (UpstreamDialer, string, error) {
+		if strings.TrimSpace(entry) == "" {
+			return nil, "unknown", fmt.Errorf("empty proxy")
+		}
+		target := strings.TrimPrefix(srv.URL, "http://")
+		return &testDirectDialer{target: target}, "vmess", nil
+	}
+	t.Cleanup(func() {
+		upstreamDialerBuilder = origBuilder
+	})
+
+	result := healthCheckMixedProxiesTwoStage([]string{"vmess://stage2.example.com:443?id=44444444-4444-4444-4444-444444444444&net=ws&tls=tls"})
+	if len(result.Healthy) != 1 {
+		t.Fatalf("expected exactly one healthy proxy for input=1, got=%d", len(result.Healthy))
+	}
+
+	funnel := buildStageFunnelByProtocol()
+	row, ok := funnel["vmess"]
+	if !ok {
+		t.Fatalf("expected vmess row in funnel, got %#v", funnel)
+	}
+	if row["input"] != 1 || row["stage1"] != 1 || row["stage1_pass"] != 1 || row["stage2"] != 1 || row["stage2_pass"] != 1 {
+		t.Fatalf("unexpected vmess funnel row: %#v", row)
+	}
+}
+
+func TestStageFunnelBoundaryLargeValues(t *testing.T) {
+	resetMixedStageMetricsForTest(t)
+	const total = 120000
+
+	for i := 0; i < total; i++ {
+		mixedStageMetrics.AddInput("vless")
+		mixedStageMetrics.AddStageResult("vless", "stage1", true, "", time.Millisecond)
+		if i%3 != 0 {
+			mixedStageMetrics.AddStageResult("vless", "stage2", true, "", 2*time.Millisecond)
+		}
+	}
+
+	funnel := buildStageFunnelByProtocol()
+	row := funnel["vless"]
+	if row["input"] != total {
+		t.Fatalf("unexpected input total for large value: got=%d want=%d", row["input"], total)
+	}
+	if row["stage1"] != total || row["stage1_pass"] != total {
+		t.Fatalf("unexpected stage1 totals for large value: %#v", row)
+	}
+	expectedStage2 := int64(total - total/3)
+	if row["stage2"] != expectedStage2 || row["stage2_pass"] != expectedStage2 {
+		t.Fatalf("unexpected stage2 totals for large value: got stage2=%d stage2_pass=%d want=%d", row["stage2"], row["stage2_pass"], expectedStage2)
+	}
+}
+
+func TestHealthCheckMixedProxiesTwoStageBoundaryInvalidProtocolFormat(t *testing.T) {
+	resetMixedStageMetricsForTest(t)
+	config = Config{}
+	config.HealthCheckTwoStage.Enabled = true
+	config.HealthCheckTwoStage.StageOne = HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1}
+	config.HealthCheckTwoStage.StageTwo = HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1}
+	config.HealthCheckConcurrency = 1
+
+	origBuilder := upstreamDialerBuilder
+	upstreamDialerBuilder = func(entry string) (UpstreamDialer, string, error) {
+		return nil, "unknown", errors.New("invalid proxy entry")
+	}
+	t.Cleanup(func() {
+		upstreamDialerBuilder = origBuilder
+	})
+
+	result := healthCheckMixedProxiesTwoStage([]string{"vmess://%%%invalid-format%%%"})
+	if len(result.Healthy) != 0 {
+		t.Fatalf("expected no healthy proxies for invalid format, got=%d", len(result.Healthy))
+	}
+
+	funnel := buildStageFunnelByProtocol()
+	row, ok := funnel["unknown"]
+	if !ok {
+		t.Fatalf("expected unknown row in funnel for invalid input, got %#v", funnel)
+	}
+	if row["input"] != 1 || row["stage1"] != 1 || row["stage1_pass"] != 0 || row["stage2"] != 0 || row["stage2_pass"] != 0 {
+		t.Fatalf("unexpected unknown funnel row for invalid input: %#v", row)
+	}
+}
+
+func TestCheckMainstreamProxyHealthStage2NativeFallbackOnCoreUnavailable(t *testing.T) {
+	config = Config{}
+	config.Detector.Core = "singbox"
+
+	oldSidecar, hadSidecar := os.LookupEnv("DP_SINGBOX_SIDECAR_ADDR")
+	_ = os.Unsetenv("DP_SINGBOX_SIDECAR_ADDR")
+	t.Cleanup(func() {
+		if hadSidecar {
+			_ = os.Setenv("DP_SINGBOX_SIDECAR_ADDR", oldSidecar)
+		} else {
+			_ = os.Unsetenv("DP_SINGBOX_SIDECAR_ADDR")
+		}
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer ln.Close()
+	done := make(chan struct{})
+	go func() {
+		for {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				select {
+				case <-done:
+					return
+				default:
+					return
+				}
+			}
+			_ = conn.Close()
+		}
+	}()
+	defer close(done)
+
+	stageSettings := HealthCheckSettings{TotalTimeoutSeconds: 2, TLSHandshakeThresholdSeconds: 2}
+	entry := fmt.Sprintf("ss://aes-256-gcm:ss-pass@%s", ln.Addr().String())
+	result := checkMainstreamProxyHealthStage2(entry, false, stageSettings)
+	if !result.Status.Healthy {
+		t.Fatalf("expected stage2 fallback to pass, got status=%#v", result.Status)
+	}
+}
+
+func TestHealthCheckMixedProxiesTwoStageAllDetectedProtocolsStage2NonZero(t *testing.T) {
+	resetMixedStageMetricsForTest(t)
+	config = Config{}
+	config.HealthCheckTwoStage.Enabled = true
+	config.HealthCheckTwoStage.StrictMode = boolPtr(false)
+	config.HealthCheckTwoStage.StageOne = HealthCheckSettings{TotalTimeoutSeconds: 2, TLSHandshakeThresholdSeconds: 2}
+	config.HealthCheckTwoStage.StageTwo = HealthCheckSettings{TotalTimeoutSeconds: 2, TLSHandshakeThresholdSeconds: 2}
+	config.HealthCheckConcurrency = 4
+	config.CFChallengeCheck.Enabled = false
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+	mixedHealthCheckURL = srv.URL
+	t.Cleanup(func() {
+		mixedHealthCheckURL = defaultMixedHealthCheckURL
+	})
+
+	origBuilder := upstreamDialerBuilder
+	upstreamDialerBuilder = func(entry string) (UpstreamDialer, string, error) {
+		target := strings.TrimPrefix(srv.URL, "http://")
+		return &testDirectDialer{target: target}, detectProxyScheme(entry, "unknown"), nil
+	}
+	t.Cleanup(func() {
+		upstreamDialerBuilder = origBuilder
+	})
+
+	proxies := []string{
+		"hy2://pass@hy2.example.com:443?sni=hy2.example.com",
+		"hysteria://auth@hy.example.com:443",
+		"hysteria2://pass@hy22.example.com:443?sni=hy22.example.com",
+		"ss://aes-256-gcm:ss-pass@ss.example.com:8388",
+		"ssr://user:pass@ssr.example.com:443",
+		"trojan://tr-pass@tr.example.com:443?sni=tr.example.com",
+		"tuic://user:pass@tuic.example.com:443",
+		"vless://22222222-2222-2222-2222-222222222222@vl.example.com:443?encryption=none&security=tls",
+		"vmess://vm.example.com:443?id=11111111-1111-1111-1111-111111111111&net=ws&tls=tls",
+	}
+
+	result := healthCheckMixedProxiesTwoStage(proxies)
+	if len(result.Healthy) != len(proxies) {
+		t.Fatalf("expected all proxies healthy in deterministic test, got=%d want=%d", len(result.Healthy), len(proxies))
+	}
+
+	funnel := buildStageFunnelByProtocol()
+	for _, protocol := range []string{"hy2", "hysteria", "hysteria2", "ss", "ssr", "trojan", "tuic", "vless", "vmess"} {
+		row, ok := funnel[protocol]
+		if !ok {
+			t.Fatalf("protocol %s missing in funnel: %#v", protocol, funnel)
+		}
+		if row["stage2_pass"] <= 0 {
+			t.Fatalf("protocol %s stage2_pass should be >0, got row=%#v", protocol, row)
+		}
+	}
+}
+
+func TestNormalizeSubscriptionProxyURLSupportsHostPort(t *testing.T) {
+	normalized, err := normalizeSubscriptionProxyURL("127.0.0.1:2081")
+	if err != nil {
+		t.Fatalf("normalizeSubscriptionProxyURL returned error: %v", err)
+	}
+	if normalized != "http://127.0.0.1:2081" {
+		t.Fatalf("unexpected normalized proxy url: %s", normalized)
+	}
+}
+
+func TestLoadConfigRejectsEmptySubscriptionProxyWhenEnabledWithoutEnvFallback(t *testing.T) {
+	dir := t.TempDir()
+	configPath := dir + string(os.PathSeparator) + "config.yaml"
+	content := strings.Join([]string{
+		"proxy_list_urls:",
+		"  - \"https://example.com/list.txt\"",
+		"subscription_use_env_proxy: false",
+		"subscription_proxy:",
+		"  enabled: true",
+		"  url: \"\"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+
+	_, err := loadConfig(configPath)
+	if err == nil {
+		t.Fatalf("expected loadConfig to fail for empty subscription_proxy.url when enabled")
+	}
+	if !strings.Contains(err.Error(), "subscription_proxy.enabled=true requires") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSubscriptionHTTPClientUsesConfiguredProxyURL(t *testing.T) {
+	dir := t.TempDir()
+	configPath := dir + string(os.PathSeparator) + "config.yaml"
+	content := strings.Join([]string{
+		"proxy_list_urls:",
+		"  - \"https://example.com/list.txt\"",
+		"subscription_use_env_proxy: false",
+		"subscription_proxy:",
+		"  enabled: true",
+		"  url: \"127.0.0.1:2081\"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	config = *cfg
+
+	client := subscriptionHTTPClient()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("unexpected transport type: %T", client.Transport)
+	}
+	if transport.Proxy == nil {
+		t.Fatalf("expected proxy function to be configured")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com", nil)
+	proxyURL, err := transport.Proxy(req)
+	if err != nil {
+		t.Fatalf("transport.Proxy returned error: %v", err)
+	}
+	if proxyURL == nil {
+		t.Fatalf("transport.Proxy returned nil proxy url")
+	}
+	if proxyURL.Scheme != "http" || proxyURL.Host != "127.0.0.1:2081" {
+		t.Fatalf("unexpected proxy url: %s", proxyURL.String())
 	}
 }
