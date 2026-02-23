@@ -49,14 +49,39 @@ health_check:
 # 两阶段健康检查（适合超大规模代理池）
 health_check_two_stage:
   enabled: true
-  # 第一阶段：快速淘汰
+  # 第一阶段：快速淘汰（仅建立隧道）
   stage_one:
-    total_timeout_seconds: 4
-    tls_handshake_threshold_seconds: 2
-  # 第二阶段：精细检测
+    total_timeout_seconds: 6
+    tls_handshake_threshold_seconds: 3
+  # 第二阶段：真实站点验证（TLS/HTTP）
   stage_two:
-    total_timeout_seconds: 8
-    tls_handshake_threshold_seconds: 4
+    total_timeout_seconds: 15
+    tls_handshake_threshold_seconds: 8
+
+# 协议级超时覆写（两阶段模型）
+# 未配置协议将回退到 health_check_two_stage 默认值
+health_check_protocol_overrides:
+  vmess:
+    stage_one:
+      total_timeout_seconds: 6
+      tls_handshake_threshold_seconds: 3
+    stage_two:
+      total_timeout_seconds: 15
+      tls_handshake_threshold_seconds: 8
+  vless:
+    stage_one:
+      total_timeout_seconds: 6
+      tls_handshake_threshold_seconds: 3
+    stage_two:
+      total_timeout_seconds: 15
+      tls_handshake_threshold_seconds: 8
+  hy2:
+    stage_one:
+      total_timeout_seconds: 6
+      tls_handshake_threshold_seconds: 3
+    stage_two:
+      total_timeout_seconds: 15
+      tls_handshake_threshold_seconds: 8
 
 # 服务器端口配置
 ports:
