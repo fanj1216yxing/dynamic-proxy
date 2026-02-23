@@ -125,6 +125,19 @@ health_check_protocol_overrides:
       total_timeout_seconds: 15
       tls_handshake_threshold_seconds: 8
 
+# 差异探测（黄金样本 + DNS 策略 + strict/relaxed A/B）
+differential_probe:
+  enabled: false
+  target_url: "https://www.google.com"
+  golden_sample_file: "golden-proxies.yaml"
+  samples_per_protocol: 5
+  compare_tls_policy: "relaxed" # client/server 对比时使用同一 TLS 策略: strict|relaxed
+  report_output_file: "diff-probe-report.json"
+  dns:
+    mode: "system" # system | doh | dot
+    doh_endpoint: "https://dns.google/resolve"
+    dot_server: "1.1.1.1:853"
+
 # 主流协议内核配置（用于 ss/ssr/trojan/vmess/vless/hy2 等拨号）
 detector:
   core: "singbox" # 已部署核心示例: mihomo | meta | singbox

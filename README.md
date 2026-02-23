@@ -136,6 +136,20 @@ health_check_protocol_overrides:
     stage_one: { total_timeout_seconds: 10, tls_handshake_threshold_seconds: 6 }
     stage_two: { total_timeout_seconds: 45, tls_handshake_threshold_seconds: 15 }
 
+
+# 差异探测（黄金样本 / DNS / strict_mode A/B）
+differential_probe:
+  enabled: false
+  target_url: "https://www.google.com"
+  golden_sample_file: "golden-proxies.yaml" # 每协议固化 5~10 条样本
+  samples_per_protocol: 5
+  compare_tls_policy: "relaxed"             # client/server 对比使用同一 TLS 策略
+  report_output_file: "diff-probe-report.json"
+  dns:
+    mode: "system"                           # system | doh | dot
+    doh_endpoint: "https://dns.google/resolve"
+    dot_server: "1.1.1.1:853"
+
 # 主流协议内核配置
 detector:
   core: "singbox"          # 建议显式设置已部署核心: mihomo | meta | singbox
@@ -443,3 +457,6 @@ axios.get('https://api.ipify.org', {
 ### 许可证
 
 MIT License
+
+
+- `POST /api/diagnostics/diff-probe`：触发一次差异探测，输出“客户端成功、服务端失败”的差异条目，包含 DNS IP、连接 IP、SNI、ALPN、证书摘要、握手耗时，以及 strict/relaxed A/B 结果。

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	_ "embed"
@@ -76,6 +77,19 @@ type Config struct {
 	Detector struct {
 		Core string `yaml:"core"`
 	} `yaml:"detector"`
+	DifferentialProbe struct {
+		Enabled            bool   `yaml:"enabled"`
+		TargetURL          string `yaml:"target_url"`
+		GoldenSampleFile   string `yaml:"golden_sample_file"`
+		SamplesPerProtocol int    `yaml:"samples_per_protocol"`
+		CompareTLSPolicy   string `yaml:"compare_tls_policy"`
+		ReportOutputFile   string `yaml:"report_output_file"`
+		DNS                struct {
+			Mode        string `yaml:"mode"`
+			DoHEndpoint string `yaml:"doh_endpoint"`
+			DoTServer   string `yaml:"dot_server"`
+		} `yaml:"dns"`
+	} `yaml:"differential_probe"`
 }
 
 type HealthCheckSettings struct {
@@ -427,6 +441,31 @@ func loadConfig(filename string) (*Config, error) {
 	}
 	if cfg.Ports.HTTPMainstreamMix == "" {
 		cfg.Ports.HTTPMainstreamMix = ":8085"
+	}
+	if cfg.DifferentialProbe.TargetURL == "" {
+		cfg.DifferentialProbe.TargetURL = defaultMixedHealthCheckURL
+	}
+	if cfg.DifferentialProbe.SamplesPerProtocol <= 0 {
+		cfg.DifferentialProbe.SamplesPerProtocol = 5
+	}
+	if cfg.DifferentialProbe.SamplesPerProtocol > 10 {
+		cfg.DifferentialProbe.SamplesPerProtocol = 10
+	}
+	if strings.TrimSpace(cfg.DifferentialProbe.GoldenSampleFile) == "" {
+		cfg.DifferentialProbe.GoldenSampleFile = "golden-proxies.yaml"
+	}
+	if strings.TrimSpace(cfg.DifferentialProbe.CompareTLSPolicy) == "" {
+		cfg.DifferentialProbe.CompareTLSPolicy = "relaxed"
+	}
+	cfg.DifferentialProbe.DNS.Mode = strings.ToLower(strings.TrimSpace(cfg.DifferentialProbe.DNS.Mode))
+	if cfg.DifferentialProbe.DNS.Mode == "" {
+		cfg.DifferentialProbe.DNS.Mode = "system"
+	}
+	if strings.TrimSpace(cfg.DifferentialProbe.DNS.DoHEndpoint) == "" {
+		cfg.DifferentialProbe.DNS.DoHEndpoint = "https://dns.google/resolve"
+	}
+	if strings.TrimSpace(cfg.DifferentialProbe.DNS.DoTServer) == "" {
+		cfg.DifferentialProbe.DNS.DoTServer = "1.1.1.1:853"
 	}
 	if cfg.Ports.HTTPCFMixed == "" {
 		cfg.Ports.HTTPCFMixed = ":8084"
@@ -5969,6 +6008,24 @@ func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool
 		})
 	})
 
+	mux.HandleFunc("/api/diagnostics/diff-probe", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "STATUS-DIFF-PROBE")
+			return
+		}
+		report, err := runDifferentialProbeReport()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(report)
+	})
+
 	mux.HandleFunc("/api/actions/refresh", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -6118,6 +6175,300 @@ func startProxyIntervalRotate(ctx context.Context, pool *ProxyPool, mode string,
 	}()
 }
 
+type goldenProxySet struct {
+	Samples map[string][]string `yaml:"samples"`
+}
+
+type differentialProbeEntry struct {
+	Protocol         string `json:"protocol"`
+	Proxy            string `json:"proxy"`
+	ComparePolicy    string `json:"compare_tls_policy"`
+	DNSMode          string `json:"dns_mode"`
+	ResolvedIP       string `json:"resolved_ip,omitempty"`
+	ConnectedIP      string `json:"connected_ip,omitempty"`
+	SNI              string `json:"sni,omitempty"`
+	ALPN             string `json:"alpn,omitempty"`
+	CertSHA256       string `json:"cert_sha256,omitempty"`
+	ClientSuccess    bool   `json:"client_success"`
+	ClientError      string `json:"client_error,omitempty"`
+	ServerSuccess    bool   `json:"server_success"`
+	ServerError      string `json:"server_error,omitempty"`
+	StrictSuccess    bool   `json:"strict_success"`
+	StrictError      string `json:"strict_error,omitempty"`
+	RelaxedSuccess   bool   `json:"relaxed_success"`
+	RelaxedError     string `json:"relaxed_error,omitempty"`
+	HandshakeLatency string `json:"handshake_latency,omitempty"`
+}
+
+type differentialProbeReport struct {
+	GeneratedAt time.Time                `json:"generated_at"`
+	TargetURL   string                   `json:"target_url"`
+	DNSMode     string                   `json:"dns_mode"`
+	Entries     []differentialProbeEntry `json:"entries"`
+	DiffOnly    []differentialProbeEntry `json:"client_ok_server_fail"`
+}
+
+func loadOrBuildGoldenProxySet() (map[string][]string, error) {
+	path := strings.TrimSpace(config.DifferentialProbe.GoldenSampleFile)
+	if path != "" {
+		if data, err := os.ReadFile(path); err == nil {
+			var gs goldenProxySet
+			if yaml.Unmarshal(data, &gs) == nil && len(gs.Samples) > 0 {
+				return gs.Samples, nil
+			}
+		}
+	}
+	perProtocol := config.DifferentialProbe.SamplesPerProtocol
+	if perProtocol <= 0 {
+		perProtocol = 5
+	}
+	if perProtocol > 10 {
+		perProtocol = 10
+	}
+	picked := make(map[string][]string)
+	err := fetchAndProcessMixedProxyBatches(2000, func(batch []string) {
+		for _, entry := range batch {
+			scheme, _, _, _, parseErr := parseMixedProxy(entry)
+			if parseErr != nil {
+				continue
+			}
+			scheme = strings.ToLower(strings.TrimSpace(scheme))
+			if len(picked[scheme]) >= perProtocol {
+				continue
+			}
+			picked[scheme] = append(picked[scheme], entry)
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	if path != "" && len(picked) > 0 {
+		out, _ := yaml.Marshal(goldenProxySet{Samples: picked})
+		_ = os.WriteFile(path, out, 0o644)
+	}
+	return picked, nil
+}
+
+func resolveTargetIPForProbe(ctx context.Context, host string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(config.DifferentialProbe.DNS.Mode))
+	switch mode {
+	case "", "system":
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil || len(ips) == 0 {
+			return "", fmt.Errorf("system dns lookup failed: %w", err)
+		}
+		return ips[0].IP.String(), nil
+	case "dot":
+		dotServer := strings.TrimSpace(config.DifferentialProbe.DNS.DoTServer)
+		if dotServer == "" {
+			dotServer = "1.1.1.1:853"
+		}
+		dotHost := dotServer
+		if h, _, err := net.SplitHostPort(dotServer); err == nil {
+			dotHost = h
+		}
+		resolver := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := &net.Dialer{Timeout: 6 * time.Second}
+			return tls.DialWithDialer(d, "tcp", dotServer, &tls.Config{ServerName: dotHost})
+		}}
+		ips, err := resolver.LookupIPAddr(ctx, host)
+		if err != nil || len(ips) == 0 {
+			return "", fmt.Errorf("dot lookup failed: %w", err)
+		}
+		return ips[0].IP.String(), nil
+	case "doh":
+		ep := strings.TrimSpace(config.DifferentialProbe.DNS.DoHEndpoint)
+		if ep == "" {
+			ep = "https://dns.google/resolve"
+		}
+		u, _ := url.Parse(ep)
+		q := u.Query()
+		q.Set("name", host)
+		q.Set("type", "A")
+		u.RawQuery = q.Encode()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+		if err != nil {
+			return "", fmt.Errorf("doh lookup failed: %w", err)
+		}
+		defer resp.Body.Close()
+		var payload struct {
+			Answer []struct {
+				Data string `json:"data"`
+			} `json:"Answer"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			return "", err
+		}
+		for _, a := range payload.Answer {
+			if ip := net.ParseIP(strings.TrimSpace(a.Data)); ip != nil {
+				return ip.String(), nil
+			}
+		}
+		return "", errors.New("no A record from doh")
+	default:
+		return "", fmt.Errorf("unsupported dns mode: %s", mode)
+	}
+}
+
+func probeServerDetailed(proxyEntry string, strictMode bool, targetURL string) (differentialProbeEntry, error) {
+	entry := differentialProbeEntry{Proxy: proxyEntry, ComparePolicy: config.DifferentialProbe.CompareTLSPolicy, DNSMode: config.DifferentialProbe.DNS.Mode}
+	scheme, _, _, _, err := parseMixedProxy(proxyEntry)
+	if err == nil {
+		entry.Protocol = scheme
+	}
+	dialer, _, err := upstreamDialerBuilder(proxyEntry)
+	if err != nil {
+		return entry, err
+	}
+	u, err := url.Parse(targetURL)
+	if err != nil {
+		return entry, err
+	}
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		if strings.EqualFold(u.Scheme, "https") {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(config.HealthCheck.TotalTimeoutSeconds)*time.Second)
+	defer cancel()
+	resolvedIP, err := resolveTargetIPForProbe(ctx, host)
+	if err == nil {
+		entry.ResolvedIP = resolvedIP
+		u.Host = net.JoinHostPort(resolvedIP, port)
+	}
+	transport := &http.Transport{}
+	transport.DialContext = dialer.DialContext
+	var tlsHello time.Duration
+	var certVerify time.Duration
+	var connectedIP string
+	var certSHA string
+	var alpn string
+	var verifyErr error
+	transport.TLSClientConfig = &tls.Config{ServerName: host, InsecureSkipVerify: true, VerifyConnection: func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) > 0 {
+			h := sha256.Sum256(cs.PeerCertificates[0].Raw)
+			certSHA = fmt.Sprintf("%x", h[:])
+		}
+		if cs.NegotiatedProtocol != "" {
+			alpn = cs.NegotiatedProtocol
+		}
+		if !strictMode {
+			return nil
+		}
+		start := time.Now()
+		defer func() { certVerify = time.Since(start) }()
+		if len(cs.PeerCertificates) == 0 {
+			verifyErr = errors.New("no peer cert")
+			return verifyErr
+		}
+		roots, _ := x509.SystemCertPool()
+		if roots == nil {
+			roots = x509.NewCertPool()
+		}
+		opts := x509.VerifyOptions{DNSName: host, Roots: roots, Intermediates: x509.NewCertPool()}
+		for _, c := range cs.PeerCertificates[1:] {
+			opts.Intermediates.AddCert(c)
+		}
+		_, verifyErr = cs.PeerCertificates[0].Verify(opts)
+		return verifyErr
+	}}
+	var tlsStart time.Time
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req.Host = host
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		ConnectDone: func(_, addr string, _ error) {
+			if h, _, e := net.SplitHostPort(addr); e == nil {
+				connectedIP = h
+			}
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Conn != nil {
+				if h, _, e := net.SplitHostPort(info.Conn.RemoteAddr().String()); e == nil {
+					connectedIP = h
+				}
+			}
+		},
+		TLSHandshakeStart: func() { tlsStart = time.Now() },
+		TLSHandshakeDone: func(_ tls.ConnectionState, _ error) {
+			if !tlsStart.IsZero() {
+				tlsHello = time.Since(tlsStart) - certVerify
+				if tlsHello < 0 {
+					tlsHello = time.Since(tlsStart)
+				}
+			}
+		},
+	}))
+	resp, err := (&http.Client{Transport: transport, Timeout: time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second}).Do(req)
+	if err != nil {
+		if verifyErr != nil {
+			err = verifyErr
+		}
+		entry.ServerError = err.Error()
+		return entry, err
+	}
+	defer resp.Body.Close()
+	entry.ServerSuccess = resp.StatusCode >= 200 && resp.StatusCode < 500
+	entry.ConnectedIP = connectedIP
+	entry.SNI = host
+	entry.ALPN = alpn
+	entry.CertSHA256 = certSHA
+	entry.HandshakeLatency = (tlsHello + certVerify).String()
+	return entry, nil
+}
+
+func runDifferentialProbeReport() (*differentialProbeReport, error) {
+	samples, err := loadOrBuildGoldenProxySet()
+	if err != nil {
+		return nil, err
+	}
+	report := &differentialProbeReport{GeneratedAt: time.Now(), TargetURL: config.DifferentialProbe.TargetURL, DNSMode: config.DifferentialProbe.DNS.Mode}
+	compareStrict := strings.EqualFold(strings.TrimSpace(config.DifferentialProbe.CompareTLSPolicy), "strict")
+	protocols := make([]string, 0, len(samples))
+	for k := range samples {
+		protocols = append(protocols, k)
+	}
+	sort.Strings(protocols)
+	for _, protocol := range protocols {
+		for _, proxyEntry := range samples[protocol] {
+			serverEntry, serverErr := probeServerDetailed(proxyEntry, compareStrict, config.DifferentialProbe.TargetURL)
+			clientOK := checkMixedProxyHealth(proxyEntry, compareStrict)
+			serverEntry.Protocol = protocol
+			serverEntry.ClientSuccess = clientOK
+			if !clientOK {
+				serverEntry.ClientError = "client_probe_failed"
+			}
+			if serverErr != nil {
+				serverEntry.ServerSuccess = false
+			}
+			strictStatus := checkMainstreamProxyHealthStage2(proxyEntry, true, config.HealthCheck).Status
+			relaxedStatus := checkMainstreamProxyHealthStage2(proxyEntry, false, config.HealthCheck).Status
+			serverEntry.StrictSuccess = strictStatus.Healthy
+			serverEntry.RelaxedSuccess = relaxedStatus.Healthy
+			if !strictStatus.Healthy {
+				serverEntry.StrictError = strictStatus.Reason
+			}
+			if !relaxedStatus.Healthy {
+				serverEntry.RelaxedError = relaxedStatus.Reason
+			}
+			report.Entries = append(report.Entries, serverEntry)
+			if serverEntry.ClientSuccess && !serverEntry.ServerSuccess {
+				report.DiffOnly = append(report.DiffOnly, serverEntry)
+			}
+		}
+	}
+	if file := strings.TrimSpace(config.DifferentialProbe.ReportOutputFile); file != "" {
+		if out, err := json.MarshalIndent(report, "", "  "); err == nil {
+			_ = os.WriteFile(file, out, 0o644)
+		}
+	}
+	return report, nil
+}
+
 func main() {
 	log.Println("Starting Dynamic Proxy Server...")
 
@@ -6175,6 +6526,14 @@ func main() {
 		log.Printf("  - Mainstream core backend: not configured (set detector.core to mihomo/meta/singbox)")
 	}
 	logCoreCapabilitySelfCheckSummary(config.Detector.Core)
+
+	if config.DifferentialProbe.Enabled {
+		if report, err := runDifferentialProbeReport(); err != nil {
+			log.Printf("[DIFF-PROBE] failed: %v", err)
+		} else {
+			log.Printf("[DIFF-PROBE] completed target=%s entries=%d client_ok_server_fail=%d dns=%s", report.TargetURL, len(report.Entries), len(report.DiffOnly), report.DNSMode)
+		}
+	}
 
 	// Create proxy pools
 	strictPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)
