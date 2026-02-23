@@ -3148,10 +3148,11 @@ const (
 )
 
 type proxyHealthStatus struct {
-	Healthy  bool
-	Scheme   string
-	Category healthFailureCategory
-	Reason   string
+	Healthy   bool
+	Scheme    string
+	Category  healthFailureCategory
+	ErrorCode string
+	Reason    string
 }
 
 type protocolStats struct {
@@ -3168,6 +3169,7 @@ type protocolStats struct {
 	ProtocolError   int64
 	CertVerifyFail  int64
 	SNIMismatch     int64
+	ErrorCodeCounts map[string]int64
 }
 
 func (s *protocolStats) addResult(status proxyHealthStatus) {
@@ -3175,6 +3177,12 @@ func (s *protocolStats) addResult(status proxyHealthStatus) {
 	if status.Healthy {
 		s.Success++
 		return
+	}
+	if status.ErrorCode != "" {
+		if s.ErrorCodeCounts == nil {
+			s.ErrorCodeCounts = make(map[string]int64)
+		}
+		s.ErrorCodeCounts[status.ErrorCode]++
 	}
 	switch status.Category {
 	case healthFailureParse:
@@ -3202,6 +3210,110 @@ func (s *protocolStats) addResult(status proxyHealthStatus) {
 	}
 }
 
+type healthErrorCodeMetrics struct {
+	mu     sync.RWMutex
+	counts map[string]int64
+}
+
+func (m *healthErrorCodeMetrics) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.counts = make(map[string]int64)
+}
+
+func (m *healthErrorCodeMetrics) Add(code string) {
+	if strings.TrimSpace(code) == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.counts == nil {
+		m.counts = make(map[string]int64)
+	}
+	m.counts[code]++
+}
+
+func (m *healthErrorCodeMetrics) Snapshot() map[string]int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string]int64, len(m.counts))
+	for k, v := range m.counts {
+		out[k] = v
+	}
+	return out
+}
+
+var mixedHealthErrorCodeMetrics = &healthErrorCodeMetrics{counts: make(map[string]int64)}
+
+func healthProtocolCodePrefix(scheme string) string {
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "ss":
+		return "SS"
+	case "ssr":
+		return "SSR"
+	case "trojan":
+		return "TRJ"
+	default:
+		return "GEN"
+	}
+}
+
+func resolveHealthErrorCode(scheme string, category healthFailureCategory, reasonCode string) string {
+	if category == healthFailureNone {
+		return ""
+	}
+	prefix := healthProtocolCodePrefix(scheme)
+	codeMap := map[healthFailureCategory]string{
+		healthFailureParse:           "001",
+		healthFailureAuth:            "002",
+		healthFailureUnsupported:     "003",
+		healthFailureCoreUnavailable: "101",
+		healthFailureHandshake:       "102",
+		healthFailureUnreachable:     "103",
+		healthFailureTimeout:         "201",
+		healthFailureCertVerify:      "202",
+		healthFailureSNIMismatch:     "203",
+		healthFailureEOF:             "204",
+		healthFailureProtocolError:   "205",
+	}
+	number, ok := codeMap[category]
+	if !ok {
+		number = "999"
+	}
+	if strings.Contains(strings.ToLower(reasonCode), "handshake") && category == healthFailureTimeout {
+		number = "206"
+	}
+	return fmt.Sprintf("DP-%s-%s", prefix, number)
+}
+
+func topKErrorCodes(counts map[string]int64, k int) string {
+	type pair struct {
+		Code  string
+		Count int64
+	}
+	list := make([]pair, 0, len(counts))
+	for code, count := range counts {
+		list = append(list, pair{Code: code, Count: count})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].Count == list[j].Count {
+			return list[i].Code < list[j].Code
+		}
+		return list[i].Count > list[j].Count
+	})
+	if k > 0 && len(list) > k {
+		list = list[:k]
+	}
+	parts := make([]string, 0, len(list))
+	for _, item := range list {
+		parts = append(parts, fmt.Sprintf("%s:%d", item.Code, item.Count))
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ",")
+}
+
 type healthPhaseMetrics struct {
 	DNS        time.Duration
 	TCPConnect time.Duration
@@ -3212,13 +3324,13 @@ type healthPhaseMetrics struct {
 
 func formatHealthReason(code string, err error) string {
 	if code == "" {
-		code = "unknown"
+		code = "DP-GEN-999"
 	}
 	if err == nil {
-		return "code=" + code
+		return "error_code=" + code
 	}
 	detail := strings.ReplaceAll(err.Error(), ";", ",")
-	return fmt.Sprintf("code=%s;detail=%s", code, detail)
+	return fmt.Sprintf("error_code=%s;detail=%s", code, detail)
 }
 
 func isTimeoutError(err error) bool {
@@ -3350,10 +3462,12 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 	}
 	if err != nil {
 		if strings.Contains(err.Error(), "invalid") {
-			return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, Reason: err.Error()}
+			errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_proxy_entry")
+			return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}
 		}
-		category, code := classifyHealthFailure(err)
-		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, Reason: formatHealthReason(code, err)}
+		category, reasonCode := classifyHealthFailure(err)
+		errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
+		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}
 	}
 
 	totalTimeout := time.Duration(settings.TotalTimeoutSeconds) * time.Second
@@ -3364,16 +3478,18 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", mixedHealthTargetAddr())
 	if err != nil {
-		category, code := classifyHealthFailure(err)
-		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, Reason: formatHealthReason(code, err)}
+		category, reasonCode := classifyHealthFailure(err)
+		errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
+		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}
 	}
 	_ = conn.Close()
 
 	if time.Since(start) > threshold {
-		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, Reason: "stage1 tunnel connect exceeded threshold"}
+		errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "stage1_connect_timeout")
+		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, errors.New("stage1 tunnel connect exceeded threshold"))}
 	}
 
-	return proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone}
+	return proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone, ErrorCode: ""}
 }
 
 func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settings HealthCheckSettings) mixedStageCheckResult {
@@ -3383,10 +3499,12 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 	}
 	if err != nil {
 		if strings.Contains(err.Error(), "invalid") {
-			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, Reason: err.Error()}}
+			errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_proxy_entry")
+			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}}
 		}
-		category, code := classifyHealthFailure(err)
-		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, Reason: formatHealthReason(code, err)}}
+		category, reasonCode := classifyHealthFailure(err)
+		errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}}
 	}
 
 	totalTimeout := time.Duration(settings.TotalTimeoutSeconds) * time.Second
@@ -3394,7 +3512,8 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 
 	targetURL, parseErr := url.Parse(mixedHealthCheckURL)
 	if parseErr != nil {
-		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, Reason: formatHealthReason("invalid_healthcheck_url", parseErr)}}
+		errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_healthcheck_url")
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, parseErr)}}
 	}
 
 	serverName := targetURL.Hostname()
@@ -3436,7 +3555,8 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 	var tlsHandshakeDone bool
 	req, reqErr := http.NewRequest(http.MethodGet, mixedHealthCheckURL, nil)
 	if reqErr != nil {
-		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, Reason: formatHealthReason("invalid_request", reqErr)}}
+		errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_request")
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, reqErr)}}
 	}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
 		DNSStart: func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
@@ -3477,32 +3597,38 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 	latency := time.Since(start)
 	if err != nil {
 		if verifyErr != nil {
-			category, code := classifyHealthFailure(verifyErr)
-			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, Reason: formatHealthReason(code, verifyErr)}, Latency: latency}
+			category, reasonCode := classifyHealthFailure(verifyErr)
+			errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
+			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, verifyErr)}, Latency: latency}
 		}
 		if isTimeoutError(err) && !tlsHandshakeDone {
-			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, Reason: formatHealthReason("tls_handshake_timeout", err)}, Latency: latency}
+			errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "tls_handshake_timeout")
+			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}, Latency: latency}
 		}
-		category, code := classifyHealthFailure(err)
-		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, Reason: formatHealthReason(code, err)}, Latency: latency}
+		category, reasonCode := classifyHealthFailure(err)
+		errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}, Latency: latency}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 500 {
-		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureUnreachable, Reason: fmt.Sprintf("unexpected status: %d", resp.StatusCode)}, Latency: latency}
+		errorCode := resolveHealthErrorCode(scheme, healthFailureUnreachable, "unexpected_status")
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureUnreachable, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, fmt.Errorf("unexpected status: %d", resp.StatusCode))}, Latency: latency}
 	}
 
 	if tlsHandshakeDone && phase.TLSHello+phase.CertVerify > threshold {
-		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, Reason: "stage2 tls handshake exceeded threshold"}, Latency: latency}
+		errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "stage2_tls_threshold_timeout")
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, errors.New("stage2 tls handshake exceeded threshold"))}, Latency: latency}
 	}
 
 	log.Printf("[MIXED-TLS-PHASE] scheme=%s dns=%s tcp_connect=%s tls_clienthello=%s cert_verify=%s first_byte=%s",
 		scheme, phase.DNS, phase.TCPConnect, phase.TLSHello, phase.CertVerify, phase.FirstByte)
 
-	return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone}, Latency: latency}
+	return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone, ErrorCode: ""}, Latency: latency}
 }
 
 func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
+	mixedHealthErrorCodeMetrics.Reset()
 	if config.HealthCheckTwoStage.Enabled {
 		return healthCheckMixedProxiesTwoStage(proxies)
 	}
@@ -3568,6 +3694,9 @@ func healthCheckMixedProxiesSingleStage(proxies []string) MixedHealthCheckResult
 				localLatencies = append(localLatencies, elapsed)
 				stats := localSummary[status.Scheme]
 				stats.addResult(status)
+				if !status.Healthy {
+					mixedHealthErrorCodeMetrics.Add(status.ErrorCode)
+				}
 				localSummary[status.Scheme] = stats
 
 				if status.Healthy {
@@ -3645,12 +3774,13 @@ func healthCheckMixedProxiesSingleStage(proxies []string) MixedHealthCheckResult
 			stats.Timeout,
 			stats.Unreachable,
 		)
-		log.Printf("[MIXED-SUMMARY] scheme=%s tls_failures={eof:%d protocol_error:%d cert_verify_failed:%d sni_mismatch:%d}",
+		log.Printf("[MIXED-SUMMARY] scheme=%s tls_failures={eof:%d protocol_error:%d cert_verify_failed:%d sni_mismatch:%d} error_code_topk=%s",
 			scheme,
 			stats.EOF,
 			stats.ProtocolError,
 			stats.CertVerifyFail,
 			stats.SNIMismatch,
+			topKErrorCodes(stats.ErrorCodeCounts, 5),
 		)
 	}
 	mu.Unlock()
@@ -3761,6 +3891,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 					stage1Candidates = append(stage1Candidates, entry)
 				} else {
 					st.DropReason[string(status.Category)]++
+					mixedHealthErrorCodeMetrics.Add(status.ErrorCode)
 				}
 				mu.Unlock()
 			}
@@ -3814,6 +3945,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 					}
 				} else {
 					st.DropReason[string(result.Status.Category)]++
+					mixedHealthErrorCodeMetrics.Add(result.Status.ErrorCode)
 				}
 				mu.Unlock()
 			}
@@ -4598,6 +4730,7 @@ func startRotateControlServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfP
 				"mainstream_current_proxy": mainstreamCurrent,
 				"cf_mixed_proxy_count":     len(cfMixedProxies),
 				"cf_mixed_current_proxy":   cfMixedCurrent,
+				"error_code_counts":        mixedHealthErrorCodeMetrics.Snapshot(),
 			})
 		default:
 			http.NotFound(w, r)
@@ -4658,6 +4791,7 @@ func buildPoolStatusPayload(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPoo
 		"mainstream_listen_port":        config.Ports.HTTPMainstreamMix,
 		"status_listen_addr":            port,
 		"mainstream_excluded_protocols": []string{"http", "https", "socks5", "socks5h"},
+		"error_code_counts":             mixedHealthErrorCodeMetrics.Snapshot(),
 	}
 }
 
@@ -4749,6 +4883,17 @@ func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(buildPoolStatusPayload(strictPool, relaxedPool, cfPool, mixedPool, mainstreamMixedPool, cfMixedPool, port))
+	})
+
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "STATUS-METRICS")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error_code_counts": mixedHealthErrorCodeMetrics.Snapshot(),
+		})
 	})
 
 	mux.HandleFunc("/api/overview", func(w http.ResponseWriter, r *http.Request) {
