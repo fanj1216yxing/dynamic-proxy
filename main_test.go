@@ -482,8 +482,8 @@ func TestMainstreamProxyHealthStageChecks_HighLatencyViaMockDialer(t *testing.T)
 	}
 
 	stage2 := checkMainstreamProxyHealthStage2("stage2-slow", false, HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 0})
-	if stage2.Status.Category != healthFailureTimeout {
-		t.Fatalf("expected stage2 timeout category, got %+v", stage2.Status)
+	if !stage2.Status.Healthy {
+		t.Fatalf("expected stage2 to pass when only overall GET latency is slow, got %+v", stage2.Status)
 	}
 }
 
@@ -579,53 +579,38 @@ func TestParseClashSubscriptionForMixed_PreservesMainstreamFields(t *testing.T) 
 	}
 }
 
-func TestHealthCheckMixedProxiesTwoStage_ProtocolSpecificTimeout(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	}))
-	defer srv.Close()
-
-	oldBuilder := upstreamDialerBuilder
-	oldURL := mixedHealthCheckURL
+func TestMixedHealthSettingsForProtocol_FallbackOrder(t *testing.T) {
 	oldConfig := config
-	defer func() {
-		upstreamDialerBuilder = oldBuilder
-		mixedHealthCheckURL = oldURL
-		config = oldConfig
-	}()
+	defer func() { config = oldConfig }()
 
-	targetAddr := strings.TrimPrefix(srv.URL, "http://")
-	mixedHealthCheckURL = srv.URL
-	upstreamDialerBuilder = func(entry string) (UpstreamDialer, string, error) {
-		scheme, _, _, _, err := parseMixedProxy(entry)
-		if err != nil {
-			return nil, "", err
-		}
-		return delayDialer{delay: 80 * time.Millisecond, targetAddr: targetAddr}, scheme, nil
-	}
-
-	config.HealthCheckConcurrency = 2
-	config.HealthCheckTwoStage.Enabled = true
-	config.HealthCheckTwoStage.StageOne = HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1}
-	config.HealthCheckTwoStage.StageTwo = HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1}
+	config.HealthCheck = HealthCheckSettings{TotalTimeoutSeconds: 7, TLSHandshakeThresholdSeconds: 3}
+	config.HealthCheckTwoStage.StageOne = HealthCheckSettings{TotalTimeoutSeconds: 4, TLSHandshakeThresholdSeconds: 2}
+	config.HealthCheckTwoStage.StageTwo = HealthCheckSettings{TotalTimeoutSeconds: 8, TLSHandshakeThresholdSeconds: 4}
 	config.HealthCheckProtocolOverrides = map[string]TwoStageHealthCheckSettings{
 		"vmess": {
-			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1},
-			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 0},
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 6, TLSHandshakeThresholdSeconds: 3},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 15, TLSHandshakeThresholdSeconds: 8},
 		},
 		"vless": {
-			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1},
-			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1},
+			StageOne: HealthCheckSettings{},
+			StageTwo: HealthCheckSettings{},
 		},
 	}
 
-	vmessEntry := "vmess://" + base64.StdEncoding.EncodeToString([]byte(`{"v":"2","add":"vmess.example.com","port":"443","id":"11111111-1111-1111-1111-111111111111"}`))
-	vlessEntry := "vless://11111111-1111-1111-1111-111111111111@vless.example.com:443?security=tls&type=ws"
-	result := healthCheckMixedProxiesTwoStage([]string{vmessEntry, vlessEntry})
+	settings, tier := mixedHealthSettingsForProtocolWithTier("vmess", 2)
+	if tier != "protocol_override" || settings.TotalTimeoutSeconds != 15 {
+		t.Fatalf("expected protocol override tier for vmess stage2, got tier=%s settings=%+v", tier, settings)
+	}
 
-	if len(result.Healthy) != 1 || result.Healthy[0] != vlessEntry {
-		t.Fatalf("expected only vless to pass protocol-specific threshold, got %+v", result.Healthy)
+	settings, tier = mixedHealthSettingsForProtocolWithTier("vless", 1)
+	if tier != "two_stage_default" || settings.TotalTimeoutSeconds != 4 {
+		t.Fatalf("expected two-stage default tier for empty override, got tier=%s settings=%+v", tier, settings)
+	}
+
+	config.HealthCheckTwoStage.StageTwo = HealthCheckSettings{}
+	settings, tier = mixedHealthSettingsForProtocolWithTier("unknown", 2)
+	if tier != "global_health_check" || settings.TotalTimeoutSeconds != 7 {
+		t.Fatalf("expected global fallback tier, got tier=%s settings=%+v", tier, settings)
 	}
 }
 

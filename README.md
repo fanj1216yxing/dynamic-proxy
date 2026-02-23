@@ -127,6 +127,15 @@ health_check_two_stage:
     total_timeout_seconds: 8
     tls_handshake_threshold_seconds: 4
 
+# 协议级策略（命中顺序：协议专用 > two-stage 默认 > health_check 全局）
+health_check_protocol_overrides:
+  http:                                 # 快检档
+    stage_one: { total_timeout_seconds: 5, tls_handshake_threshold_seconds: 5 }
+    stage_two: { total_timeout_seconds: 5, tls_handshake_threshold_seconds: 5 }
+  ss:                                   # 宽松档（ss/ssr/trojan 建议同档）
+    stage_one: { total_timeout_seconds: 10, tls_handshake_threshold_seconds: 6 }
+    stage_two: { total_timeout_seconds: 45, tls_handshake_threshold_seconds: 15 }
+
 # 主流协议内核配置
 detector:
   core: ""                 # 可选: mihomo | meta | singbox；为空时主流协议拨号不启用
@@ -161,6 +170,7 @@ auth:
 | `health_check_two_stage.enabled` | 是否启用两阶段健康检查 | true |
 | `health_check_two_stage.stage_one.*` | 第一阶段快速筛选超时参数 | 4秒 / 2秒 |
 | `health_check_two_stage.stage_two.*` | 第二阶段精细检测超时参数 | 8秒 / 4秒 |
+| `health_check_protocol_overrides.<scheme>.*` | 协议专用两阶段超时（优先级最高） | 按协议建议值 |
 | `detector.core` | 主流协议内核后端（mihomo/meta/singbox） | 空（未启用） |
 | `ports.socks5_strict` | SOCKS5服务器端口（启用SSL验证） | :17283 |
 | `ports.socks5_relaxed` | SOCKS5服务器端口（禁用SSL验证） | :17284 |
@@ -172,6 +182,15 @@ auth:
 | `ports.http_mainstream_mixed` | HTTP主流协议混合入口（仅自动选择 VMESS/VLESS/HY2 上游） | :17290 |
 | `auth.username` | 代理认证用户名（可选） | 空 |
 | `auth.password` | 代理认证密码（可选） | 空 |
+
+
+#### 协议分级超时建议值
+
+- **http/https（快检档）**：建议 `stage_one=5s`、`stage_two=5s`，用于保持快速筛选。
+- **ss/ssr/trojan（宽松档）**：建议 `stage_one=10s`，`stage_two=30~60s`（默认 45s），`tls_handshake_threshold_seconds` 独立调优（建议 10~20s）。
+- **vmess/vless/hy2（平衡档）**：建议 `stage_one=6s`、`stage_two=15s`。
+
+> 命中策略优先级：`health_check_protocol_overrides` > `health_check_two_stage` > `health_check`。
 
 ### 使用方法
 
