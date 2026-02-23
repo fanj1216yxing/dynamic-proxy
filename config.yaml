@@ -49,6 +49,8 @@ health_check:
 # 两阶段健康检查（适合超大规模代理池）
 health_check_two_stage:
   enabled: true
+  # 第二阶段是否启用严格证书校验（影响 cert_verify 指标）
+  strict_mode: true
   # 第一阶段：快速淘汰（仅建立隧道）
   stage_one:
     total_timeout_seconds: 6

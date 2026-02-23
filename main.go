@@ -46,9 +46,10 @@ type Config struct {
 	ProxySwitchIntervalMin string              `yaml:"proxy_switch_interval_min"`
 	HealthCheck            HealthCheckSettings `yaml:"health_check"`
 	HealthCheckTwoStage    struct {
-		Enabled  bool                `yaml:"enabled"`
-		StageOne HealthCheckSettings `yaml:"stage_one"`
-		StageTwo HealthCheckSettings `yaml:"stage_two"`
+		Enabled    bool                `yaml:"enabled"`
+		StrictMode *bool               `yaml:"strict_mode"`
+		StageOne   HealthCheckSettings `yaml:"stage_one"`
+		StageTwo   HealthCheckSettings `yaml:"stage_two"`
 	} `yaml:"health_check_two_stage"`
 	HealthCheckProtocolOverrides map[string]TwoStageHealthCheckSettings `yaml:"health_check_protocol_overrides"`
 	Ports                        struct {
@@ -348,6 +349,10 @@ func loadConfig(filename string) (*Config, error) {
 	}
 	if cfg.HealthCheckTwoStage.StageTwo.TLSHandshakeThresholdSeconds <= 0 {
 		cfg.HealthCheckTwoStage.StageTwo.TLSHandshakeThresholdSeconds = 4
+	}
+	if cfg.HealthCheckTwoStage.StrictMode == nil {
+		strictModeDefault := false
+		cfg.HealthCheckTwoStage.StrictMode = &strictModeDefault
 	}
 	if cfg.HealthCheckProtocolOverrides == nil {
 		cfg.HealthCheckProtocolOverrides = make(map[string]TwoStageHealthCheckSettings)
@@ -4074,6 +4079,11 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 		config.HealthCheckTwoStage.StageTwo.TotalTimeoutSeconds,
 		config.HealthCheckTwoStage.StageTwo.TLSHandshakeThresholdSeconds,
 	)
+	strictMode := false
+	if config.HealthCheckTwoStage.StrictMode != nil {
+		strictMode = *config.HealthCheckTwoStage.StrictMode
+	}
+	log.Printf("[MIXED-2STAGE] stage2 strict_mode=%t", strictMode)
 
 	workerCount := config.HealthCheckConcurrency
 	if workerCount <= 0 {
@@ -4092,7 +4102,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 		}
 		stageOneSettings, stageOneTier := mixedHealthSettingsForProtocolWithTier(scheme, 1)
 		stageTwoSettings, stageTwoTier := mixedHealthSettingsForProtocolWithTier(scheme, 2)
-		log.Printf("[MIXED-2STAGE-POLICY] scheme=%s stage1={tier:%s timeout:%ds tls_threshold:%ds} stage2={tier:%s timeout:%ds tls_threshold:%ds}",
+		log.Printf("[MIXED-2STAGE-POLICY] scheme=%s stage1={tier:%s timeout:%ds tls_threshold:%ds} stage2={tier:%s timeout:%ds tls_threshold:%ds strict_mode:%t}",
 			scheme,
 			stageOneTier,
 			stageOneSettings.TotalTimeoutSeconds,
@@ -4100,6 +4110,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 			stageTwoTier,
 			stageTwoSettings.TotalTimeoutSeconds,
 			stageTwoSettings.TLSHandshakeThresholdSeconds,
+			strictMode,
 		)
 		loggedSchemes[scheme] = struct{}{}
 	}
@@ -4239,7 +4250,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 					scheme = parsedScheme
 				}
 				settings, _ := mixedHealthSettingsForProtocolWithTier(scheme, 2)
-				result := checkMainstreamProxyHealthStage2(entry, false, settings)
+				result := checkMainstreamProxyHealthStage2(entry, strictMode, settings)
 				mu.Lock()
 				st := getStageStats(result.Status.Scheme)
 				if result.Status.Healthy {
