@@ -138,6 +138,16 @@ const breakerOpenTimeout = 30 * time.Second
 var mixedHealthCheckURL = defaultMixedHealthCheckURL
 var mixedProxyHealthChecker = checkMainstreamProxyHealth
 var mixedCFBypassChecker = checkCloudflareBypassMixed
+
+var parseFailureReasonCounter = struct {
+	sync.Mutex
+	counts map[string]int64
+}{counts: make(map[string]int64)}
+
+var parseFailureSampleCounter atomic.Int64
+
+const parseFailureSampleLimit = 50
+
 var upstreamDialerBuilder = buildUpstreamDialer
 var mainstreamAdapterFactory = func() mainstreamDialAdapter { return &mainstreamTCPConnectAdapter{} }
 var adapterMetrics = newAdapterObservabilityMetrics()
@@ -714,6 +724,7 @@ func (p *ProxyPool) ForceRotateIfCurrent(expected string) (string, bool, error) 
 // 支持格式：任何包含 ip:port 的行，自动忽略协议前缀和描述文本
 // 例如：socks5://83.217.209.26:1 [[家宽] 英国] → 提取 83.217.209.26:1
 func parseSpecialProxyURL(content string) ([]string, error) {
+	content = preprocessSubscriptionContent(content)
 	var proxies []string
 	proxySet := make(map[string]bool) // 用于去重
 
@@ -831,6 +842,7 @@ func parseClashSubscriptionForStrictRelaxed(content string) ([]string, bool) {
 }
 
 func parseRegularProxyContent(content string) ([]string, string) {
+	content = preprocessSubscriptionContent(content)
 	if clashProxies, ok := parseClashSubscriptionForStrictRelaxed(content); ok {
 		return clashProxies, "clash"
 	}
@@ -850,6 +862,8 @@ func parseRegularProxyContent(content string) ([]string, string) {
 		}
 		if normalized, ok := normalizeMixedProxyEntry(line); ok {
 			proxies = append(proxies, normalized)
+		} else {
+			sampleParseFailureLine("parse_failed", line, "normalize_failed")
 		}
 	}
 
@@ -857,6 +871,7 @@ func parseRegularProxyContent(content string) ([]string, string) {
 }
 
 func parseRegularProxyContentMixed(content string) ([]string, string) {
+	content = preprocessSubscriptionContent(content)
 	if clashProxies, ok := parseClashSubscriptionForMixed(content); ok {
 		return clashProxies, "clash"
 	}
@@ -878,6 +893,8 @@ func parseRegularProxyContentMixed(content string) ([]string, string) {
 		normalized, ok := normalizeMixedProxyEntry(line)
 		if ok {
 			proxies = append(proxies, normalized)
+		} else {
+			sampleParseFailureLine("parse_failed", line, "normalize_failed")
 		}
 	}
 
@@ -1088,6 +1105,7 @@ func decodeBase64ProxySubscription(content string) (string, bool) {
 		}
 		return r
 	}, trimmed)
+	compact = normalizeURLSafeBase64Token(compact)
 
 	if len(compact) < 32 {
 		return "", false
@@ -1126,9 +1144,112 @@ func decodeBase64ProxySubscription(content string) (string, bool) {
 	return "", false
 }
 
+func preprocessSubscriptionContent(content string) string {
+	if content == "" {
+		return ""
+	}
+	processed := strings.TrimPrefix(content, "\ufeff")
+	processed = strings.ReplaceAll(processed, "\r\n", "\n")
+	processed = strings.ReplaceAll(processed, "\r", "\n")
+
+	processed = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+			return -1
+		}
+		return r
+	}, processed)
+
+	compact := strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, processed)
+	if isLikelyBase64Payload(compact) {
+		processed = normalizeURLSafeBase64Token(compact)
+	}
+	return processed
+}
+
+func isLikelyBase64Payload(content string) bool {
+	if len(content) < 16 {
+		return false
+	}
+	for _, ch := range content {
+		if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '+' || ch == '/' || ch == '=' || ch == '-' || ch == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func normalizeURLSafeBase64Token(token string) string {
+	replaced := strings.NewReplacer("-", "+", "_", "/").Replace(strings.TrimSpace(token))
+	if replaced == "" {
+		return ""
+	}
+	if rem := len(replaced) % 4; rem != 0 {
+		replaced += strings.Repeat("=", 4-rem)
+	}
+	return replaced
+}
+
+func recordParseFailureReasonTag(scope string, reason string) {
+	if scope == "" || reason == "" {
+		return
+	}
+	key := scope + ":" + reason
+	parseFailureReasonCounter.Lock()
+	parseFailureReasonCounter.counts[key]++
+	parseFailureReasonCounter.Unlock()
+}
+
+func sanitizeSampleLine(raw string) string {
+	trimmed := strings.TrimSpace(strings.TrimPrefix(raw, "\ufeff"))
+	if trimmed == "" {
+		return ""
+	}
+	if u, err := url.Parse(trimmed); err == nil {
+		if u.User != nil {
+			u.User = url.User("***")
+		}
+		for _, key := range []string{"token", "password", "passwd", "auth", "key", "secret", "uuid", "id"} {
+			if q := u.Query(); q.Has(key) {
+				q.Set(key, "***")
+				u.RawQuery = q.Encode()
+			}
+		}
+		if s := u.String(); s != "" {
+			trimmed = s
+		}
+	}
+	trimmed = regexp.MustCompile(`(?i)(password|passwd|token|secret|uuid|id)=([^&\s]+)`).ReplaceAllString(trimmed, "$1=***")
+	trimmed = regexp.MustCompile(`(?i)(://)([^/@\s]+)@`).ReplaceAllString(trimmed, "$1***@")
+	if len(trimmed) > 240 {
+		trimmed = trimmed[:240] + "..."
+	}
+	return trimmed
+}
+
+func sampleParseFailureLine(category string, raw string, reason string) {
+	if parseFailureSampleCounter.Add(1) > parseFailureSampleLimit {
+		return
+	}
+	sanitized := sanitizeSampleLine(raw)
+	if sanitized == "" {
+		return
+	}
+	log.Printf("[SUB_PARSE_SAMPLE][%s] reason=%s line=%s", category, reason, sanitized)
+}
+
 func normalizeMixedProxyEntry(raw string) (string, bool) {
 	line := strings.TrimSpace(raw)
 	if line == "" {
+		recordParseFailureReasonTag("normalize", "empty_line")
 		return "", false
 	}
 	if candidate, ok := extractMixedURICandidate(line); ok {
@@ -1141,6 +1262,7 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 			if normalized, ok := normalizeSSURI(line); ok {
 				return normalized, true
 			}
+			recordParseFailureReasonTag("ss", "invalid_query")
 			return "", false
 		}
 
@@ -1148,18 +1270,29 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 			if normalized, ok := normalizeVMESSURI(line); ok {
 				return normalized, true
 			}
+			recordParseFailureReasonTag("vmess", "invalid_query")
 		}
 
 		if strings.HasPrefix(lowerLine, "ssr://") {
 			if normalized, ok := normalizeSSRURI(line); ok {
 				return normalized, true
 			}
+			recordParseFailureReasonTag("ssr", "invalid_query")
 			return "", false
 		}
 
 		if strings.HasPrefix(lowerLine, "trojan://") {
 			u, err := url.Parse(line)
-			if err != nil || u.Host == "" || u.User == nil || strings.TrimSpace(u.User.Username()) == "" {
+			if err != nil {
+				recordParseFailureReasonTag("trojan", "invalid_query")
+				return "", false
+			}
+			if u.Host == "" {
+				recordParseFailureReasonTag("trojan", "missing_host")
+				return "", false
+			}
+			if u.User == nil || strings.TrimSpace(u.User.Username()) == "" {
+				recordParseFailureReasonTag("trojan", "invalid_userinfo")
 				return "", false
 			}
 		}
@@ -1168,10 +1301,20 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 			if normalized, ok := normalizeWireGuardURI(line); ok {
 				return normalized, true
 			}
+			recordParseFailureReasonTag("wireguard", "invalid_query")
 		}
 
 		u, err := url.Parse(line)
-		if err != nil || u.Host == "" {
+		if err != nil {
+			recordParseFailureReasonTag("normalize", "invalid_query")
+			return "", false
+		}
+		if strings.TrimSpace(u.Hostname()) == "" {
+			recordParseFailureReasonTag(strings.ToLower(u.Scheme), "missing_host")
+			return "", false
+		}
+		if strings.TrimSpace(u.Port()) == "" {
+			recordParseFailureReasonTag(strings.ToLower(u.Scheme), "missing_port")
 			return "", false
 		}
 		scheme := strings.ToLower(u.Scheme)
@@ -1179,6 +1322,7 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 			return "", false
 		}
 		if !validateMainstreamURI(scheme, u) {
+			recordParseFailureReasonTag(scheme, "invalid_userinfo")
 			return "", false
 		}
 		authority := u.Host
@@ -1186,8 +1330,13 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 			authority = u.User.String() + "@" + authority
 		}
 		normalized := fmt.Sprintf("%s://%s", scheme, authority)
-		if filteredQuery := filterRawQueryWithWhitelist(u.RawQuery, scheme); filteredQuery != "" {
-			normalized += "?" + filteredQuery
+		if strings.TrimSpace(u.RawQuery) != "" {
+			filteredQuery := filterRawQueryWithWhitelist(u.RawQuery, scheme)
+			if filteredQuery == "" {
+				recordParseFailureReasonTag(scheme, "invalid_query")
+			} else {
+				normalized += "?" + filteredQuery
+			}
 		}
 		if u.Fragment != "" && scheme != "vless" {
 			normalized += "#" + u.Fragment
@@ -1354,12 +1503,18 @@ func parseVMESSNode(raw string) (vmessNode, bool) {
 	}
 
 	u, err := url.Parse(trimmed)
-	if err != nil || u.Host == "" {
+	if err != nil {
+		recordParseFailureReasonTag("vmess", "invalid_query")
+		return node, false
+	}
+	if strings.TrimSpace(u.Hostname()) == "" {
+		recordParseFailureReasonTag("vmess", "missing_host")
 		return node, false
 	}
 	host := u.Hostname()
 	port := u.Port()
-	if host == "" || port == "" {
+	if port == "" {
+		recordParseFailureReasonTag("vmess", "missing_port")
 		return node, false
 	}
 	q := u.Query()
@@ -1391,7 +1546,12 @@ func parseVMESSNode(raw string) (vmessNode, bool) {
 	if node.TLS == "" && strings.EqualFold(strings.TrimSpace(q.Get("security")), "tls") {
 		node.TLS = "tls"
 	}
-	if node.Add == "" || node.Port == "" {
+	if node.Add == "" {
+		recordParseFailureReasonTag("vmess", "missing_host")
+		return vmessNode{}, false
+	}
+	if node.Port == "" {
+		recordParseFailureReasonTag("vmess", "missing_port")
 		return vmessNode{}, false
 	}
 	return node, true
@@ -1400,16 +1560,30 @@ func parseVMESSNode(raw string) (vmessNode, bool) {
 func parseVLESSNode(raw string) (vlessNode, bool) {
 	node := vlessNode{}
 	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || strings.ToLower(u.Scheme) != "vless" {
+	if err != nil {
+		recordParseFailureReasonTag("vless", "invalid_query")
+		return node, false
+	}
+	if strings.ToLower(u.Scheme) != "vless" {
 		return node, false
 	}
 	host := strings.TrimSpace(u.Hostname())
 	port := strings.TrimSpace(u.Port())
-	if host == "" || port == "" || u.User == nil {
+	if host == "" {
+		recordParseFailureReasonTag("vless", "missing_host")
+		return node, false
+	}
+	if port == "" {
+		recordParseFailureReasonTag("vless", "missing_port")
+		return node, false
+	}
+	if u.User == nil {
+		recordParseFailureReasonTag("vless", "invalid_userinfo")
 		return node, false
 	}
 	uuid := strings.TrimSpace(u.User.Username())
 	if uuid == "" {
+		recordParseFailureReasonTag("vless", "invalid_userinfo")
 		return node, false
 	}
 	q := u.Query()
@@ -1435,6 +1609,7 @@ func parseHY2Node(raw string) (hy2Node, bool) {
 	node := hy2Node{}
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
+		recordParseFailureReasonTag("hy2", "invalid_query")
 		return node, false
 	}
 	scheme := strings.ToLower(u.Scheme)
@@ -1443,11 +1618,21 @@ func parseHY2Node(raw string) (hy2Node, bool) {
 	}
 	host := strings.TrimSpace(u.Hostname())
 	port := strings.TrimSpace(u.Port())
-	if host == "" || port == "" || u.User == nil {
+	if host == "" {
+		recordParseFailureReasonTag(scheme, "missing_host")
+		return node, false
+	}
+	if port == "" {
+		recordParseFailureReasonTag(scheme, "missing_port")
+		return node, false
+	}
+	if u.User == nil {
+		recordParseFailureReasonTag(scheme, "invalid_userinfo")
 		return node, false
 	}
 	password := strings.TrimSpace(u.User.Username())
 	if password == "" {
+		recordParseFailureReasonTag(scheme, "invalid_userinfo")
 		return node, false
 	}
 	q := u.Query()
@@ -2686,6 +2871,7 @@ func buildUpstreamDialer(entry string) (UpstreamDialer, string, error) {
 }
 
 func parseSpecialProxyURLMixed(content string) []string {
+	content = preprocessSubscriptionContent(content)
 	proxies := make([]string, 0)
 	proxySet := make(map[string]bool)
 
@@ -2703,15 +2889,18 @@ func parseSpecialProxyURLMixed(content string) []string {
 			}
 			continue
 		}
+		sampleParseFailureLine("parse_failed", line, "normalize_failed")
 
 		lowerLine := strings.ToLower(line)
 		if strings.Contains(lowerLine, "ss://") || strings.Contains(lowerLine, "ssr://") || strings.Contains(lowerLine, "trojan://") {
 			log.Printf("parse_failed: skip malformed mainstream line without fallback: %s", line)
+			sampleParseFailureLine("parse_failed", line, "malformed_mainstream")
 			continue
 		}
 
 		matches := simpleProxyRegex.FindStringSubmatch(line)
 		if len(matches) < 3 {
+			sampleParseFailureLine("unknown", line, "unsupported_format")
 			continue
 		}
 
