@@ -112,6 +112,7 @@ const healthCheckBatchSize = 50000
 var mixedHealthCheckURL = defaultMixedHealthCheckURL
 var mixedProxyHealthChecker = checkMainstreamProxyHealth
 var mixedCFBypassChecker = checkCloudflareBypassMixed
+var upstreamDialerBuilder = buildUpstreamDialer
 
 //go:embed web/admin/index.html
 var adminPanelHTML string
@@ -2052,7 +2053,7 @@ func checkCloudflareBypassMixed(proxyEntry string) bool {
 		return false
 	}
 
-	dialer, _, err := buildUpstreamDialer(proxyEntry)
+	dialer, _, err := upstreamDialerBuilder(proxyEntry)
 	if err != nil {
 		log.Printf("[CF-MIXED] Skip proxy %s: %v", proxyEntry, err)
 		return false
@@ -2101,7 +2102,7 @@ func checkCloudflareBypassMixed(proxyEntry string) bool {
 }
 
 func checkMixedProxyHealth(proxyEntry string, strictMode bool) bool {
-	dialer, _, err := buildUpstreamDialer(proxyEntry)
+	dialer, _, err := upstreamDialerBuilder(proxyEntry)
 	if err != nil {
 		return false
 	}
@@ -2635,7 +2636,7 @@ func mixedHealthSettingsForProtocol(scheme string, stage int) HealthCheckSetting
 }
 
 func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSettings) proxyHealthStatus {
-	dialer, scheme, err := buildUpstreamDialer(proxyEntry)
+	dialer, scheme, err := upstreamDialerBuilder(proxyEntry)
 	if scheme == "" {
 		scheme = "unknown"
 	}
@@ -2666,7 +2667,7 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 }
 
 func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settings HealthCheckSettings) mixedStageCheckResult {
-	dialer, scheme, err := buildUpstreamDialer(proxyEntry)
+	dialer, scheme, err := upstreamDialerBuilder(proxyEntry)
 	if scheme == "" {
 		scheme = "unknown"
 	}

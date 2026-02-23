@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -354,5 +360,270 @@ func TestHealthCheckMixedProxies_TwoStageStage1FastDrop(t *testing.T) {
 	}
 	if elapsed > 4*time.Second {
 		t.Fatalf("two-stage mixed health check should stop quickly, got %v", elapsed)
+	}
+}
+
+func TestParseMixedProxy_MainstreamAndMalformed_TableDriven(t *testing.T) {
+	vmessPayload, err := json.Marshal(vmessNode{V: "2", Add: "vmess.example.com", Port: "443", ID: "11111111-1111-1111-1111-111111111111", Net: "ws", TLS: "tls", Host: "cdn.example.com", Path: "/ws", SNI: "sni.example.com"})
+	if err != nil {
+		t.Fatalf("failed to prepare vmess payload: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		entry      string
+		wantScheme string
+		wantAddr   string
+		wantErr    bool
+	}{
+		{
+			name:       "vmess v2rayn json",
+			entry:      "vmess://" + base64.StdEncoding.EncodeToString(vmessPayload),
+			wantScheme: "vmess",
+			wantAddr:   "vmess.example.com:443",
+		},
+		{
+			name:       "vless reality tls",
+			entry:      "vless://22222222-2222-2222-2222-222222222222@vless.example.com:443?security=tls&type=ws&host=edge.example.com&path=%2Fvless&sni=reality.example.com&pbk=pubkey&sid=ab12&flow=xtls-rprx-vision",
+			wantScheme: "vless",
+			wantAddr:   "vless.example.com:443",
+		},
+		{
+			name:       "hy2 with sni and alpn",
+			entry:      "hy2://secret-password@hy2.example.com:8443?sni=hy2.example.com&alpn=h3,h2",
+			wantScheme: "hy2",
+			wantAddr:   "hy2.example.com:8443",
+		},
+		{
+			name:    "missing uuid",
+			entry:   "vless://@vless.example.com:443?security=tls",
+			wantErr: true,
+		},
+		{
+			name:    "missing host",
+			entry:   "hy2://secret@:8443?sni=test.example.com",
+			wantErr: true,
+		},
+		{
+			name:    "invalid port",
+			entry:   "vless://33333333-3333-3333-3333-333333333333@vless.example.com:abc?security=tls",
+			wantErr: true,
+		},
+		{
+			name:    "bad vmess base64",
+			entry:   "vmess://@@@@not-base64@@@@",
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme, addr, _, _, err := parseMixedProxy(tc.entry)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected parse error for %q", tc.entry)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			if scheme != tc.wantScheme || addr != tc.wantAddr {
+				t.Fatalf("unexpected parse result: got scheme=%s addr=%s, want scheme=%s addr=%s", scheme, addr, tc.wantScheme, tc.wantAddr)
+			}
+		})
+	}
+}
+
+type delayDialer struct {
+	delay      time.Duration
+	targetAddr string
+}
+
+func (d delayDialer) DialContext(ctx context.Context, network, _ string) (net.Conn, error) {
+	select {
+	case <-time.After(d.delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, d.targetAddr)
+}
+
+func TestMainstreamProxyHealthStageChecks_HighLatencyViaMockDialer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	oldBuilder := upstreamDialerBuilder
+	oldURL := mixedHealthCheckURL
+	defer func() {
+		upstreamDialerBuilder = oldBuilder
+		mixedHealthCheckURL = oldURL
+	}()
+
+	targetAddr := strings.TrimPrefix(srv.URL, "http://")
+	mixedHealthCheckURL = srv.URL
+	upstreamDialerBuilder = func(entry string) (UpstreamDialer, string, error) {
+		switch entry {
+		case "stage1-slow":
+			return delayDialer{delay: 120 * time.Millisecond, targetAddr: targetAddr}, "socks5", nil
+		case "stage2-slow":
+			return delayDialer{delay: 80 * time.Millisecond, targetAddr: targetAddr}, "socks5", nil
+		default:
+			return nil, "", fmt.Errorf("unexpected entry: %s", entry)
+		}
+	}
+
+	stage1 := checkMainstreamProxyHealthStage1("stage1-slow", HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 0})
+	if stage1.Category != healthFailureTimeout {
+		t.Fatalf("expected stage1 timeout category, got %+v", stage1)
+	}
+
+	stage2 := checkMainstreamProxyHealthStage2("stage2-slow", false, HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 0})
+	if stage2.Status.Category != healthFailureTimeout {
+		t.Fatalf("expected stage2 timeout category, got %+v", stage2.Status)
+	}
+}
+
+func TestBuildUpstreamDialer_MainstreamSchemesSupported(t *testing.T) {
+	entries := []string{
+		"vmess://" + base64.StdEncoding.EncodeToString([]byte(`{"v":"2","add":"vmess.example.com","port":"443","id":"11111111-1111-1111-1111-111111111111"}`)),
+		"vless://11111111-1111-1111-1111-111111111111@vless.example.com:443?security=tls&type=ws",
+		"hy2://password@hy2.example.com:8443?sni=hy2.example.com&alpn=h3,h2",
+	}
+
+	for _, entry := range entries {
+		t.Run(entry, func(t *testing.T) {
+			_, scheme, err := buildUpstreamDialer(entry)
+			if err != nil {
+				t.Fatalf("buildUpstreamDialer should support %s, got err=%v", entry, err)
+			}
+			if scheme == "" {
+				t.Fatalf("scheme should not be empty for %s", entry)
+			}
+		})
+	}
+}
+
+func TestParseClashSubscriptionForMixed_PreservesMainstreamFields(t *testing.T) {
+	content := `proxies:
+  - name: vmess-node
+    type: vmess
+    server: vmess.example.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    network: ws
+    tls: true
+    sni: sni.vmess.example.com
+    alpn: [h2,h3]
+    ws-opts:
+      path: /vmess
+      headers:
+        Host: ws.vmess.example.com
+  - name: vless-node
+    type: vless
+    server: vless.example.com
+    port: 8443
+    uuid: 22222222-2222-2222-2222-222222222222
+    network: ws
+    tls: true
+    flow: xtls-rprx-vision
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: pubkey123
+      short-id: abcd
+    ws-opts:
+      path: /vless
+      headers:
+        Host: ws.vless.example.com
+  - name: hy2-node
+    type: hy2
+    server: hy2.example.com
+    port: 9443
+    password: hy2pass
+    sni: hy2.sni.example.com
+    alpn: [h3,h2]
+    hysteria2:
+      obfs: salamander
+      obfs-password: obfspass
+`
+
+	entries, ok := parseClashSubscriptionForMixed(content)
+	if !ok {
+		t.Fatalf("expected mixed clash subscription to parse")
+	}
+	joined := strings.Join(entries, "\n")
+
+	checks := []string{
+		"vmess://vmess.example.com:443?",
+		"network=ws",
+		"path=%2Fvmess",
+		"host=ws.vmess.example.com",
+		"sni=sni.vmess.example.com",
+		"alpn=h2%2Ch3",
+		"vless://22222222-2222-2222-2222-222222222222@vless.example.com:8443?",
+		"flow=xtls-rprx-vision",
+		"fp=chrome",
+		"pbk=pubkey123",
+		"sid=abcd",
+		"hy2://hy2pass@hy2.example.com:9443?",
+		"obfs=salamander",
+		"obfs-password=obfspass",
+	}
+	for _, fragment := range checks {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("expected parsed entries to preserve %q, got:\n%s", fragment, joined)
+		}
+	}
+}
+
+func TestHealthCheckMixedProxiesTwoStage_ProtocolSpecificTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	oldBuilder := upstreamDialerBuilder
+	oldURL := mixedHealthCheckURL
+	oldConfig := config
+	defer func() {
+		upstreamDialerBuilder = oldBuilder
+		mixedHealthCheckURL = oldURL
+		config = oldConfig
+	}()
+
+	targetAddr := strings.TrimPrefix(srv.URL, "http://")
+	mixedHealthCheckURL = srv.URL
+	upstreamDialerBuilder = func(entry string) (UpstreamDialer, string, error) {
+		scheme, _, _, _, err := parseMixedProxy(entry)
+		if err != nil {
+			return nil, "", err
+		}
+		return delayDialer{delay: 80 * time.Millisecond, targetAddr: targetAddr}, scheme, nil
+	}
+
+	config.HealthCheckConcurrency = 2
+	config.HealthCheckTwoStage.Enabled = true
+	config.HealthCheckTwoStage.StageOne = HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1}
+	config.HealthCheckTwoStage.StageTwo = HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1}
+	config.HealthCheckProtocolOverrides = map[string]TwoStageHealthCheckSettings{
+		"vmess": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 0},
+		},
+		"vless": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1},
+		},
+	}
+
+	vmessEntry := "vmess://" + base64.StdEncoding.EncodeToString([]byte(`{"v":"2","add":"vmess.example.com","port":"443","id":"11111111-1111-1111-1111-111111111111"}`))
+	vlessEntry := "vless://11111111-1111-1111-1111-111111111111@vless.example.com:443?security=tls&type=ws"
+	result := healthCheckMixedProxiesTwoStage([]string{vmessEntry, vlessEntry})
+
+	if len(result.Healthy) != 1 || result.Healthy[0] != vlessEntry {
+		t.Fatalf("expected only vless to pass protocol-specific threshold, got %+v", result.Healthy)
 	}
 }
