@@ -18,6 +18,13 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai  # Set timezone (optional)
+      # Mainstream core sidecar (required when detector.core=singbox/meta/mihomo)
+      - DP_SINGBOX_SIDECAR_ADDR=${DP_SINGBOX_SIDECAR_ADDR:-}
+      - DP_SINGBOX_HEALTHCHECK_CMD=${DP_SINGBOX_HEALTHCHECK_CMD:-}
+      # Optional protocol-specific health check commands
+      - DP_HEALTHCHECK_SS_CMD=${DP_HEALTHCHECK_SS_CMD:-}
+      - DP_HEALTHCHECK_SSR_CMD=${DP_HEALTHCHECK_SSR_CMD:-}
+      - DP_HEALTHCHECK_TROJAN_CMD=${DP_HEALTHCHECK_TROJAN_CMD:-}
     networks:
       - proxy-network
 
