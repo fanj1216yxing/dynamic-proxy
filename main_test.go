@@ -867,22 +867,22 @@ func TestMainstreamStage2_TLSFailureCategoriesWithMockServers(t *testing.T) {
 	settings := HealthCheckSettings{TotalTimeoutSeconds: 1, TLSHandshakeThresholdSeconds: 1}
 
 	timeoutResult := checkMainstreamProxyHealthStage2("timeout", false, settings).Status
-	if timeoutResult.Category != healthFailureTimeout || !strings.Contains(timeoutResult.Reason, "code=tls_handshake_timeout") {
+	if timeoutResult.Category != healthFailureTimeout || timeoutResult.ErrorCode != "DP-TRJ-206" || !strings.Contains(timeoutResult.Reason, "error_code=DP-TRJ-206") {
 		t.Fatalf("unexpected timeout classification: %+v", timeoutResult)
 	}
 
 	eofResult := checkMainstreamProxyHealthStage2("eof", false, settings).Status
-	if eofResult.Category != healthFailureEOF || !strings.Contains(eofResult.Reason, "code=eof") {
+	if eofResult.Category != healthFailureEOF || eofResult.ErrorCode != "DP-TRJ-204" || !strings.Contains(eofResult.Reason, "error_code=DP-TRJ-204") {
 		t.Fatalf("unexpected eof classification: %+v", eofResult)
 	}
 
 	certResult := checkMainstreamProxyHealthStage2("cert", true, settings).Status
-	if certResult.Category != healthFailureCertVerify || !strings.Contains(certResult.Reason, "code=cert_verify_failed") {
+	if certResult.Category != healthFailureCertVerify || certResult.ErrorCode != "DP-TRJ-202" || !strings.Contains(certResult.Reason, "error_code=DP-TRJ-202") {
 		t.Fatalf("unexpected cert classification: %+v", certResult)
 	}
 
 	protocolResult := checkMainstreamProxyHealthStage2("protocol", false, settings).Status
-	if protocolResult.Category != healthFailureProtocolError || !strings.Contains(protocolResult.Reason, "code=protocol_error") {
+	if protocolResult.Category != healthFailureProtocolError || protocolResult.ErrorCode != "DP-TRJ-205" || !strings.Contains(protocolResult.Reason, "error_code=DP-TRJ-205") {
 		t.Fatalf("unexpected protocol classification: %+v", protocolResult)
 	}
 }
