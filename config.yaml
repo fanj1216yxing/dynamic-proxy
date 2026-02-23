@@ -138,6 +138,26 @@ cert_verify_whitelist:
   require_insecure: true
   enforce_strict_audit: true
 
+# HTTP Mainstream 混合入口降级策略
+# fallback_http_socks: 主流协议池不可用时回退到 http/socks 池
+# explicit_error: 主流协议池不可用时返回显式 503 错误（由业务自行处理）
+mainstream_mixed:
+  degrade_strategy: "explicit_error"
+  explicit_error_message: "Mainstream upstream unavailable"
+
+# 协议级 SLO（主流协议池）
+protocol_slo:
+  enabled: true
+  min_healthy:
+    vless: 1
+    hy2: 1
+    trojan: 1
+
+# 告警策略
+alerting:
+  # 当 mainstream=0 连续超过该周期数时触发 P1 告警
+  zero_mainstream_tolerance_cycles: 1
+
 # 差异探测（黄金样本 + DNS 策略 + strict/relaxed A/B）
 differential_probe:
   enabled: false
