@@ -127,7 +127,7 @@ health_check_protocol_overrides:
 
 # 主流协议内核配置（用于 ss/ssr/trojan/vmess/vless/hy2 等拨号）
 detector:
-  core: "" # 可选: mihomo | meta | singbox；为空时主流协议适配层不会启用
+  core: "singbox" # 已部署核心示例: mihomo | meta | singbox
 
 # 服务器端口配置
 ports:

@@ -2157,6 +2157,80 @@ func resolveMainstreamCoreBackend(core string) (mainstreamCoreBackend, bool) {
 	}
 }
 
+func resolveCoreSidecarEnvNames(core string) (sidecarEnv string, healthcheckEnv string) {
+	core = strings.ToLower(strings.TrimSpace(core))
+	switch core {
+	case "mihomo":
+		return "DP_MIHOMO_SIDECAR_ADDR", "DP_MIHOMO_HEALTHCHECK_CMD"
+	case "meta":
+		return "DP_META_SIDECAR_ADDR", "DP_META_HEALTHCHECK_CMD"
+	case "singbox", "sing-box":
+		return "DP_SINGBOX_SIDECAR_ADDR", "DP_SINGBOX_HEALTHCHECK_CMD"
+	default:
+		return "", ""
+	}
+}
+
+func logCoreCapabilitySelfCheckSummary(core string) {
+	core = strings.ToLower(strings.TrimSpace(core))
+	if core == "" {
+		log.Printf("[CORE-SELF-CHECK] core_type=unset risk=core_unconfigured detector.core is empty")
+		return
+	}
+
+	sidecarEnv, healthcheckEnv := resolveCoreSidecarEnvNames(core)
+	sidecarAddr := ""
+	coreHealthcheck := ""
+	if sidecarEnv != "" {
+		sidecarAddr = strings.TrimSpace(os.Getenv(sidecarEnv))
+	}
+	if healthcheckEnv != "" {
+		coreHealthcheck = strings.TrimSpace(os.Getenv(healthcheckEnv))
+	}
+
+	protocolEnvNames := map[string]string{
+		"ss":     "DP_HEALTHCHECK_SS_CMD",
+		"ssr":    "DP_HEALTHCHECK_SSR_CMD",
+		"trojan": "DP_HEALTHCHECK_TROJAN_CMD",
+	}
+	protocols := []string{"ss", "ssr", "trojan"}
+	checks := make([]string, 0, len(protocols))
+	missing := make([]string, 0)
+	for _, protocol := range protocols {
+		envName := protocolEnvNames[protocol]
+		configured := strings.TrimSpace(os.Getenv(envName)) != ""
+		checks = append(checks, fmt.Sprintf("%s:%t", protocol, configured))
+		if !configured {
+			missing = append(missing, envName)
+		}
+	}
+
+	risk := "ok"
+	riskReasons := make([]string, 0)
+	if sidecarEnv != "" && sidecarAddr == "" {
+		risk = "core_unconfigured"
+		riskReasons = append(riskReasons, fmt.Sprintf("%s missing", sidecarEnv))
+	}
+	if len(missing) > 0 {
+		riskReasons = append(riskReasons, "protocol healthcheck commands missing: "+strings.Join(missing, ","))
+	}
+
+	if sidecarAddr == "" {
+		sidecarAddr = "<empty>"
+	}
+	log.Printf("[CORE-SELF-CHECK] core_type=%s sidecar_addr=%s sidecar_env=%s core_healthcheck_cmd=%t protocol_healthchecks={%s} risk=%s",
+		core,
+		sidecarAddr,
+		sidecarEnv,
+		coreHealthcheck != "",
+		strings.Join(checks, " "),
+		risk,
+	)
+	if len(riskReasons) > 0 {
+		log.Printf("[CORE-SELF-CHECK] detail=%s", strings.Join(riskReasons, "; "))
+	}
+}
+
 func parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr string) (kernelNodeConfig, error) {
 	node := kernelNodeConfig{Protocol: strings.ToLower(strings.TrimSpace(proxyScheme)), Name: proxyEntry}
 	host, port, err := net.SplitHostPort(proxyAddr)
@@ -4261,6 +4335,17 @@ func healthCheckMixedProxiesSingleStage(proxies []string) MixedHealthCheckResult
 			stats.SNIMismatch,
 			topKErrorCodes(stats.ErrorCodeCounts, 5),
 		)
+		if stats.Total > 0 {
+			coreUnconfiguredRate := float64(stats.CoreUnavailable) / float64(stats.Total)
+			if coreUnconfiguredRate > 0.10 {
+				log.Printf("[ALERT-core_unconfigured] scheme=%s core_unconfigured=%d total=%d rate=%.1f%% threshold=10.0%%",
+					scheme,
+					stats.CoreUnavailable,
+					stats.Total,
+					coreUnconfiguredRate*100,
+				)
+			}
+		}
 	}
 	mu.Unlock()
 
@@ -5749,6 +5834,7 @@ func main() {
 	} else {
 		log.Printf("  - Mainstream core backend: not configured (set detector.core to mihomo/meta/singbox)")
 	}
+	logCoreCapabilitySelfCheckSummary(config.Detector.Core)
 
 	// Create proxy pools
 	strictPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)
