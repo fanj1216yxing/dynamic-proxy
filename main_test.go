@@ -715,10 +715,13 @@ func TestMainstreamHealthChecks_UseAdapterDialBranchForSSSSRAndTrojan(t *testing
 	oldFactory := mainstreamAdapterFactory
 	oldURL := mixedHealthCheckURL
 	oldConfig := config
+	oldDisabled := mixedRuntimeDisabledSchemes
+	mixedRuntimeDisabledSchemes = map[string]string{}
 	defer func() {
 		mainstreamAdapterFactory = oldFactory
 		mixedHealthCheckURL = oldURL
 		config = oldConfig
+		mixedRuntimeDisabledSchemes = oldDisabled
 	}()
 
 	targetAddr := strings.TrimPrefix(srv.URL, "http://")

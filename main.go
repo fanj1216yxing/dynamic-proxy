@@ -588,6 +588,140 @@ var mixedSupportedSchemes = map[string]bool{
 	"wireguard": true,
 }
 
+var mixedRuntimeDisabledSchemes = map[string]string{
+	"ss":     "disabled_by_runtime: pending kernel adaptation",
+	"ssr":    "disabled_by_runtime: pending kernel adaptation",
+	"trojan": "disabled_by_runtime: pending kernel adaptation",
+}
+
+var protocolAvailabilityTracker = newProtocolAvailabilityStore()
+
+type protocolAvailabilityStatus struct {
+	Scheme           string `json:"scheme"`
+	ParseSupport     bool   `json:"parse_support"`
+	DetectSupport    bool   `json:"detect_support"`
+	ForwardSupport   bool   `json:"forward_support"`
+	Availability     string `json:"availability"`
+	PrimaryFailure   string `json:"primary_failure_reason,omitempty"`
+	RuntimeNote      string `json:"runtime_note,omitempty"`
+	ObservedSuccess  int64  `json:"observed_success"`
+	ObservedFailures int64  `json:"observed_failures"`
+}
+
+type protocolAvailabilityStore struct {
+	mu        sync.RWMutex
+	stats     map[string]map[string]int64
+	successes map[string]int64
+}
+
+func newProtocolAvailabilityStore() *protocolAvailabilityStore {
+	return &protocolAvailabilityStore{stats: make(map[string]map[string]int64), successes: make(map[string]int64)}
+}
+
+func (s *protocolAvailabilityStore) record(status proxyHealthStatus) {
+	scheme := strings.ToLower(strings.TrimSpace(status.Scheme))
+	if scheme == "" {
+		scheme = "unknown"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if status.Healthy {
+		s.successes[scheme]++
+		return
+	}
+	reasonKey := string(status.Category)
+	if reasonKey == "" {
+		reasonKey = "unknown"
+	}
+	if s.stats[scheme] == nil {
+		s.stats[scheme] = make(map[string]int64)
+	}
+	s.stats[scheme][reasonKey]++
+}
+
+func (s *protocolAvailabilityStore) snapshot() map[string]protocolAvailabilityStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]protocolAvailabilityStatus)
+	for scheme := range mixedSupportedSchemes {
+		status := currentProtocolAvailability(scheme)
+		status.ObservedSuccess = s.successes[scheme]
+		var topReason string
+		var topCount int64
+		for reason, c := range s.stats[scheme] {
+			status.ObservedFailures += c
+			if c > topCount {
+				topReason = reason
+				topCount = c
+			}
+		}
+		if topReason != "" {
+			status.PrimaryFailure = topReason
+		}
+		out[scheme] = status
+	}
+	return out
+}
+
+func isRuntimeSchemeEnabled(scheme string) bool {
+	_, disabled := mixedRuntimeDisabledSchemes[strings.ToLower(strings.TrimSpace(scheme))]
+	return !disabled
+}
+
+func schemeRequiresMainstreamCore(scheme string) bool {
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "http", "https", "socks5", "socks5h":
+		return false
+	default:
+		return true
+	}
+}
+
+func currentProtocolAvailability(scheme string) protocolAvailabilityStatus {
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	parseSupport := mixedSupportedSchemes[scheme]
+	detectSupport := parseSupport && isRuntimeSchemeEnabled(scheme)
+	forwardSupport := detectSupport
+	status := protocolAvailabilityStatus{
+		Scheme:         scheme,
+		ParseSupport:   parseSupport,
+		DetectSupport:  detectSupport,
+		ForwardSupport: forwardSupport,
+		Availability:   "enabled",
+	}
+	if reason, ok := mixedRuntimeDisabledSchemes[scheme]; ok {
+		status.Availability = "disabled_by_runtime"
+		status.RuntimeNote = reason
+		status.DetectSupport = false
+		status.ForwardSupport = false
+		return status
+	}
+	if schemeRequiresMainstreamCore(scheme) && strings.TrimSpace(config.Detector.Core) == "" {
+		status.Availability = "core_unconfigured"
+		status.RuntimeNote = "set detector.core to enable mainstream protocol detection/forwarding"
+		status.DetectSupport = false
+		status.ForwardSupport = false
+	}
+	return status
+}
+
+func logProtocolSupportMatrixAtStartup() {
+	schemes := make([]string, 0, len(mixedSupportedSchemes))
+	for scheme := range mixedSupportedSchemes {
+		schemes = append(schemes, scheme)
+	}
+	sort.Strings(schemes)
+	log.Printf("  - 协议支持矩阵（解析支持/检测支持/转发支持）:")
+	for _, scheme := range schemes {
+		status := currentProtocolAvailability(scheme)
+		note := ""
+		if status.RuntimeNote != "" {
+			note = " (" + status.RuntimeNote + ")"
+		}
+		log.Printf("    %s: %t/%t/%t [%s]%s", scheme, status.ParseSupport, status.DetectSupport, status.ForwardSupport, status.Availability, note)
+	}
+}
+
 var httpSocksMixedSchemes = map[string]bool{
 	"http":    true,
 	"https":   true,
@@ -2425,6 +2559,9 @@ func parseMixedProxy(entry string) (scheme string, addr string, auth *proxy.Auth
 		if !mixedSupportedSchemes[s] {
 			return "", "", nil, "", fmt.Errorf("unsupported proxy scheme: %s", s)
 		}
+		if reason, disabled := mixedRuntimeDisabledSchemes[s]; disabled {
+			return "", "", nil, "", fmt.Errorf("%s: %s", reason, s)
+		}
 
 		var socksAuth *proxy.Auth
 		httpHeader := ""
@@ -2446,6 +2583,9 @@ func parseMixedProxy(entry string) (scheme string, addr string, auth *proxy.Auth
 		return s, u.Host, socksAuth, httpHeader, nil
 	}
 
+	if reason, disabled := mixedRuntimeDisabledSchemes["socks5"]; disabled {
+		return "", "", nil, "", fmt.Errorf("%s: %s", reason, "socks5")
+	}
 	return "socks5", entry, nil, "", nil
 }
 
@@ -3035,6 +3175,8 @@ func classifyHealthFailure(err error) (healthFailureCategory, string) {
 	switch {
 	case errors.Is(err, errMainstreamAdapterUnavailable), strings.Contains(msg, "detector.core is empty"):
 		return healthFailureCoreUnavailable, "core_unconfigured"
+	case strings.Contains(msg, "disabled_by_runtime"):
+		return healthFailureUnsupported, "disabled_by_runtime"
 	case strings.Contains(msg, "unsupported"):
 		return healthFailureUnsupported, "unsupported"
 	case strings.Contains(msg, "first record does not look like a tls handshake"), strings.Contains(msg, "tls: oversized record"), strings.Contains(msg, "malformed"), strings.Contains(msg, "server gave http response to https client"):
@@ -3341,6 +3483,7 @@ func healthCheckMixedProxiesSingleStage(proxies []string) MixedHealthCheckResult
 				status := mixedProxyHealthChecker(entry, false)
 				elapsed := time.Since(begin)
 				localLatencies = append(localLatencies, elapsed)
+				protocolAvailabilityTracker.record(status)
 				stats := localSummary[status.Scheme]
 				stats.addResult(status)
 				localSummary[status.Scheme] = stats
@@ -3528,6 +3671,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 				}
 				settings, _ := mixedHealthSettingsForProtocolWithTier(scheme, 1)
 				status := checkMainstreamProxyHealthStage1(entry, settings)
+				protocolAvailabilityTracker.record(status)
 				mu.Lock()
 				st := getStageStats(status.Scheme)
 				st.Total++
@@ -3578,6 +3722,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 				}
 				settings, _ := mixedHealthSettingsForProtocolWithTier(scheme, 2)
 				result := checkMainstreamProxyHealthStage2(entry, false, settings)
+				protocolAvailabilityTracker.record(result.Status)
 				mu.Lock()
 				st := getStageStats(result.Status.Scheme)
 				if result.Status.Healthy {
@@ -4409,6 +4554,8 @@ func buildPoolStatusPayload(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPoo
 	allHealthyProxies = mergeUniqueMixedEntries(allHealthyProxies, cfProxies)
 	allHealthyProxies = mergeUniqueMixedEntries(allHealthyProxies, cfMixedProxies)
 
+	protocolAvailability := protocolAvailabilityTracker.snapshot()
+
 	return map[string]interface{}{
 		"strict_proxy_count":            len(strictProxies),
 		"strict_current_proxy":          strictCurrent,
@@ -4433,6 +4580,7 @@ func buildPoolStatusPayload(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPoo
 		"mainstream_listen_port":        config.Ports.HTTPMainstreamMix,
 		"status_listen_addr":            port,
 		"mainstream_excluded_protocols": []string{"http", "https", "socks5", "socks5h"},
+		"protocol_availability":         protocolAvailability,
 	}
 }
 
@@ -4791,6 +4939,7 @@ func main() {
 	} else {
 		log.Printf("  - Mainstream core backend: not configured (set detector.core to mihomo/meta/singbox)")
 	}
+	logProtocolSupportMatrixAtStartup()
 
 	// Create proxy pools
 	strictPool := NewProxyPool(proxySwitchInterval, rotateEveryRequest)

@@ -19,6 +19,14 @@
 - 🔐 **双模式**: 严格模式（启用SSL验证）和宽松模式（禁用SSL验证）
 - 🧩 **混合协议识别**: HTTP Mixed 入口可识别 socks5/socks5h/http/https/vmess/vless/hy2（后3者按 HTTPS CONNECT 兼容模式接入）
 
+### 协议当前支持状态（运行时）
+
+- **SS**：实验性（当前默认 `disabled_by_runtime`，待内核适配完成后启用）。
+- **SSR**：需外部内核（当前默认 `disabled_by_runtime`，待内核适配完成后启用）。
+- **Trojan**：需外部内核（当前默认 `disabled_by_runtime`，待内核适配完成后启用）。
+- **VMESS / VLESS / HY2 / Hysteria / TUIC / WireGuard**：已接入解析链路；检测/转发依赖 `detector.core`，未配置时会显示 `core_unconfigured`。
+- **HTTP / HTTPS / SOCKS5 / SOCKS5H**：已支持（解析/检测/转发均可用）。
+
 ### 快速开始
 
 
