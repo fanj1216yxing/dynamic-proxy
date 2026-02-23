@@ -100,6 +100,17 @@ type Config struct {
 			DoTServer   string `yaml:"dot_server"`
 		} `yaml:"dns"`
 	} `yaml:"differential_probe"`
+	MainstreamMixed struct {
+		DegradeStrategy      string `yaml:"degrade_strategy"`
+		ExplicitErrorMessage string `yaml:"explicit_error_message"`
+	} `yaml:"mainstream_mixed"`
+	ProtocolSLO struct {
+		Enabled    bool           `yaml:"enabled"`
+		MinHealthy map[string]int `yaml:"min_healthy"`
+	} `yaml:"protocol_slo"`
+	Alerting struct {
+		ZeroMainstreamToleranceCycles int `yaml:"zero_mainstream_tolerance_cycles"`
+	} `yaml:"alerting"`
 }
 
 type HealthCheckSettings struct {
@@ -162,6 +173,38 @@ var upstreamDialerBuilder = buildUpstreamDialer
 var mainstreamAdapterFactory = func() mainstreamDialAdapter { return &mainstreamTCPConnectAdapter{} }
 var adapterMetrics = newAdapterObservabilityMetrics()
 var adapterBreaker = newUpstreamBreaker()
+
+type runtimeHealthState struct {
+	mu                            sync.RWMutex
+	ConsecutiveMainstreamZero     int
+	MainstreamProtocolHealthCount map[string]int
+	ProtocolSLOViolations         map[string]int
+	HighPriorityAlert             bool
+}
+
+func newRuntimeHealthState() *runtimeHealthState {
+	return &runtimeHealthState{
+		MainstreamProtocolHealthCount: make(map[string]int),
+		ProtocolSLOViolations:         make(map[string]int),
+	}
+}
+
+func (s *runtimeHealthState) Update(mainstreamProtocolCounts map[string]int, consecutiveZero int, sloViolations map[string]int, highPriority bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ConsecutiveMainstreamZero = consecutiveZero
+	s.MainstreamProtocolHealthCount = cloneProtocolIntMap(mainstreamProtocolCounts)
+	s.ProtocolSLOViolations = cloneProtocolIntMap(sloViolations)
+	s.HighPriorityAlert = highPriority
+}
+
+func (s *runtimeHealthState) Snapshot() (int, map[string]int, map[string]int, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ConsecutiveMainstreamZero, cloneProtocolIntMap(s.MainstreamProtocolHealthCount), cloneProtocolIntMap(s.ProtocolSLOViolations), s.HighPriorityAlert
+}
+
+var runtimeHealth = newRuntimeHealthState()
 
 //go:embed web/admin/index.html
 var adminPanelHTML string
@@ -498,6 +541,31 @@ func loadConfig(filename string) (*Config, error) {
 	}
 	if cfg.Ports.RotateControl == "" {
 		cfg.Ports.RotateControl = ":9090"
+	}
+	cfg.MainstreamMixed.DegradeStrategy = strings.ToLower(strings.TrimSpace(cfg.MainstreamMixed.DegradeStrategy))
+	if cfg.MainstreamMixed.DegradeStrategy == "" {
+		cfg.MainstreamMixed.DegradeStrategy = "explicit_error"
+	}
+	if cfg.MainstreamMixed.DegradeStrategy != "fallback_http_socks" && cfg.MainstreamMixed.DegradeStrategy != "explicit_error" {
+		return nil, fmt.Errorf("mainstream_mixed.degrade_strategy must be one of: fallback_http_socks, explicit_error")
+	}
+	if strings.TrimSpace(cfg.MainstreamMixed.ExplicitErrorMessage) == "" {
+		cfg.MainstreamMixed.ExplicitErrorMessage = "Mainstream upstream unavailable"
+	}
+	if cfg.ProtocolSLO.MinHealthy == nil {
+		cfg.ProtocolSLO.MinHealthy = map[string]int{}
+	}
+	normalizedSLO := make(map[string]int, len(cfg.ProtocolSLO.MinHealthy))
+	for protocol, min := range cfg.ProtocolSLO.MinHealthy {
+		normalized := strings.ToLower(strings.TrimSpace(protocol))
+		if normalized == "" || min <= 0 {
+			continue
+		}
+		normalizedSLO[normalized] = min
+	}
+	cfg.ProtocolSLO.MinHealthy = normalizedSLO
+	if cfg.Alerting.ZeroMainstreamToleranceCycles <= 0 {
+		cfg.Alerting.ZeroMainstreamToleranceCycles = 1
 	}
 
 	if cfg.CFChallengeCheck.Enabled {
@@ -5398,6 +5466,89 @@ func mergeUniqueMixedEntries(base []string, extras []string) []string {
 	return merged
 }
 
+func cloneProtocolIntMap(input map[string]int) map[string]int {
+	if len(input) == 0 {
+		return map[string]int{}
+	}
+	out := make(map[string]int, len(input))
+	for k, v := range input {
+		out[k] = v
+	}
+	return out
+}
+
+func protocolHealthyCounts(entries []string) map[string]int {
+	counts := make(map[string]int)
+	for _, entry := range entries {
+		scheme, _, _, _, err := parseMixedProxy(entry)
+		if err != nil || strings.TrimSpace(scheme) == "" {
+			scheme = detectProxyScheme(entry, "http")
+		}
+		scheme = strings.ToLower(strings.TrimSpace(scheme))
+		if scheme == "" {
+			scheme = "unknown"
+		}
+		counts[scheme]++
+	}
+	return counts
+}
+
+func evaluateMainstreamHealth(mainstreamHealthy []string) (string, []string) {
+	counts := protocolHealthyCounts(mainstreamHealthy)
+	tolerance := config.Alerting.ZeroMainstreamToleranceCycles
+	if tolerance <= 0 {
+		tolerance = 1
+	}
+
+	consecutiveZero := 0
+	if len(mainstreamHealthy) == 0 {
+		lastConsecutive, _, _, _ := runtimeHealth.Snapshot()
+		consecutiveZero = lastConsecutive + 1
+	}
+
+	sloViolations := make(map[string]int)
+	if config.ProtocolSLO.Enabled {
+		for protocol, minimum := range config.ProtocolSLO.MinHealthy {
+			normalized := strings.ToLower(strings.TrimSpace(protocol))
+			if normalized == "" || minimum <= 0 {
+				continue
+			}
+			if counts[normalized] < minimum {
+				sloViolations[normalized] = minimum - counts[normalized]
+			}
+		}
+	}
+
+	reasons := make([]string, 0)
+	highPriorityAlert := false
+	if consecutiveZero > tolerance {
+		highPriorityAlert = true
+		reasons = append(reasons, fmt.Sprintf("P1 mainstream=0持续%d个周期(阈值>%d)", consecutiveZero, tolerance))
+	}
+	if len(sloViolations) > 0 {
+		protocols := make([]string, 0, len(sloViolations))
+		for p := range sloViolations {
+			protocols = append(protocols, p)
+		}
+		sort.Strings(protocols)
+		parts := make([]string, 0, len(protocols))
+		for _, p := range protocols {
+			parts = append(parts, fmt.Sprintf("%s缺口%d", p, sloViolations[p]))
+		}
+		reasons = append(reasons, "协议级SLO不达标: "+strings.Join(parts, ","))
+	}
+
+	runtimeHealth.Update(counts, consecutiveZero, sloViolations, highPriorityAlert)
+
+	if highPriorityAlert {
+		return "alert", reasons
+	}
+	if len(reasons) > 0 {
+		return "degraded", reasons
+	}
+	return "ok", nil
+}
+
 func poolEntriesWithDefaultScheme(pool *ProxyPool, defaultScheme string) []string {
 	entries := pool.GetAll()
 	result := make([]string, 0, len(entries))
@@ -5462,6 +5613,13 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy non-http/socks5 mixed proxies found, keeping existing pool")
 	}
 
+	updateStatus, healthReasons := evaluateMainstreamHealth(mainstreamHealthy)
+	if updateStatus == "alert" {
+		log.Printf("[ALERT][P1][MAINSTREAM] %s", strings.Join(healthReasons, "; "))
+	} else if updateStatus == "degraded" {
+		log.Printf("[DEGRADED][MAINSTREAM] %s", strings.Join(healthReasons, "; "))
+	}
+
 	if config.CFChallengeCheck.Enabled {
 		if len(result.CFPass) > 0 {
 			cfMixedPool.Update(result.CFPass)
@@ -5471,7 +5629,11 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 		}
 	}
 
-	adminRuntime.MarkUpdated("ok")
+	if len(healthReasons) == 0 {
+		adminRuntime.MarkUpdated(updateStatus)
+	} else {
+		adminRuntime.MarkUpdated(updateStatus + ": " + strings.Join(healthReasons, "; "))
+	}
 }
 
 func startProxyUpdater(ctx context.Context, strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool, initialSync bool) {
@@ -5724,6 +5886,10 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 	proxyAddr, err := selectProxyWithBreaker(pool, fallbackPool)
 	if err != nil {
 		log.Printf("[HTTP-%s] ERROR: No proxy available for %s %s: %v", mode, r.Method, r.URL.String(), err)
+		if mode == "MAINSTREAM-MIXED" && config.MainstreamMixed.DegradeStrategy == "explicit_error" {
+			http.Error(w, config.MainstreamMixed.ExplicitErrorMessage, http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "No available proxies", http.StatusServiceUnavailable)
 		return
 	}
@@ -6128,32 +6294,40 @@ func buildPoolStatusPayload(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPoo
 	allHealthyProxies = mergeUniqueMixedEntries(allHealthyProxies, mainstreamProxies)
 	allHealthyProxies = mergeUniqueMixedEntries(allHealthyProxies, cfProxies)
 	allHealthyProxies = mergeUniqueMixedEntries(allHealthyProxies, cfMixedProxies)
+	protocolCounts := protocolHealthyCounts(allHealthyProxies)
+	mainstreamProtocolCounts := protocolHealthyCounts(mainstreamProxies)
+	mainstreamZeroCycles, _, sloViolations, highPriorityAlert := runtimeHealth.Snapshot()
 
 	return map[string]interface{}{
-		"strict_proxy_count":            len(strictProxies),
-		"strict_current_proxy":          strictCurrent,
-		"strict_proxies":                strictProxies,
-		"relaxed_proxy_count":           len(relaxedProxies),
-		"relaxed_current_proxy":         relaxedCurrent,
-		"relaxed_proxies":               relaxedProxies,
-		"cf_proxy_count":                len(cfProxies),
-		"cf_current_proxy":              cfCurrent,
-		"cf_proxies":                    cfProxies,
-		"http_socks_proxy_count":        len(mixedProxies),
-		"http_socks_current_proxy":      mixedCurrent,
-		"http_socks_proxies":            mixedProxies,
-		"mainstream_proxy_count":        len(mainstreamProxies),
-		"mainstream_current_proxy":      mainstreamCurrent,
-		"mainstream_proxies":            mainstreamProxies,
-		"cf_mixed_proxy_count":          len(cfMixedProxies),
-		"cf_mixed_current_proxy":        cfMixedCurrent,
-		"cf_mixed_proxies":              cfMixedProxies,
-		"all_healthy_proxy_count":       len(allHealthyProxies),
-		"all_healthy_proxies":           allHealthyProxies,
-		"mainstream_listen_port":        config.Ports.HTTPMainstreamMix,
-		"status_listen_addr":            port,
-		"mainstream_excluded_protocols": []string{"http", "https", "socks5", "socks5h"},
-		"error_code_counts":             mixedHealthErrorCodeMetrics.Snapshot(),
+		"strict_proxy_count":                 len(strictProxies),
+		"strict_current_proxy":               strictCurrent,
+		"strict_proxies":                     strictProxies,
+		"relaxed_proxy_count":                len(relaxedProxies),
+		"relaxed_current_proxy":              relaxedCurrent,
+		"relaxed_proxies":                    relaxedProxies,
+		"cf_proxy_count":                     len(cfProxies),
+		"cf_current_proxy":                   cfCurrent,
+		"cf_proxies":                         cfProxies,
+		"http_socks_proxy_count":             len(mixedProxies),
+		"http_socks_current_proxy":           mixedCurrent,
+		"http_socks_proxies":                 mixedProxies,
+		"mainstream_proxy_count":             len(mainstreamProxies),
+		"mainstream_current_proxy":           mainstreamCurrent,
+		"mainstream_proxies":                 mainstreamProxies,
+		"cf_mixed_proxy_count":               len(cfMixedProxies),
+		"cf_mixed_current_proxy":             cfMixedCurrent,
+		"cf_mixed_proxies":                   cfMixedProxies,
+		"all_healthy_proxy_count":            len(allHealthyProxies),
+		"all_healthy_proxies":                allHealthyProxies,
+		"protocol_healthy_counts":            protocolCounts,
+		"mainstream_protocol_healthy_counts": mainstreamProtocolCounts,
+		"mainstream_zero_cycles":             mainstreamZeroCycles,
+		"protocol_slo_violations":            sloViolations,
+		"high_priority_alert":                highPriorityAlert,
+		"mainstream_listen_port":             config.Ports.HTTPMainstreamMix,
+		"status_listen_addr":                 port,
+		"mainstream_excluded_protocols":      []string{"http", "https", "socks5", "socks5h"},
+		"error_code_counts":                  mixedHealthErrorCodeMetrics.Snapshot(),
 	}
 }
 
@@ -6309,7 +6483,11 @@ func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool
 			"strict":                      map[string]interface{}{"available": payload["strict_proxy_count"]},
 			"relaxed":                     map[string]interface{}{"available": payload["relaxed_proxy_count"]},
 			"mixed":                       map[string]interface{}{"available": payload["http_socks_proxy_count"]},
+			"mainstream":                  map[string]interface{}{"available": payload["mainstream_proxy_count"]},
 			"all_healthy":                 allHealthyCount,
+			"protocol_healthy_counts":     payload["protocol_healthy_counts"],
+			"protocol_slo_violations":     payload["protocol_slo_violations"],
+			"high_priority_alert":         payload["high_priority_alert"],
 			"last_update_status":          status,
 			"mixed_stage_funnel_by_proto": buildStageFunnelByProtocol(),
 		}
@@ -6349,6 +6527,9 @@ func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool
 			"update_interval_minutes":   config.UpdateIntervalMinutes,
 			"health_check_concurrency":  config.HealthCheckConcurrency,
 			"proxy_switch_interval_min": config.ProxySwitchIntervalMin,
+			"mainstream_mixed":          config.MainstreamMixed,
+			"protocol_slo":              config.ProtocolSLO,
+			"alerting":                  config.Alerting,
 			"ports":                     config.Ports,
 			"auth_enabled":              isProxyAuthEnabled(),
 		})
@@ -6938,6 +7119,10 @@ func main() {
 	// Start servers
 	var wg sync.WaitGroup
 	wg.Add(9)
+	var mainstreamFallbackPool *ProxyPool
+	if config.MainstreamMixed.DegradeStrategy == "fallback_http_socks" {
+		mainstreamFallbackPool = mixedHTTPPool
+	}
 
 	// SOCKS5 Strict
 	go func() {
@@ -6998,7 +7183,7 @@ func main() {
 	// HTTP Mainstream Mixed (VMESS/VLESS/HY2 upstream)
 	go func() {
 		defer wg.Done()
-		if err := startHTTPServer(mainstreamMixedHTTPPool, nil, config.Ports.HTTPMainstreamMix, "MAINSTREAM-MIXED"); err != nil {
+		if err := startHTTPServer(mainstreamMixedHTTPPool, mainstreamFallbackPool, config.Ports.HTTPMainstreamMix, "MAINSTREAM-MIXED"); err != nil {
 			log.Fatalf("[MAINSTREAM-MIXED] HTTP server error: %v", err)
 		}
 	}()
@@ -7016,6 +7201,7 @@ func main() {
 	log.Println("  [RELAXED] SOCKS5: " + config.Ports.SOCKS5Relaxed + " | HTTP: " + config.Ports.HTTPRelaxed)
 	log.Println("  [MIXED] HTTP (HTTP/HTTPS/SOCKS upstream): " + config.Ports.HTTPMixed)
 	log.Println("  [MAINSTREAM-MIXED] HTTP (all non-http/socks5 upstream): " + config.Ports.HTTPMainstreamMix)
+	log.Printf("  [MAINSTREAM-MIXED] Degrade strategy: %s", config.MainstreamMixed.DegradeStrategy)
 	log.Println("  [CF-MIXED] HTTP (CF-pass SOCKS5/HTTP upstream): " + config.Ports.HTTPCFMixed)
 	log.Println("  [ROTATE] Control: " + config.Ports.RotateControl)
 	log.Println("  [STATUS] Pool list: :17233/list")

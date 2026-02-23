@@ -5,6 +5,10 @@ import (
 	"testing"
 )
 
+func resetRuntimeHealthForTest() {
+	runtimeHealth = newRuntimeHealthState()
+}
+
 func assertSchemeCoverage(t *testing.T, entries []string, wanted ...string) {
 	t.Helper()
 	seen := make(map[string]bool)
@@ -91,5 +95,46 @@ func TestShouldAllowInsecureByWhitelist(t *testing.T) {
 	allowed, _ = shouldAllowInsecureByWhitelist("trojan://p@allowed.example.com:443?sni=allowed.example.com&alpn=h2")
 	if allowed {
 		t.Fatalf("expected missing insecure=true to be denied when require_insecure=true")
+	}
+}
+
+func TestProtocolHealthyCounts(t *testing.T) {
+	counts := protocolHealthyCounts([]string{
+		"http://1.1.1.1:80",
+		"socks5://2.2.2.2:1080",
+		"vless://uuid@vl.example.com:443?encryption=none",
+		"vless://uuid@vl2.example.com:443?encryption=none",
+		"trojan://pass@tr.example.com:443",
+	})
+
+	if counts["http"] != 1 || counts["socks5"] != 1 || counts["vless"] != 2 || counts["trojan"] != 1 {
+		t.Fatalf("unexpected protocol counts: %#v", counts)
+	}
+}
+
+func TestEvaluateMainstreamHealthAlertAndSLO(t *testing.T) {
+	config = Config{}
+	config.Alerting.ZeroMainstreamToleranceCycles = 1
+	config.ProtocolSLO.Enabled = true
+	config.ProtocolSLO.MinHealthy = map[string]int{"vless": 1, "hy2": 1, "trojan": 1}
+	resetRuntimeHealthForTest()
+
+	status1, reasons1 := evaluateMainstreamHealth(nil)
+	if status1 != "degraded" {
+		t.Fatalf("expected degraded on first empty cycle, got %s (%v)", status1, reasons1)
+	}
+
+	status2, reasons2 := evaluateMainstreamHealth(nil)
+	if status2 != "alert" {
+		t.Fatalf("expected alert on second empty cycle, got %s (%v)", status2, reasons2)
+	}
+
+	status3, reasons3 := evaluateMainstreamHealth([]string{
+		"vless://uuid@vl.example.com:443?encryption=none",
+		"hy2://pass@hy.example.com:443?sni=hy.example.com",
+		"trojan://pass@tr.example.com:443?sni=tr.example.com",
+	})
+	if status3 != "ok" || len(reasons3) != 0 {
+		t.Fatalf("expected ok with no reasons, got %s (%v)", status3, reasons3)
 	}
 }
