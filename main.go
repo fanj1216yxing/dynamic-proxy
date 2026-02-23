@@ -195,6 +195,26 @@ func loadConfig(filename string) (*Config, error) {
 		cfg.HealthCheckProtocolOverrides = make(map[string]TwoStageHealthCheckSettings)
 	}
 	defaultProtocolOverrides := map[string]TwoStageHealthCheckSettings{
+		"http": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 5, TLSHandshakeThresholdSeconds: 5},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 5, TLSHandshakeThresholdSeconds: 5},
+		},
+		"https": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 5, TLSHandshakeThresholdSeconds: 5},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 5, TLSHandshakeThresholdSeconds: 5},
+		},
+		"ss": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 10, TLSHandshakeThresholdSeconds: 6},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 45, TLSHandshakeThresholdSeconds: 15},
+		},
+		"ssr": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 10, TLSHandshakeThresholdSeconds: 6},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 45, TLSHandshakeThresholdSeconds: 15},
+		},
+		"trojan": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 10, TLSHandshakeThresholdSeconds: 6},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 45, TLSHandshakeThresholdSeconds: 15},
+		},
 		"vmess": {
 			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 6, TLSHandshakeThresholdSeconds: 3},
 			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 15, TLSHandshakeThresholdSeconds: 8},
@@ -3069,18 +3089,33 @@ func mixedHealthTargetAddr() string {
 }
 
 func mixedHealthSettingsForProtocol(scheme string, stage int) HealthCheckSettings {
+	settings, _ := mixedHealthSettingsForProtocolWithTier(scheme, stage)
+	return settings
+}
+
+func mixedHealthSettingsForProtocolWithTier(scheme string, stage int) (HealthCheckSettings, string) {
 	scheme = strings.ToLower(strings.TrimSpace(scheme))
 	override, ok := config.HealthCheckProtocolOverrides[scheme]
-	if !ok {
+	if ok {
 		if stage == 1 {
-			return config.HealthCheckTwoStage.StageOne
+			if override.StageOne.TotalTimeoutSeconds > 0 && override.StageOne.TLSHandshakeThresholdSeconds > 0 {
+				return override.StageOne, "protocol_override"
+			}
+		} else if override.StageTwo.TotalTimeoutSeconds > 0 && override.StageTwo.TLSHandshakeThresholdSeconds > 0 {
+			return override.StageTwo, "protocol_override"
 		}
-		return config.HealthCheckTwoStage.StageTwo
 	}
+
 	if stage == 1 {
-		return override.StageOne
+		if config.HealthCheckTwoStage.StageOne.TotalTimeoutSeconds > 0 && config.HealthCheckTwoStage.StageOne.TLSHandshakeThresholdSeconds > 0 {
+			return config.HealthCheckTwoStage.StageOne, "two_stage_default"
+		}
+		return config.HealthCheck, "global_health_check"
 	}
-	return override.StageTwo
+	if config.HealthCheckTwoStage.StageTwo.TotalTimeoutSeconds > 0 && config.HealthCheckTwoStage.StageTwo.TLSHandshakeThresholdSeconds > 0 {
+		return config.HealthCheckTwoStage.StageTwo, "two_stage_default"
+	}
+	return config.HealthCheck, "global_health_check"
 }
 
 func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSettings) proxyHealthStatus {
@@ -3232,8 +3267,8 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureUnreachable, Reason: fmt.Sprintf("unexpected status: %d", resp.StatusCode)}, Latency: latency}
 	}
 
-	if latency > threshold {
-		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, Reason: "stage2 http verification exceeded threshold"}, Latency: latency}
+	if tlsHandshakeDone && phase.TLSHello+phase.CertVerify > threshold {
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, Reason: "stage2 tls handshake exceeded threshold"}, Latency: latency}
 	}
 
 	log.Printf("[MIXED-TLS-PHASE] scheme=%s dns=%s tcp_connect=%s tls_clienthello=%s cert_verify=%s first_byte=%s",
@@ -3441,6 +3476,30 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 		workerCount = 1
 	}
 
+	loggedSchemes := make(map[string]struct{})
+	for _, entry := range proxies {
+		scheme := "unknown"
+		if parsedScheme, _, _, _, err := parseMixedProxy(entry); err == nil && parsedScheme != "" {
+			scheme = parsedScheme
+		}
+		scheme = strings.ToLower(strings.TrimSpace(scheme))
+		if _, exists := loggedSchemes[scheme]; exists {
+			continue
+		}
+		stageOneSettings, stageOneTier := mixedHealthSettingsForProtocolWithTier(scheme, 1)
+		stageTwoSettings, stageTwoTier := mixedHealthSettingsForProtocolWithTier(scheme, 2)
+		log.Printf("[MIXED-2STAGE-POLICY] scheme=%s stage1={tier:%s timeout:%ds tls_threshold:%ds} stage2={tier:%s timeout:%ds tls_threshold:%ds}",
+			scheme,
+			stageOneTier,
+			stageOneSettings.TotalTimeoutSeconds,
+			stageOneSettings.TLSHandshakeThresholdSeconds,
+			stageTwoTier,
+			stageTwoSettings.TotalTimeoutSeconds,
+			stageTwoSettings.TLSHandshakeThresholdSeconds,
+		)
+		loggedSchemes[scheme] = struct{}{}
+	}
+
 	stageStats := make(map[string]*mixedTwoStageStats)
 	getStageStats := func(scheme string) *mixedTwoStageStats {
 		if scheme == "" {
@@ -3467,7 +3526,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 				if parsedScheme, _, _, _, err := parseMixedProxy(entry); err == nil && parsedScheme != "" {
 					scheme = parsedScheme
 				}
-				settings := mixedHealthSettingsForProtocol(scheme, 1)
+				settings, _ := mixedHealthSettingsForProtocolWithTier(scheme, 1)
 				status := checkMainstreamProxyHealthStage1(entry, settings)
 				mu.Lock()
 				st := getStageStats(status.Scheme)
@@ -3517,7 +3576,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 				if parsedScheme, _, _, _, err := parseMixedProxy(entry); err == nil && parsedScheme != "" {
 					scheme = parsedScheme
 				}
-				settings := mixedHealthSettingsForProtocol(scheme, 2)
+				settings, _ := mixedHealthSettingsForProtocolWithTier(scheme, 2)
 				result := checkMainstreamProxyHealthStage2(entry, false, settings)
 				mu.Lock()
 				st := getStageStats(result.Status.Scheme)
