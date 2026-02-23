@@ -1133,6 +1133,46 @@ func (d *httpConnectUpstreamDialer) DialContext(ctx context.Context, network, ad
 	return dialTargetThroughHTTPProxy(ctx, d.proxyScheme, d.proxyAddr, d.proxyAuthHeader, addr)
 }
 
+var errMainstreamAdapterUnavailable = errors.New("mainstream upstream adapter unavailable")
+
+type mainstreamDialAdapter interface {
+	DialContext(ctx context.Context, proxyScheme, proxyEntry, proxyAddr, network, addr string) (net.Conn, error)
+}
+
+type mainstreamUpstreamDialer struct {
+	proxyScheme string
+	proxyEntry  string
+	proxyAddr   string
+	adapter     mainstreamDialAdapter
+}
+
+func (d *mainstreamUpstreamDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if d.adapter == nil {
+		return nil, fmt.Errorf("%w: %s", errMainstreamAdapterUnavailable, d.proxyScheme)
+	}
+	return d.adapter.DialContext(ctx, d.proxyScheme, d.proxyEntry, d.proxyAddr, network, addr)
+}
+
+type mainstreamTCPConnectAdapter struct{}
+
+func (a *mainstreamTCPConnectAdapter) DialContext(ctx context.Context, proxyScheme, proxyEntry, proxyAddr, network, addr string) (net.Conn, error) {
+	if network != "tcp" {
+		return nil, fmt.Errorf("unsupported network %s for mainstream upstream", network)
+	}
+
+	// 预留给外部适配器进程：当前未配置时返回能力缺失，供健康检查分类。
+	return nil, fmt.Errorf("%w: no adapter configured for %s (%s -> %s)", errMainstreamAdapterUnavailable, proxyScheme, proxyAddr, addr)
+}
+
+func newMainstreamUpstreamDialer(proxyScheme, proxyEntry, proxyAddr string) UpstreamDialer {
+	return &mainstreamUpstreamDialer{
+		proxyScheme: proxyScheme,
+		proxyEntry:  proxyEntry,
+		proxyAddr:   proxyAddr,
+		adapter:     &mainstreamTCPConnectAdapter{},
+	}
+}
+
 func buildUpstreamDialer(entry string) (UpstreamDialer, string, error) {
 	scheme, addr, auth, httpAuthHeader, err := parseMixedProxy(entry)
 	if err != nil {
@@ -1151,7 +1191,7 @@ func buildUpstreamDialer(entry string) (UpstreamDialer, string, error) {
 	case "http", "https":
 		return &httpConnectUpstreamDialer{proxyScheme: dialScheme, proxyAddr: dialAddr, proxyAuthHeader: httpAuthHeader}, scheme, nil
 	case "vmess", "vless", "hy2", "hysteria", "hysteria2", "trojan", "ss", "ssr", "tuic", "wg", "wireguard":
-		return nil, scheme, fmt.Errorf("unsupported upstream proxy scheme: %s", scheme)
+		return newMainstreamUpstreamDialer(scheme, entry, dialAddr), scheme, nil
 	default:
 		return nil, scheme, fmt.Errorf("unknown upstream proxy scheme: %s", scheme)
 	}
@@ -2152,6 +2192,7 @@ type healthFailureCategory string
 const (
 	healthFailureNone        healthFailureCategory = "none"
 	healthFailureParse       healthFailureCategory = "parse_failed"
+	healthFailureUnsupported healthFailureCategory = "unsupported"
 	healthFailureHandshake   healthFailureCategory = "handshake_failed"
 	healthFailureAuth        healthFailureCategory = "auth_failed"
 	healthFailureTimeout     healthFailureCategory = "timeout"
@@ -2169,6 +2210,7 @@ type protocolStats struct {
 	Total         int64
 	Success       int64
 	ParseFailed   int64
+	Unsupported   int64
 	HandshakeFail int64
 	AuthFail      int64
 	Timeout       int64
@@ -2184,6 +2226,8 @@ func (s *protocolStats) addResult(status proxyHealthStatus) {
 	switch status.Category {
 	case healthFailureParse:
 		s.ParseFailed++
+	case healthFailureUnsupported:
+		s.Unsupported++
 	case healthFailureHandshake:
 		s.HandshakeFail++
 	case healthFailureAuth:
@@ -2217,6 +2261,8 @@ func classifyHealthFailure(err error) healthFailureCategory {
 
 	msg := strings.ToLower(err.Error())
 	switch {
+	case errors.Is(err, errMainstreamAdapterUnavailable), strings.Contains(msg, "adapter unavailable"), strings.Contains(msg, "no adapter configured"):
+		return healthFailureUnsupported
 	case strings.Contains(msg, "timeout"), strings.Contains(msg, "deadline exceeded"):
 		return healthFailureTimeout
 	case strings.Contains(msg, "auth"), strings.Contains(msg, "unauthorized"), strings.Contains(msg, "forbidden"):
@@ -2234,7 +2280,7 @@ func checkMainstreamProxyHealth(proxyEntry string, strictMode bool) proxyHealthS
 		scheme = "unknown"
 	}
 	if err != nil {
-		if strings.Contains(err.Error(), "unsupported upstream proxy scheme") || strings.Contains(err.Error(), "invalid") {
+		if strings.Contains(err.Error(), "invalid") {
 			return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, Reason: err.Error()}
 		}
 		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: classifyHealthFailure(err), Reason: err.Error()}
@@ -2352,6 +2398,7 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 				stats.Total += local.Total
 				stats.Success += local.Success
 				stats.ParseFailed += local.ParseFailed
+				stats.Unsupported += local.Unsupported
 				stats.HandshakeFail += local.HandshakeFail
 				stats.AuthFail += local.AuthFail
 				stats.Timeout += local.Timeout
@@ -2382,12 +2429,13 @@ func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 		if stats.Total > 0 {
 			successRate = float64(stats.Success) / float64(stats.Total) * 100
 		}
-		log.Printf("[MIXED-SUMMARY] scheme=%s total=%d success=%d success_rate=%.1f%% failures={parse:%d handshake:%d auth:%d timeout:%d unreachable:%d}",
+		log.Printf("[MIXED-SUMMARY] scheme=%s total=%d success=%d success_rate=%.1f%% failures={parse:%d unsupported:%d handshake:%d auth:%d timeout:%d unreachable:%d}",
 			scheme,
 			stats.Total,
 			stats.Success,
 			successRate,
 			stats.ParseFailed,
+			stats.Unsupported,
 			stats.HandshakeFail,
 			stats.AuthFail,
 			stats.Timeout,
