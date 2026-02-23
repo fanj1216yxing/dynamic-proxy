@@ -781,6 +781,25 @@ func TestParseKernelNodeConfig_MapsSSSSRAndTrojanFields(t *testing.T) {
 	}
 }
 
+func TestValidateKernelNodeConfig_InvalidTrojanWSPath(t *testing.T) {
+	node := kernelNodeConfig{Protocol: "trojan", Address: "1.1.1.1", Port: "443"}
+	node.Trojan.Password = "secret"
+	node.Trojan.Network = "ws"
+	node.Trojan.Path = "invalid"
+	if err := validateKernelNodeConfig(node); err == nil {
+		t.Fatalf("expected trojan ws path validation error")
+	}
+}
+
+func TestValidateKernelNodeConfig_PortRange(t *testing.T) {
+	node := kernelNodeConfig{Protocol: "ss", Address: "1.1.1.1", Port: "70000"}
+	node.SS.Cipher = "aes-256-gcm"
+	node.SS.Password = "pwd"
+	if err := validateKernelNodeConfig(node); err == nil {
+		t.Fatalf("expected port range validation error")
+	}
+}
+
 type fixedTargetDialer struct {
 	targetAddr string
 }

@@ -113,12 +113,20 @@ var config Config
 const connectivityCheckInterval = 10 * time.Second
 const defaultMixedHealthCheckURL = "https://www.google.com"
 const healthCheckBatchSize = 50000
+const adapterDialTimeout = 10 * time.Second
+const healthCheckMaxRetries = 2
+const requestForwardMaxRetries = 3
+const retryBaseBackoff = 150 * time.Millisecond
+const breakerFailureThreshold = 3
+const breakerOpenTimeout = 30 * time.Second
 
 var mixedHealthCheckURL = defaultMixedHealthCheckURL
 var mixedProxyHealthChecker = checkMainstreamProxyHealth
 var mixedCFBypassChecker = checkCloudflareBypassMixed
 var upstreamDialerBuilder = buildUpstreamDialer
 var mainstreamAdapterFactory = func() mainstreamDialAdapter { return &mainstreamTCPConnectAdapter{} }
+var adapterMetrics = newAdapterObservabilityMetrics()
+var adapterBreaker = newUpstreamBreaker()
 
 //go:embed web/admin/index.html
 var adminPanelHTML string
@@ -146,6 +154,155 @@ func (a *AdminRuntime) Snapshot() (time.Time, time.Time, string) {
 }
 
 var adminRuntime = &AdminRuntime{}
+
+type adapterObservabilityMetrics struct {
+	mu                  sync.RWMutex
+	dialTotal           map[string]int64
+	dialLatencyBuckets  map[string]int64
+	breakerState        map[string]int64
+	retryExhaustedTotal int64
+}
+
+func newAdapterObservabilityMetrics() *adapterObservabilityMetrics {
+	return &adapterObservabilityMetrics{
+		dialTotal:          make(map[string]int64),
+		dialLatencyBuckets: make(map[string]int64),
+		breakerState:       make(map[string]int64),
+	}
+}
+
+func (m *adapterObservabilityMetrics) AddDial(protocol, result, errorCode string, latency time.Duration) {
+	key := strings.ToLower(strings.TrimSpace(protocol)) + "|" + strings.TrimSpace(result) + "|" + strings.TrimSpace(errorCode)
+	bucket := dialLatencyBucket(latency)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dialTotal[key]++
+	m.dialLatencyBuckets[bucket]++
+}
+
+func (m *adapterObservabilityMetrics) SetBreakerState(protocol, upstream string, state bool) {
+	key := strings.ToLower(strings.TrimSpace(protocol)) + "|" + strings.TrimSpace(upstream)
+	value := int64(0)
+	if state {
+		value = 1
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.breakerState[key] = value
+}
+
+func (m *adapterObservabilityMetrics) IncRetryExhausted() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.retryExhaustedTotal++
+}
+
+func (m *adapterObservabilityMetrics) Snapshot() map[string]interface{} {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	dialTotal := make(map[string]int64, len(m.dialTotal))
+	for k, v := range m.dialTotal {
+		dialTotal[k] = v
+	}
+	buckets := make(map[string]int64, len(m.dialLatencyBuckets))
+	for k, v := range m.dialLatencyBuckets {
+		buckets[k] = v
+	}
+	breaker := make(map[string]int64, len(m.breakerState))
+	for k, v := range m.breakerState {
+		breaker[k] = v
+	}
+	return map[string]interface{}{
+		"adapter_dial_total":             dialTotal,
+		"adapter_dial_latency_ms_bucket": buckets,
+		"adapter_breaker_state":          breaker,
+		"adapter_retry_exhausted_total":  m.retryExhaustedTotal,
+	}
+}
+
+func dialLatencyBucket(latency time.Duration) string {
+	ms := latency.Milliseconds()
+	switch {
+	case ms <= 10:
+		return "le_10"
+	case ms <= 50:
+		return "le_50"
+	case ms <= 100:
+		return "le_100"
+	case ms <= 300:
+		return "le_300"
+	case ms <= 500:
+		return "le_500"
+	case ms <= 1000:
+		return "le_1000"
+	default:
+		return "gt_1000"
+	}
+}
+
+type breakerState struct {
+	consecutiveFailures int
+	openUntil           time.Time
+}
+
+type upstreamBreaker struct {
+	mu     sync.Mutex
+	states map[string]breakerState
+}
+
+func newUpstreamBreaker() *upstreamBreaker {
+	return &upstreamBreaker{states: make(map[string]breakerState)}
+}
+
+func breakerKey(protocol, upstream string) string {
+	return strings.ToLower(strings.TrimSpace(protocol)) + "|" + strings.TrimSpace(upstream)
+}
+
+func (b *upstreamBreaker) Allow(protocol, upstream string) bool {
+	key := breakerKey(protocol, upstream)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := b.states[key]
+	open := time.Now().Before(state.openUntil)
+	adapterMetrics.SetBreakerState(protocol, upstream, open)
+	return !open
+}
+
+func (b *upstreamBreaker) RecordSuccess(protocol, upstream string) {
+	key := breakerKey(protocol, upstream)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.states[key] = breakerState{}
+	adapterMetrics.SetBreakerState(protocol, upstream, false)
+}
+
+func (b *upstreamBreaker) RecordFailure(protocol, upstream string) {
+	key := breakerKey(protocol, upstream)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := b.states[key]
+	state.consecutiveFailures++
+	if state.consecutiveFailures >= breakerFailureThreshold {
+		state.openUntil = time.Now().Add(breakerOpenTimeout)
+		state.consecutiveFailures = 0
+	}
+	b.states[key] = state
+	adapterMetrics.SetBreakerState(protocol, upstream, time.Now().Before(state.openUntil))
+}
+
+func withDialTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, adapterDialTimeout)
+}
+
+func retryBackoff(attempt int) time.Duration {
+	if attempt <= 0 {
+		return 0
+	}
+	return retryBaseBackoff * time.Duration(1<<(attempt-1))
+}
 
 // Simple regex to extract ip:port from any format (used for special proxy lists)
 // Matches: [IP]:[port] and ignores any protocol prefixes or extra text
@@ -1507,6 +1664,9 @@ type socksUpstreamDialer struct {
 }
 
 func (d *socksUpstreamDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	ctx, cancel := withDialTimeout(ctx)
+	defer cancel()
+	start := time.Now()
 	timeout := 10 * time.Second
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
@@ -1534,14 +1694,17 @@ func (d *socksUpstreamDialer) DialContext(ctx context.Context, network, addr str
 
 	select {
 	case <-ctx.Done():
+		adapterMetrics.AddDial("socks5", "error", "deadline_exceeded", time.Since(start))
 		return nil, ctx.Err()
 	case result := <-resultCh:
 		if result.err != nil {
+			adapterMetrics.AddDial("socks5", "error", "dial_failed", time.Since(start))
 			return nil, result.err
 		}
 		if deadline, ok := ctx.Deadline(); ok {
 			_ = result.conn.SetDeadline(deadline)
 		}
+		adapterMetrics.AddDial("socks5", "success", "", time.Since(start))
 		return result.conn, nil
 	}
 }
@@ -1556,7 +1719,16 @@ func (d *httpConnectUpstreamDialer) DialContext(ctx context.Context, network, ad
 	if network != "tcp" {
 		return nil, fmt.Errorf("unsupported network %s for HTTP upstream", network)
 	}
-	return dialTargetThroughHTTPProxy(ctx, d.proxyScheme, d.proxyAddr, d.proxyAuthHeader, addr)
+	ctx, cancel := withDialTimeout(ctx)
+	defer cancel()
+	start := time.Now()
+	conn, err := dialTargetThroughHTTPProxy(ctx, d.proxyScheme, d.proxyAddr, d.proxyAuthHeader, addr)
+	if err != nil {
+		adapterMetrics.AddDial(d.proxyScheme, "error", "connect_failed", time.Since(start))
+		return nil, err
+	}
+	adapterMetrics.AddDial(d.proxyScheme, "success", "", time.Since(start))
+	return conn, nil
 }
 
 var errMainstreamAdapterUnavailable = errors.New("mainstream upstream adapter unavailable")
@@ -1617,6 +1789,8 @@ type tcpConnectCoreBackend struct {
 }
 
 func (b *tcpConnectCoreBackend) DialContext(ctx context.Context, _ kernelNodeConfig, network, addr string) (net.Conn, error) {
+	ctx, cancel := withDialTimeout(ctx)
+	defer cancel()
 	return (&net.Dialer{}).DialContext(ctx, network, addr)
 }
 
@@ -1639,6 +1813,8 @@ func (b *embeddedSSBackend) HealthCheck(ctx context.Context, node kernelNodeConf
 }
 
 func (b *embeddedSSBackend) DialContext(ctx context.Context, node kernelNodeConfig, network, addr string) (net.Conn, error) {
+	ctx, cancel := withDialTimeout(ctx)
+	defer cancel()
 	if network != "tcp" {
 		return nil, fmt.Errorf("embedded ss backend unsupported network=%s", network)
 	}
@@ -1778,6 +1954,8 @@ func (b *externalKernelBackend) HealthCheck(ctx context.Context, node kernelNode
 }
 
 func (b *externalKernelBackend) DialContext(ctx context.Context, node kernelNodeConfig, network, addr string) (net.Conn, error) {
+	ctx, cancel := withDialTimeout(ctx)
+	defer cancel()
 	if network != "tcp" {
 		return nil, fmt.Errorf("external kernel backend unsupported network=%s", network)
 	}
@@ -1922,7 +2100,53 @@ func parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr string) (kernelNod
 		node.Trojan.Host = n.Host
 	}
 
+	if err := validateKernelNodeConfig(node); err != nil {
+		return kernelNodeConfig{}, err
+	}
+
 	return node, nil
+}
+
+func validateKernelNodeConfig(node kernelNodeConfig) error {
+	if strings.TrimSpace(node.Protocol) == "" {
+		return fmt.Errorf("invalid kernel node: missing protocol")
+	}
+	if strings.TrimSpace(node.Address) == "" {
+		return fmt.Errorf("invalid kernel node: missing address")
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(node.Port))
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("invalid kernel node: port out of range")
+	}
+	switch node.Protocol {
+	case "ss":
+		if strings.TrimSpace(node.SS.Cipher) == "" || strings.TrimSpace(node.SS.Password) == "" {
+			return fmt.Errorf("invalid ss entry missing cipher/password")
+		}
+	case "ssr":
+		if strings.TrimSpace(node.SSR.Cipher) == "" || strings.TrimSpace(node.SSR.Password) == "" || strings.TrimSpace(node.SSR.Protocol) == "" || strings.TrimSpace(node.SSR.Obfs) == "" {
+			return fmt.Errorf("invalid ssr entry missing required fields")
+		}
+	case "trojan":
+		if strings.TrimSpace(node.Trojan.Password) == "" {
+			return fmt.Errorf("invalid trojan entry missing password")
+		}
+		for _, alpn := range node.Trojan.ALPN {
+			if strings.TrimSpace(alpn) == "" || strings.ContainsAny(alpn, " \t\n") {
+				return fmt.Errorf("invalid trojan alpn value")
+			}
+		}
+		network := strings.ToLower(strings.TrimSpace(node.Trojan.Network))
+		if network != "" && network != "ws" && network != "tcp" {
+			return fmt.Errorf("invalid trojan network type: %s", network)
+		}
+		if network == "ws" {
+			if strings.TrimSpace(node.Trojan.Path) == "" || !strings.HasPrefix(node.Trojan.Path, "/") {
+				return fmt.Errorf("invalid trojan ws path")
+			}
+		}
+	}
+	return nil
 }
 
 type ssrKernelNode struct {
@@ -2052,17 +2276,28 @@ type mainstreamUpstreamDialer struct {
 }
 
 func (d *mainstreamUpstreamDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	ctx, cancel := withDialTimeout(ctx)
+	defer cancel()
+	start := time.Now()
 	if d.adapter == nil {
+		adapterMetrics.AddDial(d.proxyScheme, "error", "adapter_unavailable", time.Since(start))
 		return nil, fmt.Errorf("%w: %s", errMainstreamAdapterUnavailable, d.proxyScheme)
 	}
 	if checker, ok := d.adapter.(interface {
 		CheckAvailability(ctx context.Context, proxyScheme, proxyEntry, proxyAddr string) error
 	}); ok {
 		if err := checker.CheckAvailability(ctx, d.proxyScheme, d.proxyEntry, d.proxyAddr); err != nil {
+			adapterMetrics.AddDial(d.proxyScheme, "error", "core_unavailable", time.Since(start))
 			return nil, err
 		}
 	}
-	return d.adapter.DialContext(ctx, d.proxyScheme, d.proxyEntry, d.proxyAddr, network, addr)
+	conn, err := d.adapter.DialContext(ctx, d.proxyScheme, d.proxyEntry, d.proxyAddr, network, addr)
+	if err != nil {
+		adapterMetrics.AddDial(d.proxyScheme, "error", "dial_failed", time.Since(start))
+		return nil, err
+	}
+	adapterMetrics.AddDial(d.proxyScheme, "success", "", time.Since(start))
+	return conn, nil
 }
 
 type mainstreamTCPConnectAdapter struct{}
@@ -2688,6 +2923,7 @@ func checkCloudflareBypassMixed(proxyEntry string) bool {
 	timeout := time.Duration(config.CFChallengeCheck.TimeoutSeconds) * time.Second
 	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	transport.DialContext = dialer.DialContext
+	defer transport.CloseIdleConnections()
 
 	client := &http.Client{Transport: transport, Timeout: timeout}
 	req, err := http.NewRequest(http.MethodGet, config.CFChallengeCheck.URL, nil)
@@ -2698,6 +2934,7 @@ func checkCloudflareBypassMixed(proxyEntry string) bool {
 
 	resp, err := client.Do(req)
 	if err != nil {
+		adapterMetrics.IncRetryExhausted()
 		return false
 	}
 	defer resp.Body.Close()
@@ -2742,11 +2979,23 @@ func checkMixedProxyHealth(proxyEntry string, strictMode bool) bool {
 		},
 	}
 	transport.DialContext = dialer.DialContext
+	defer transport.CloseIdleConnections()
 
 	client := &http.Client{Transport: transport, Timeout: totalTimeout}
 	start := time.Now()
-	resp, err := client.Get(mixedHealthCheckURL)
-	if err != nil {
+	var resp *http.Response
+	var reqErr error
+	for attempt := 1; attempt <= healthCheckMaxRetries; attempt++ {
+		resp, reqErr = client.Get(mixedHealthCheckURL)
+		if reqErr == nil {
+			break
+		}
+		if attempt < healthCheckMaxRetries {
+			time.Sleep(retryBackoff(attempt))
+		}
+	}
+	if reqErr != nil {
+		adapterMetrics.IncRetryExhausted()
 		return false
 	}
 	defer resp.Body.Close()
@@ -4312,6 +4561,37 @@ func rotatePoolOnUpstreamFailure(pool *ProxyPool, mode string, failedProxy strin
 	log.Printf("[AUTO-ROTATE-%s] on-failure rotate switched from %s to %s (trigger=%v)", mode, failedProxy, newProxy, reason)
 }
 
+func selectProxyWithBreaker(pool *ProxyPool, fallbackPool *ProxyPool) (string, error) {
+	if pool == nil {
+		return "", fmt.Errorf("no primary pool")
+	}
+	tries := len(pool.GetAll())
+	if tries <= 0 {
+		tries = 1
+	}
+	for i := 0; i < tries; i++ {
+		candidate, err := pool.GetNext()
+		if err != nil {
+			break
+		}
+		scheme, _, _, _, parseErr := parseMixedProxy(candidate)
+		if parseErr != nil {
+			scheme = "unknown"
+		}
+		if adapterBreaker.Allow(scheme, candidate) {
+			return candidate, nil
+		}
+		_, _, _ = pool.ForceRotateIfCurrent(candidate)
+	}
+	if fallbackPool != nil {
+		fallbackProxy, fallbackErr := fallbackPool.GetNext()
+		if fallbackErr == nil {
+			return fallbackProxy, nil
+		}
+	}
+	return "", fmt.Errorf("no available proxies after breaker filtering")
+}
+
 func writePoolListResponse(w http.ResponseWriter, pool *ProxyPool, fallbackPool *ProxyPool, mode string) {
 	payload := map[string]interface{}{
 		"mode":     mode,
@@ -4367,15 +4647,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 		return
 	}
 
-	proxyAddr, err := pool.GetNext()
-	if err != nil && fallbackPool != nil {
-		fallbackProxy, fallbackErr := fallbackPool.GetNext()
-		if fallbackErr == nil {
-			log.Printf("[HTTP-%s] Primary pool unavailable, fallback proxy selected from MIXED pool: %s", mode, fallbackProxy)
-			proxyAddr = fallbackProxy
-			err = nil
-		}
-	}
+	proxyAddr, err := selectProxyWithBreaker(pool, fallbackPool)
 	if err != nil {
 		log.Printf("[HTTP-%s] ERROR: No proxy available for %s %s: %v", mode, r.Method, r.URL.String(), err)
 		http.Error(w, "No available proxies", http.StatusServiceUnavailable)
@@ -4412,6 +4684,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 		},
 		DialContext: upstreamDialer.DialContext,
 	}
+	defer transport.CloseIdleConnections()
 	if upstreamScheme == "http" || upstreamScheme == "https" {
 		transport.Proxy = nil
 	}
@@ -4436,14 +4709,29 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 		}
 	}
 
-	resp, err := client.Do(proxyReq)
-	if err != nil {
+	var resp *http.Response
+	var lastErr error
+	for attempt := 1; attempt <= requestForwardMaxRetries; attempt++ {
+		resp, err = client.Do(proxyReq)
+		if err == nil {
+			lastErr = nil
+			break
+		}
+		lastErr = err
+		if attempt < requestForwardMaxRetries {
+			time.Sleep(retryBackoff(attempt))
+		}
+	}
+	if lastErr != nil {
 		log.Printf("[HTTP-%s] ERROR: Request failed for %s: %v", mode, r.URL.String(), err)
+		adapterMetrics.IncRetryExhausted()
+		adapterBreaker.RecordFailure(upstreamScheme, proxyAddr)
 		rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, err)
 		http.Error(w, fmt.Sprintf("Proxy request failed: %v", err), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+	adapterBreaker.RecordSuccess(upstreamScheme, proxyAddr)
 
 	log.Printf("[HTTP-%s] SUCCESS: Got response %d for %s", mode, resp.StatusCode, r.URL.String())
 
@@ -4891,9 +5179,13 @@ func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool
 			return
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		payload := map[string]interface{}{
 			"error_code_counts": mixedHealthErrorCodeMetrics.Snapshot(),
-		})
+		}
+		for k, v := range adapterMetrics.Snapshot() {
+			payload[k] = v
+		}
+		_ = json.NewEncoder(w).Encode(payload)
 	})
 
 	mux.HandleFunc("/api/overview", func(w http.ResponseWriter, r *http.Request) {
