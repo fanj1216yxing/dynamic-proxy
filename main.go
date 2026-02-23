@@ -4378,6 +4378,7 @@ const (
 type stagePromMetrics struct {
 	mu                sync.RWMutex
 	inputByProtocol   map[string]int64
+	checkedByProtocol map[string]map[string]int64
 	passByProtocol    map[string]map[string]int64
 	errorCodeByProto  map[string]map[string]map[string]int64
 	latencyByProtocol map[string]map[string][]time.Duration
@@ -4386,6 +4387,7 @@ type stagePromMetrics struct {
 func newStagePromMetrics() *stagePromMetrics {
 	return &stagePromMetrics{
 		inputByProtocol:   make(map[string]int64),
+		checkedByProtocol: make(map[string]map[string]int64),
 		passByProtocol:    make(map[string]map[string]int64),
 		errorCodeByProto:  make(map[string]map[string]map[string]int64),
 		latencyByProtocol: make(map[string]map[string][]time.Duration),
@@ -4412,6 +4414,7 @@ func (m *stagePromMetrics) Reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.inputByProtocol = make(map[string]int64)
+	m.checkedByProtocol = make(map[string]map[string]int64)
 	m.passByProtocol = make(map[string]map[string]int64)
 	m.errorCodeByProto = make(map[string]map[string]map[string]int64)
 	m.latencyByProtocol = make(map[string]map[string][]time.Duration)
@@ -4430,6 +4433,11 @@ func (m *stagePromMetrics) AddStageResult(protocol, stage string, healthy bool, 
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if _, ok := m.checkedByProtocol[protocol]; !ok {
+		m.checkedByProtocol[protocol] = make(map[string]int64)
+	}
+	m.checkedByProtocol[protocol][stage]++
 
 	if _, ok := m.passByProtocol[protocol]; !ok {
 		m.passByProtocol[protocol] = make(map[string]int64)
@@ -4465,6 +4473,14 @@ func (m *stagePromMetrics) Snapshot() map[string]interface{} {
 		input[k] = v
 	}
 
+	checked := make(map[string]map[string]int64, len(m.checkedByProtocol))
+	for proto, stages := range m.checkedByProtocol {
+		checked[proto] = make(map[string]int64, len(stages))
+		for stage, count := range stages {
+			checked[proto][stage] = count
+		}
+	}
+
 	pass := make(map[string]map[string]int64, len(m.passByProtocol))
 	for proto, stages := range m.passByProtocol {
 		pass[proto] = make(map[string]int64, len(stages))
@@ -4486,14 +4502,15 @@ func (m *stagePromMetrics) Snapshot() map[string]interface{} {
 
 	pct := make(map[string]map[string]float64)
 	for proto, stages := range pass {
-		total := float64(input[proto])
-		if total <= 0 {
-			continue
-		}
+		checkedStages := checked[proto]
 		if _, ok := pct[proto]; !ok {
 			pct[proto] = make(map[string]float64)
 		}
 		for stage, count := range stages {
+			total := float64(checkedStages[stage])
+			if total <= 0 {
+				continue
+			}
 			pct[proto][stage] = float64(count) / total
 		}
 	}
@@ -4517,6 +4534,7 @@ func (m *stagePromMetrics) Snapshot() map[string]interface{} {
 
 	return map[string]interface{}{
 		"input":             input,
+		"checked":           checked,
 		"pass":              pass,
 		"pass_rate":         pct,
 		"error_code_counts": errCodes,
@@ -4534,6 +4552,13 @@ func (m *stagePromMetrics) RenderPrometheus() string {
 	for protocol, total := range m.inputByProtocol {
 		fmt.Fprintf(b, "dynamic_proxy_stage_input_total{protocol=%q} %d\n", protocol, total)
 	}
+	b.WriteString("# HELP dynamic_proxy_stage_checked_total Stage health check checked total by protocol and stage\n")
+	b.WriteString("# TYPE dynamic_proxy_stage_checked_total counter\n")
+	for protocol, stages := range m.checkedByProtocol {
+		for stage, total := range stages {
+			fmt.Fprintf(b, "dynamic_proxy_stage_checked_total{protocol=%q,stage=%q} %d\n", protocol, stage, total)
+		}
+	}
 	b.WriteString("# HELP dynamic_proxy_stage_pass_total Stage health check pass total by protocol and stage\n")
 	b.WriteString("# TYPE dynamic_proxy_stage_pass_total counter\n")
 	for protocol, stages := range m.passByProtocol {
@@ -4543,12 +4568,13 @@ func (m *stagePromMetrics) RenderPrometheus() string {
 	}
 	b.WriteString("# HELP dynamic_proxy_stage_pass_rate Stage health check pass rate by protocol and stage\n")
 	b.WriteString("# TYPE dynamic_proxy_stage_pass_rate gauge\n")
-	for protocol, input := range m.inputByProtocol {
-		if input <= 0 {
-			continue
-		}
-		for stage, pass := range m.passByProtocol[protocol] {
-			rate := float64(pass) / float64(input)
+	for protocol, stages := range m.passByProtocol {
+		for stage, pass := range stages {
+			checked := m.checkedByProtocol[protocol][stage]
+			if checked <= 0 {
+				continue
+			}
+			rate := float64(pass) / float64(checked)
 			fmt.Fprintf(b, "dynamic_proxy_stage_pass_rate{protocol=%q,stage=%q} %.6f\n", protocol, stage, rate)
 		}
 	}
@@ -6399,16 +6425,42 @@ func triggerRotateControlAll() (string, error) {
 func buildStageFunnelByProtocol() map[string]map[string]int64 {
 	snapshot := mixedStageMetrics.Snapshot()
 	inputRaw, _ := snapshot["input"].(map[string]int64)
+	checkedRaw, _ := snapshot["checked"].(map[string]map[string]int64)
 	passRaw, _ := snapshot["pass"].(map[string]map[string]int64)
-	funnel := make(map[string]map[string]int64, len(inputRaw))
-	for protocol, input := range inputRaw {
-		stage1 := int64(0)
-		stage2 := int64(0)
-		if stages, ok := passRaw[protocol]; ok {
-			stage1 = stages["stage1"]
-			stage2 = stages["stage2"]
+
+	protocolSet := make(map[string]struct{}, len(inputRaw))
+	for protocol := range inputRaw {
+		protocolSet[protocol] = struct{}{}
+	}
+	for protocol := range checkedRaw {
+		protocolSet[protocol] = struct{}{}
+	}
+	for protocol := range passRaw {
+		protocolSet[protocol] = struct{}{}
+	}
+
+	funnel := make(map[string]map[string]int64, len(protocolSet))
+	for protocol := range protocolSet {
+		input := inputRaw[protocol]
+		stage1Checked := int64(0)
+		stage2Checked := int64(0)
+		if stages, ok := checkedRaw[protocol]; ok {
+			stage1Checked = stages["stage1"]
+			stage2Checked = stages["stage2"]
 		}
-		funnel[protocol] = map[string]int64{"input": input, "stage1": stage1, "stage2": stage2}
+		stage1Pass := int64(0)
+		stage2Pass := int64(0)
+		if stages, ok := passRaw[protocol]; ok {
+			stage1Pass = stages["stage1"]
+			stage2Pass = stages["stage2"]
+		}
+		funnel[protocol] = map[string]int64{
+			"input":       input,
+			"stage1":      stage1Checked,
+			"stage2":      stage2Checked,
+			"stage1_pass": stage1Pass,
+			"stage2_pass": stage2Pass,
+		}
 	}
 	return funnel
 }
