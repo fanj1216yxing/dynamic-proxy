@@ -5,9 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
-	"net"
 	"slices"
 	"strings"
 	"sync"
@@ -625,5 +625,62 @@ func TestHealthCheckMixedProxiesTwoStage_ProtocolSpecificTimeout(t *testing.T) {
 
 	if len(result.Healthy) != 1 || result.Healthy[0] != vlessEntry {
 		t.Fatalf("expected only vless to pass protocol-specific threshold, got %+v", result.Healthy)
+	}
+}
+
+func TestParseRegularProxyContentMixed_PreservesMainstreamPayloadWithExtraText(t *testing.T) {
+	ssLine := "prefix ss://YWVzLTI1Ni1nY206cGFzczEyMw@1.2.3.4:8388/?plugin=v2ray-plugin&plugin-opts=mode%3Dwebsocket#name suffix"
+	ssrPayload := "example.com:8443:auth_sha1_v4:aes-256-cfb:tls1.2_ticket_auth:cHdkMTIz/?remarks=bm9kZTE&obfsparam=b2Jmcw"
+	ssrLine := "说明 " + "ssr://" + base64.RawURLEncoding.EncodeToString([]byte(ssrPayload)) + " extra-text"
+	trojanLine := "tag trojan://secret@8.8.8.8:443?sni=cdn.example.com trailing"
+
+	proxies, format := parseRegularProxyContentMixed(strings.Join([]string{
+		"# comment",
+		ssLine,
+		ssrLine,
+		trojanLine,
+	}, "\n"))
+
+	if format != "plain" {
+		t.Fatalf("expected plain format, got %s", format)
+	}
+
+	expectedSSR := "ssr://" + base64.RawURLEncoding.EncodeToString([]byte(ssrPayload))
+	expected := []string{
+		"ss://YWVzLTI1Ni1nY206cGFzczEyMw@1.2.3.4:8388?plugin=v2ray-plugin&plugin-opts=mode%3Dwebsocket#name",
+		expectedSSR,
+		"trojan://secret@8.8.8.8:443?sni=cdn.example.com",
+	}
+	for _, want := range expected {
+		if !slices.Contains(proxies, want) {
+			t.Fatalf("expected proxy %q in parsed result: %v", want, proxies)
+		}
+	}
+}
+
+func TestParseSpecialProxyURLMixed_MainstreamMalformedSkipsFallback(t *testing.T) {
+	ssrPayload := "example.com:9443:auth_chain_a:aes-128-cfb:plain:cGFzczEyMw/?remarks=dGVzdA"
+	validSSR := "ssr://" + base64.RawURLEncoding.EncodeToString([]byte(ssrPayload))
+
+	content := strings.Join([]string{
+		"noise " + validSSR + " trailing",
+		"broken ssr://invalid$$ 9.9.9.9:9999",
+		"broken ss://invalid 6.6.6.6:6666",
+		"broken trojan:// 7.7.7.7:7777",
+		"fallback https://5.5.5.5:443",
+	}, "\n")
+
+	proxies := parseSpecialProxyURLMixed(content)
+
+	if !slices.Contains(proxies, validSSR) {
+		t.Fatalf("expected valid SSR payload to be preserved, got: %v", proxies)
+	}
+	if !slices.Contains(proxies, "https://5.5.5.5:443") {
+		t.Fatalf("expected https fallback entry, got: %v", proxies)
+	}
+	for _, forbidden := range []string{"socks5://9.9.9.9:9999", "socks5://6.6.6.6:6666", "socks5://7.7.7.7:7777"} {
+		if slices.Contains(proxies, forbidden) {
+			t.Fatalf("unexpected degraded fallback %s in %v", forbidden, proxies)
+		}
 	}
 }

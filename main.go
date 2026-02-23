@@ -49,7 +49,7 @@ type Config struct {
 		StageTwo HealthCheckSettings `yaml:"stage_two"`
 	} `yaml:"health_check_two_stage"`
 	HealthCheckProtocolOverrides map[string]TwoStageHealthCheckSettings `yaml:"health_check_protocol_overrides"`
-	Ports struct {
+	Ports                        struct {
 		SOCKS5Strict      string `yaml:"socks5_strict"`
 		SOCKS5Relaxed     string `yaml:"socks5_relaxed"`
 		HTTPStrict        string `yaml:"http_strict"`
@@ -144,6 +144,7 @@ var adminRuntime = &AdminRuntime{}
 // Simple regex to extract ip:port from any format (used for special proxy lists)
 // Matches: [IP]:[port] and ignores any protocol prefixes or extra text
 var simpleProxyRegex = regexp.MustCompile(`([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})`)
+var mixedURITokenRegex = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://\S+)`)
 
 // loadConfig loads configuration from config.yaml
 func loadConfig(filename string) (*Config, error) {
@@ -903,6 +904,9 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 	if line == "" {
 		return "", false
 	}
+	if candidate, ok := extractMixedURICandidate(line); ok {
+		line = candidate
+	}
 
 	if strings.Contains(line, "://") {
 		lowerLine := strings.ToLower(line)
@@ -910,6 +914,7 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 			if normalized, ok := normalizeSSURI(line); ok {
 				return normalized, true
 			}
+			return "", false
 		}
 
 		if strings.HasPrefix(lowerLine, "vmess://") {
@@ -921,6 +926,14 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 		if strings.HasPrefix(lowerLine, "ssr://") {
 			if normalized, ok := normalizeSSRURI(line); ok {
 				return normalized, true
+			}
+			return "", false
+		}
+
+		if strings.HasPrefix(lowerLine, "trojan://") {
+			u, err := url.Parse(line)
+			if err != nil || u.Host == "" || u.User == nil || strings.TrimSpace(u.User.Username()) == "" {
+				return "", false
 			}
 		}
 
@@ -1228,41 +1241,32 @@ func parseHY2Node(raw string) (hy2Node, bool) {
 }
 
 func normalizeSSRURI(raw string) (string, bool) {
-	encoded := strings.TrimSpace(strings.TrimPrefix(raw, "ssr://"))
+	trimmed := strings.TrimSpace(raw)
+	if !strings.HasPrefix(strings.ToLower(trimmed), "ssr://") {
+		return "", false
+	}
+
+	encoded := strings.TrimSpace(strings.TrimPrefix(trimmed, "ssr://"))
+	fragment := ""
 	if idx := strings.Index(encoded, "#"); idx >= 0 {
+		fragment = encoded[idx:]
 		encoded = encoded[:idx]
 	}
 	if encoded == "" {
 		return "", false
 	}
 
-	payload, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil {
-		payload, err = base64.RawStdEncoding.DecodeString(encoded)
-		if err != nil {
-			return "", false
-		}
-	}
-
-	parts := strings.SplitN(string(payload), "/?", 2)
-	segments := strings.Split(parts[0], ":")
-	if len(segments) < 6 {
-		return "", false
-	}
-	host, port, passwordEnc := segments[0], segments[1], segments[5]
-	if host == "" || port == "" || passwordEnc == "" {
+	payload, err := decodeFlexibleBase64(encoded)
+	if err != nil || len(payload) == 0 {
 		return "", false
 	}
 
-	passwordRaw, err := base64.RawURLEncoding.DecodeString(passwordEnc)
-	if err != nil {
-		passwordRaw, err = base64.RawStdEncoding.DecodeString(passwordEnc)
-		if err != nil {
-			return "", false
-		}
+	// SSR payload must remain fully reversible; only normalize base64 variant.
+	canonical := encodeBase64URLNoPadding(payload)
+	if canonical == "" {
+		return "", false
 	}
-
-	return fmt.Sprintf("ssr://%s@%s", url.QueryEscape(string(passwordRaw)), net.JoinHostPort(host, port)), true
+	return "ssr://" + canonical + fragment, true
 }
 
 func normalizeWireGuardURI(raw string) (string, bool) {
@@ -1334,24 +1338,36 @@ func validateMainstreamURI(scheme string, u *url.URL) bool {
 }
 
 func normalizeSSURI(raw string) (string, bool) {
-	u, err := url.Parse(raw)
+	trimmed := strings.TrimSpace(raw)
+	u, err := url.Parse(trimmed)
 	if err != nil {
 		return "", false
 	}
+	pluginQuery := filterSSPluginQuery(u.RawQuery)
+	fragment := strings.TrimSpace(u.Fragment)
+
 	if u.Host != "" && (u.User != nil || strings.Contains(u.Host, ":")) {
 		authority := u.Host
 		if u.User != nil {
 			authority = u.User.String() + "@" + authority
 		}
-		return "ss://" + authority, true
+		normalized := "ss://" + authority
+		if pluginQuery != "" {
+			normalized += "?" + pluginQuery
+		}
+		if fragment != "" {
+			normalized += "#" + fragment
+		}
+		return normalized, true
 	}
 
-	decoded, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(raw, "ss://"))
-	if err != nil {
-		decoded, err = base64.StdEncoding.DecodeString(strings.TrimPrefix(raw, "ss://"))
-		if err != nil {
-			return "", false
-		}
+	payload := strings.TrimPrefix(trimmed, "ss://")
+	if i := strings.IndexAny(payload, "?#"); i >= 0 {
+		payload = payload[:i]
+	}
+	decoded, err := decodeFlexibleBase64(payload)
+	if err != nil || len(decoded) == 0 {
+		return "", false
 	}
 
 	decodedURL, err := url.Parse("ss://" + string(decoded))
@@ -1362,7 +1378,73 @@ func normalizeSSURI(raw string) (string, bool) {
 	if decodedURL.User != nil {
 		authority = decodedURL.User.String() + "@" + authority
 	}
-	return "ss://" + authority, true
+	normalized := "ss://" + authority
+	if pluginQuery != "" {
+		normalized += "?" + pluginQuery
+	}
+	if fragment != "" {
+		normalized += "#" + fragment
+	}
+	return normalized, true
+}
+
+func decodeFlexibleBase64(v string) ([]byte, error) {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return nil, fmt.Errorf("empty base64 payload")
+	}
+	decoders := []func(string) ([]byte, error){
+		base64.RawURLEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.StdEncoding.DecodeString,
+	}
+	for _, decode := range decoders {
+		payload, err := decode(trimmed)
+		if err == nil {
+			return payload, nil
+		}
+	}
+	return nil, fmt.Errorf("invalid base64 payload")
+}
+
+func encodeBase64URLNoPadding(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func extractMixedURICandidate(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return "", false
+	}
+	matches := mixedURITokenRegex.FindStringSubmatch(trimmed)
+	if len(matches) < 2 {
+		return "", false
+	}
+	candidate := strings.Trim(matches[1], `"'()[]{}<>,;`)
+	if candidate == "" {
+		return "", false
+	}
+	return candidate, true
+}
+
+func filterSSPluginQuery(rawQuery string) string {
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return ""
+	}
+	allowed := url.Values{}
+	for _, key := range []string{"plugin", "plugin-opts"} {
+		for _, v := range q[key] {
+			if strings.TrimSpace(v) != "" {
+				allowed.Add(key, v)
+			}
+		}
+	}
+	return allowed.Encode()
 }
 
 func resolveMixedDialTarget(scheme string, addr string) (dialScheme string, dialAddr string, useAuth bool) {
@@ -1514,13 +1596,18 @@ func parseSpecialProxyURLMixed(content string) []string {
 			continue
 		}
 
+		lowerLine := strings.ToLower(line)
+		if strings.Contains(lowerLine, "ss://") || strings.Contains(lowerLine, "ssr://") || strings.Contains(lowerLine, "trojan://") {
+			log.Printf("parse_failed: skip malformed mainstream line without fallback: %s", line)
+			continue
+		}
+
 		matches := simpleProxyRegex.FindStringSubmatch(line)
 		if len(matches) < 3 {
 			continue
 		}
 
 		scheme := "socks5"
-		lowerLine := strings.ToLower(line)
 		switch {
 		case strings.Contains(lowerLine, "https://"):
 			scheme = "https"
@@ -1530,26 +1617,6 @@ func parseSpecialProxyURLMixed(content string) []string {
 			scheme = "socks5h"
 		case strings.Contains(lowerLine, "socks5://"):
 			scheme = "socks5"
-		case strings.Contains(lowerLine, "ss://"):
-			scheme = "ss"
-		case strings.Contains(lowerLine, "ssr://"):
-			scheme = "ssr"
-		case strings.Contains(lowerLine, "trojan://"):
-			scheme = "trojan"
-		case strings.Contains(lowerLine, "vmess://"):
-			scheme = "vmess"
-		case strings.Contains(lowerLine, "vless://"):
-			scheme = "vless"
-		case strings.Contains(lowerLine, "tuic://"):
-			scheme = "tuic"
-		case strings.Contains(lowerLine, "hysteria://"):
-			scheme = "hysteria"
-		case strings.Contains(lowerLine, "hy2://"):
-			scheme = "hy2"
-		case strings.Contains(lowerLine, "hysteria2://"):
-			scheme = "hysteria2"
-		case strings.Contains(lowerLine, "wg://"):
-			scheme = "wg"
 		}
 
 		entry := fmt.Sprintf("%s://%s:%s", scheme, matches[1], matches[2])
@@ -2866,7 +2933,6 @@ func healthCheckMixedProxiesSingleStage(proxies []string) MixedHealthCheckResult
 
 	return MixedHealthCheckResult{Healthy: mixedHealthy, CFPass: cfPassHealthy}
 }
-
 
 type mixedTwoStageStats struct {
 	Total      int64
