@@ -3942,6 +3942,30 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 	return proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone, ErrorCode: ""}
 }
 
+func checkMainstreamProxyHealthStage1WithHardTimeout(proxyEntry string, settings HealthCheckSettings) proxyHealthStatus {
+	totalTimeout := time.Duration(settings.TotalTimeoutSeconds) * time.Second
+	if totalTimeout <= 0 {
+		totalTimeout = 5 * time.Second
+	}
+
+	resultCh := make(chan proxyHealthStatus, 1)
+	go func() {
+		resultCh <- checkMainstreamProxyHealthStage1(proxyEntry, settings)
+	}()
+
+	select {
+	case result := <-resultCh:
+		return result
+	case <-time.After(totalTimeout + time.Second):
+		scheme := "unknown"
+		if parsedScheme, _, _, _, err := parseMixedProxy(proxyEntry); err == nil && parsedScheme != "" {
+			scheme = parsedScheme
+		}
+		errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "stage1_hard_timeout")
+		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, errors.New("stage1 hard timeout exceeded"))}
+	}
+}
+
 func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settings HealthCheckSettings) mixedStageCheckResult {
 	dialer, scheme, err := upstreamDialerBuilder(proxyEntry)
 	if scheme == "" {
@@ -4370,7 +4394,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 					scheme = parsedScheme
 				}
 				settings, _ := mixedHealthSettingsForProtocolWithTier(scheme, 1)
-				status := checkMainstreamProxyHealthStage1(entry, settings)
+				status := checkMainstreamProxyHealthStage1WithHardTimeout(entry, settings)
 				mu.Lock()
 				st := getStageStats(status.Scheme)
 				st.Total++
