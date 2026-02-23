@@ -83,6 +83,10 @@ health_check_protocol_overrides:
       total_timeout_seconds: 15
       tls_handshake_threshold_seconds: 8
 
+# 主流协议内核配置（用于 ss/ssr/trojan/vmess/vless/hy2 等拨号）
+detector:
+  core: "" # 可选: mihomo | meta | singbox；为空时主流协议适配层不会启用
+
 # 服务器端口配置
 ports:
   socks5_strict: ":17283"
