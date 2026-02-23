@@ -3838,6 +3838,38 @@ func topKErrorCodes(counts map[string]int64, k int) string {
 	return strings.Join(parts, ",")
 }
 
+func summarizeTopRootCauses(counts map[string]int64, total int64, topN int) string {
+	type pair struct {
+		Name  string
+		Count int64
+	}
+	items := make([]pair, 0, len(counts))
+	for name, count := range counts {
+		items = append(items, pair{Name: name, Count: count})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Count == items[j].Count {
+			return items[i].Name < items[j].Name
+		}
+		return items[i].Count > items[j].Count
+	})
+	if topN > 0 && len(items) > topN {
+		items = items[:topN]
+	}
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		ratio := 0.0
+		if total > 0 {
+			ratio = float64(item.Count) / float64(total) * 100
+		}
+		parts = append(parts, fmt.Sprintf("%s:%.1f%%(%d/%d)", item.Name, ratio, item.Count, total))
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ",")
+}
+
 type healthPhaseMetrics struct {
 	DNS        time.Duration
 	TCPConnect time.Duration
@@ -3929,6 +3961,236 @@ type mixedStageCheckResult struct {
 	Latency time.Duration
 }
 
+type mixedFailPhase string
+
+const (
+	mixedFailPhaseDialerBuild  mixedFailPhase = "dialer_build"
+	mixedFailPhaseCoreCheck    mixedFailPhase = "core_check"
+	mixedFailPhaseTCPConnect   mixedFailPhase = "tcp_connect"
+	mixedFailPhaseTLSHandshake mixedFailPhase = "tls_handshake"
+	mixedFailPhaseHTTPRequest  mixedFailPhase = "http_request"
+)
+
+type stagePromMetrics struct {
+	mu                sync.RWMutex
+	inputByProtocol   map[string]int64
+	passByProtocol    map[string]map[string]int64
+	errorCodeByProto  map[string]map[string]map[string]int64
+	latencyByProtocol map[string]map[string][]time.Duration
+}
+
+func newStagePromMetrics() *stagePromMetrics {
+	return &stagePromMetrics{
+		inputByProtocol:   make(map[string]int64),
+		passByProtocol:    make(map[string]map[string]int64),
+		errorCodeByProto:  make(map[string]map[string]map[string]int64),
+		latencyByProtocol: make(map[string]map[string][]time.Duration),
+	}
+}
+
+func normalizeMetricsProtocol(scheme string) string {
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	if scheme == "" {
+		return "unknown"
+	}
+	return scheme
+}
+
+func normalizeStageName(stage string) string {
+	stage = strings.ToLower(strings.TrimSpace(stage))
+	if stage != "stage1" && stage != "stage2" {
+		return "unknown"
+	}
+	return stage
+}
+
+func (m *stagePromMetrics) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inputByProtocol = make(map[string]int64)
+	m.passByProtocol = make(map[string]map[string]int64)
+	m.errorCodeByProto = make(map[string]map[string]map[string]int64)
+	m.latencyByProtocol = make(map[string]map[string][]time.Duration)
+}
+
+func (m *stagePromMetrics) AddInput(protocol string) {
+	protocol = normalizeMetricsProtocol(protocol)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inputByProtocol[protocol]++
+}
+
+func (m *stagePromMetrics) AddStageResult(protocol, stage string, healthy bool, errorCode string, latency time.Duration) {
+	protocol = normalizeMetricsProtocol(protocol)
+	stage = normalizeStageName(stage)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.passByProtocol[protocol]; !ok {
+		m.passByProtocol[protocol] = make(map[string]int64)
+	}
+	if healthy {
+		m.passByProtocol[protocol][stage]++
+	}
+
+	if !healthy && strings.TrimSpace(errorCode) != "" {
+		if _, ok := m.errorCodeByProto[protocol]; !ok {
+			m.errorCodeByProto[protocol] = make(map[string]map[string]int64)
+		}
+		if _, ok := m.errorCodeByProto[protocol][stage]; !ok {
+			m.errorCodeByProto[protocol][stage] = make(map[string]int64)
+		}
+		m.errorCodeByProto[protocol][stage][errorCode]++
+	}
+
+	if healthy && latency > 0 {
+		if _, ok := m.latencyByProtocol[protocol]; !ok {
+			m.latencyByProtocol[protocol] = make(map[string][]time.Duration)
+		}
+		m.latencyByProtocol[protocol][stage] = append(m.latencyByProtocol[protocol][stage], latency)
+	}
+}
+
+func (m *stagePromMetrics) Snapshot() map[string]interface{} {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	input := make(map[string]int64, len(m.inputByProtocol))
+	for k, v := range m.inputByProtocol {
+		input[k] = v
+	}
+
+	pass := make(map[string]map[string]int64, len(m.passByProtocol))
+	for proto, stages := range m.passByProtocol {
+		pass[proto] = make(map[string]int64, len(stages))
+		for stage, count := range stages {
+			pass[proto][stage] = count
+		}
+	}
+
+	errCodes := make(map[string]map[string]map[string]int64, len(m.errorCodeByProto))
+	for proto, stages := range m.errorCodeByProto {
+		errCodes[proto] = make(map[string]map[string]int64, len(stages))
+		for stage, codes := range stages {
+			errCodes[proto][stage] = make(map[string]int64, len(codes))
+			for code, count := range codes {
+				errCodes[proto][stage][code] = count
+			}
+		}
+	}
+
+	pct := make(map[string]map[string]float64)
+	for proto, stages := range pass {
+		total := float64(input[proto])
+		if total <= 0 {
+			continue
+		}
+		if _, ok := pct[proto]; !ok {
+			pct[proto] = make(map[string]float64)
+		}
+		for stage, count := range stages {
+			pct[proto][stage] = float64(count) / total
+		}
+	}
+
+	latency := make(map[string]map[string]map[string]float64)
+	for proto, stages := range m.latencyByProtocol {
+		latency[proto] = make(map[string]map[string]float64)
+		for stage, vals := range stages {
+			if len(vals) == 0 {
+				continue
+			}
+			copied := append([]time.Duration(nil), vals...)
+			sort.Slice(copied, func(i, j int) bool { return copied[i] < copied[j] })
+			q := func(p float64) float64 {
+				idx := int(float64(len(copied)-1) * p)
+				return float64(copied[idx].Milliseconds())
+			}
+			latency[proto][stage] = map[string]float64{"p50_ms": q(0.5), "p90_ms": q(0.9)}
+		}
+	}
+
+	return map[string]interface{}{
+		"input":             input,
+		"pass":              pass,
+		"pass_rate":         pct,
+		"error_code_counts": errCodes,
+		"latency":           latency,
+	}
+}
+
+func (m *stagePromMetrics) RenderPrometheus() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	b := &strings.Builder{}
+	b.WriteString("# HELP dynamic_proxy_stage_input_total Stage health check input total by protocol\n")
+	b.WriteString("# TYPE dynamic_proxy_stage_input_total counter\n")
+	for protocol, total := range m.inputByProtocol {
+		fmt.Fprintf(b, "dynamic_proxy_stage_input_total{protocol=%q} %d\n", protocol, total)
+	}
+	b.WriteString("# HELP dynamic_proxy_stage_pass_total Stage health check pass total by protocol and stage\n")
+	b.WriteString("# TYPE dynamic_proxy_stage_pass_total counter\n")
+	for protocol, stages := range m.passByProtocol {
+		for stage, total := range stages {
+			fmt.Fprintf(b, "dynamic_proxy_stage_pass_total{protocol=%q,stage=%q} %d\n", protocol, stage, total)
+		}
+	}
+	b.WriteString("# HELP dynamic_proxy_stage_pass_rate Stage health check pass rate by protocol and stage\n")
+	b.WriteString("# TYPE dynamic_proxy_stage_pass_rate gauge\n")
+	for protocol, input := range m.inputByProtocol {
+		if input <= 0 {
+			continue
+		}
+		for stage, pass := range m.passByProtocol[protocol] {
+			rate := float64(pass) / float64(input)
+			fmt.Fprintf(b, "dynamic_proxy_stage_pass_rate{protocol=%q,stage=%q} %.6f\n", protocol, stage, rate)
+		}
+	}
+	b.WriteString("# HELP dynamic_proxy_stage_latency_ms Stage health check latency percentile in milliseconds\n")
+	b.WriteString("# TYPE dynamic_proxy_stage_latency_ms gauge\n")
+	for protocol, stages := range m.latencyByProtocol {
+		for stage, vals := range stages {
+			if len(vals) == 0 {
+				continue
+			}
+			copied := append([]time.Duration(nil), vals...)
+			sort.Slice(copied, func(i, j int) bool { return copied[i] < copied[j] })
+			q := func(p float64) float64 {
+				idx := int(float64(len(copied)-1) * p)
+				return float64(copied[idx].Milliseconds())
+			}
+			fmt.Fprintf(b, "dynamic_proxy_stage_latency_ms{protocol=%q,stage=%q,quantile=\"0.50\"} %.2f\n", protocol, stage, q(0.5))
+			fmt.Fprintf(b, "dynamic_proxy_stage_latency_ms{protocol=%q,stage=%q,quantile=\"0.90\"} %.2f\n", protocol, stage, q(0.9))
+		}
+	}
+	b.WriteString("# HELP dynamic_proxy_stage_error_code_total Stage health check error code total by protocol and stage\n")
+	b.WriteString("# TYPE dynamic_proxy_stage_error_code_total counter\n")
+	for protocol, stages := range m.errorCodeByProto {
+		for stage, codes := range stages {
+			for code, total := range codes {
+				fmt.Fprintf(b, "dynamic_proxy_stage_error_code_total{protocol=%q,stage=%q,error_code=%q} %d\n", protocol, stage, code, total)
+			}
+		}
+	}
+	return b.String()
+}
+
+var mixedStageMetrics = newStagePromMetrics()
+
+func logMixedHealthFailure(stage, scheme string, category healthFailureCategory, errorCode string, failPhase mixedFailPhase, err error) {
+	if scheme == "" {
+		scheme = "unknown"
+	}
+	detail := ""
+	if err != nil {
+		detail = strings.ReplaceAll(err.Error(), "\n", " ")
+	}
+	log.Printf("[MIXED-HEALTH-FAIL] stage=%s scheme=%s category=%s error_code=%s fail_phase=%s detail=%s",
+		stage, scheme, category, errorCode, failPhase, detail)
+}
+
 func mixedHealthTargetAddr() string {
 	u, err := url.Parse(mixedHealthCheckURL)
 	if err != nil || u.Host == "" {
@@ -3985,12 +4247,18 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 		scheme = "unknown"
 	}
 	if err != nil {
+		failPhase := mixedFailPhaseDialerBuild
+		if category, _ := classifyHealthFailure(err); category == healthFailureCoreUnavailable {
+			failPhase = mixedFailPhaseCoreCheck
+		}
 		if strings.Contains(err.Error(), "invalid") {
 			errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_proxy_entry")
+			logMixedHealthFailure("stage1", scheme, healthFailureParse, errorCode, failPhase, err)
 			return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}
 		}
 		category, reasonCode := classifyHealthFailure(err)
 		errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
+		logMixedHealthFailure("stage1", scheme, category, errorCode, failPhase, err)
 		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}
 	}
 
@@ -4004,13 +4272,16 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 	if err != nil {
 		category, reasonCode := classifyHealthFailure(err)
 		errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
+		logMixedHealthFailure("stage1", scheme, category, errorCode, mixedFailPhaseTCPConnect, err)
 		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}
 	}
 	_ = conn.Close()
 
 	if time.Since(start) > threshold {
 		errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "stage1_connect_timeout")
-		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, errors.New("stage1 tunnel connect exceeded threshold"))}
+		timeoutErr := errors.New("stage1 tunnel connect exceeded threshold")
+		logMixedHealthFailure("stage1", scheme, healthFailureTimeout, errorCode, mixedFailPhaseTCPConnect, timeoutErr)
+		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, timeoutErr)}
 	}
 
 	return proxyHealthStatus{Healthy: true, Scheme: scheme, Category: healthFailureNone, ErrorCode: ""}
@@ -4036,7 +4307,9 @@ func checkMainstreamProxyHealthStage1WithHardTimeout(proxyEntry string, settings
 			scheme = parsedScheme
 		}
 		errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "stage1_hard_timeout")
-		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, errors.New("stage1 hard timeout exceeded"))}
+		timeoutErr := errors.New("stage1 hard timeout exceeded")
+		logMixedHealthFailure("stage1", scheme, healthFailureTimeout, errorCode, mixedFailPhaseTCPConnect, timeoutErr)
+		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, timeoutErr)}
 	}
 }
 
@@ -4046,12 +4319,18 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 		scheme = "unknown"
 	}
 	if err != nil {
+		failPhase := mixedFailPhaseDialerBuild
+		if category, _ := classifyHealthFailure(err); category == healthFailureCoreUnavailable {
+			failPhase = mixedFailPhaseCoreCheck
+		}
 		if strings.Contains(err.Error(), "invalid") {
 			errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_proxy_entry")
+			logMixedHealthFailure("stage2", scheme, healthFailureParse, errorCode, failPhase, err)
 			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}}
 		}
 		category, reasonCode := classifyHealthFailure(err)
 		errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
+		logMixedHealthFailure("stage2", scheme, category, errorCode, failPhase, err)
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}}
 	}
 
@@ -4061,6 +4340,7 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 	targetURL, parseErr := url.Parse(mixedHealthCheckURL)
 	if parseErr != nil {
 		errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_healthcheck_url")
+		logMixedHealthFailure("stage2", scheme, healthFailureParse, errorCode, mixedFailPhaseHTTPRequest, parseErr)
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, parseErr)}}
 	}
 
@@ -4104,6 +4384,7 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 	req, reqErr := http.NewRequest(http.MethodGet, mixedHealthCheckURL, nil)
 	if reqErr != nil {
 		errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_request")
+		logMixedHealthFailure("stage2", scheme, healthFailureParse, errorCode, mixedFailPhaseHTTPRequest, reqErr)
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, reqErr)}}
 	}
 	reqCtx, dialPhaseMetric := withDialPhase(req.Context())
@@ -4148,26 +4429,37 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 		if verifyErr != nil {
 			category, reasonCode := classifyHealthFailure(verifyErr)
 			errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
+			logMixedHealthFailure("stage2", scheme, category, errorCode, mixedFailPhaseTLSHandshake, verifyErr)
 			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, verifyErr)}, Latency: latency}
 		}
 		if isTimeoutError(err) && !tlsHandshakeDone {
 			errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "tls_handshake_timeout")
+			logMixedHealthFailure("stage2", scheme, healthFailureTimeout, errorCode, mixedFailPhaseTLSHandshake, err)
 			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}, Latency: latency}
 		}
 		category, reasonCode := classifyHealthFailure(err)
 		errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
+		phase := mixedFailPhaseHTTPRequest
+		if !tlsHandshakeDone {
+			phase = mixedFailPhaseTCPConnect
+		}
+		logMixedHealthFailure("stage2", scheme, category, errorCode, phase, err)
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}, Latency: latency}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 500 {
 		errorCode := resolveHealthErrorCode(scheme, healthFailureUnreachable, "unexpected_status")
-		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureUnreachable, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, fmt.Errorf("unexpected status: %d", resp.StatusCode))}, Latency: latency}
+		statusErr := fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		logMixedHealthFailure("stage2", scheme, healthFailureUnreachable, errorCode, mixedFailPhaseHTTPRequest, statusErr)
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureUnreachable, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, statusErr)}, Latency: latency}
 	}
 
 	if tlsHandshakeDone && phase.TLSHello+phase.CertVerify > threshold {
 		errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "stage2_tls_threshold_timeout")
-		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, errors.New("stage2 tls handshake exceeded threshold"))}, Latency: latency}
+		timeoutErr := errors.New("stage2 tls handshake exceeded threshold")
+		logMixedHealthFailure("stage2", scheme, healthFailureTimeout, errorCode, mixedFailPhaseTLSHandshake, timeoutErr)
+		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, timeoutErr)}, Latency: latency}
 	}
 	proxyDial := dialPhaseMetric.ProxyDial
 	if phase.TCPConnect == 0 && dialPhaseMetric.TCPConnect > 0 {
@@ -4182,6 +4474,7 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 
 func healthCheckMixedProxies(proxies []string) MixedHealthCheckResult {
 	mixedHealthErrorCodeMetrics.Reset()
+	mixedStageMetrics.Reset()
 	if config.HealthCheckTwoStage.Enabled {
 		return healthCheckMixedProxiesTwoStage(proxies)
 	}
@@ -4479,7 +4772,10 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 					scheme = parsedScheme
 				}
 				settings, _ := mixedHealthSettingsForProtocolWithTier(scheme, 1)
+				start := time.Now()
 				status := checkMainstreamProxyHealthStage1WithHardTimeout(entry, settings)
+				stageLatency := time.Since(start)
+				mixedStageMetrics.AddStageResult(status.Scheme, "stage1", status.Healthy, status.ErrorCode, stageLatency)
 				mu.Lock()
 				st := getStageStats(status.Scheme)
 				st.Total++
@@ -4497,6 +4793,11 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 		}()
 	}
 	for _, entry := range proxies {
+		scheme := "unknown"
+		if parsedScheme, _, _, _, err := parseMixedProxy(entry); err == nil && parsedScheme != "" {
+			scheme = parsedScheme
+		}
+		mixedStageMetrics.AddInput(scheme)
 		jobs <- entry
 	}
 	close(jobs)
@@ -4513,6 +4814,9 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 		for _, scheme := range protocols {
 			st := stageStats[scheme]
 			log.Printf("[MIXED-2STAGE] scheme=%s stage1_pass=%d stage2_pass=%d drop_reason=%v", scheme, st.Stage1Pass, st.Stage2Pass, st.DropReason)
+			if st.Total > 0 && st.Stage1Pass == 0 {
+				log.Printf("[MIXED-2STAGE-ROOTCAUSE] scheme=%s stage=stage1 top_causes=%s", scheme, summarizeTopRootCauses(st.DropReason, st.Total, 3))
+			}
 		}
 		return MixedHealthCheckResult{}
 	}
@@ -4561,6 +4865,7 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 				}
 				settings, _ := mixedHealthSettingsForProtocolWithTier(scheme, 2)
 				result := checkMainstreamProxyHealthStage2(entry, strictMode, settings)
+				mixedStageMetrics.AddStageResult(result.Status.Scheme, "stage2", result.Status.Healthy, result.Status.ErrorCode, result.Latency)
 				mu.Lock()
 				st := getStageStats(result.Status.Scheme)
 				if result.Status.Healthy {
@@ -4609,6 +4914,9 @@ func healthCheckMixedProxiesTwoStage(proxies []string) MixedHealthCheckResult {
 	for _, scheme := range protocols {
 		st := stageStats[scheme]
 		log.Printf("[MIXED-2STAGE] scheme=%s stage1_pass=%d stage2_pass=%d drop_reason=%v", scheme, st.Stage1Pass, st.Stage2Pass, st.DropReason)
+		if st.Total > 0 && st.Stage1Pass == 0 {
+			log.Printf("[MIXED-2STAGE-ROOTCAUSE] scheme=%s stage=stage1 top_causes=%s", scheme, summarizeTopRootCauses(st.DropReason, st.Total, 3))
+		}
 	}
 
 	sort.Strings(cfPassHealthy)
@@ -5529,6 +5837,34 @@ func triggerRotateControlAll() (string, error) {
 	return string(body), nil
 }
 
+func buildStageFunnelByProtocol() map[string]map[string]int64 {
+	snapshot := mixedStageMetrics.Snapshot()
+	inputRaw, _ := snapshot["input"].(map[string]int64)
+	passRaw, _ := snapshot["pass"].(map[string]map[string]int64)
+	funnel := make(map[string]map[string]int64, len(inputRaw))
+	for protocol, input := range inputRaw {
+		stage1 := int64(0)
+		stage2 := int64(0)
+		if stages, ok := passRaw[protocol]; ok {
+			stage1 = stages["stage1"]
+			stage2 = stages["stage2"]
+		}
+		funnel[protocol] = map[string]int64{"input": input, "stage1": stage1, "stage2": stage2}
+	}
+	return funnel
+}
+
+func mergedMetricsPayload() map[string]interface{} {
+	payload := map[string]interface{}{
+		"error_code_counts": mixedHealthErrorCodeMetrics.Snapshot(),
+		"stage_metrics":     mixedStageMetrics.Snapshot(),
+	}
+	for k, v := range adapterMetrics.Snapshot() {
+		payload[k] = v
+	}
+	return payload
+}
+
 func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool *ProxyPool, mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, cfMixedPool *ProxyPool, port string) error {
 	mux := http.NewServeMux()
 
@@ -5560,13 +5896,16 @@ func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool
 			return
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		payload := map[string]interface{}{
-			"error_code_counts": mixedHealthErrorCodeMetrics.Snapshot(),
+		_ = json.NewEncoder(w).Encode(mergedMetricsPayload())
+	})
+
+	mux.HandleFunc("/metrics/prometheus", func(w http.ResponseWriter, r *http.Request) {
+		if !validateBasicAuth(r) {
+			requireBasicAuth(w, "STATUS-METRICS")
+			return
 		}
-		for k, v := range adapterMetrics.Snapshot() {
-			payload[k] = v
-		}
-		_ = json.NewEncoder(w).Encode(payload)
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		_, _ = w.Write([]byte(mixedStageMetrics.RenderPrometheus()))
 	})
 
 	mux.HandleFunc("/api/overview", func(w http.ResponseWriter, r *http.Request) {
@@ -5582,11 +5921,12 @@ func startPoolStatusServer(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPool
 		lastUpdate, lastHealth, status := adminRuntime.Snapshot()
 		allHealthyCount := payload["all_healthy_proxy_count"]
 		out := map[string]interface{}{
-			"strict":             map[string]interface{}{"available": payload["strict_proxy_count"]},
-			"relaxed":            map[string]interface{}{"available": payload["relaxed_proxy_count"]},
-			"mixed":              map[string]interface{}{"available": payload["http_socks_proxy_count"]},
-			"all_healthy":        allHealthyCount,
-			"last_update_status": status,
+			"strict":                      map[string]interface{}{"available": payload["strict_proxy_count"]},
+			"relaxed":                     map[string]interface{}{"available": payload["relaxed_proxy_count"]},
+			"mixed":                       map[string]interface{}{"available": payload["http_socks_proxy_count"]},
+			"all_healthy":                 allHealthyCount,
+			"last_update_status":          status,
+			"mixed_stage_funnel_by_proto": buildStageFunnelByProtocol(),
 		}
 		if !lastUpdate.IsZero() {
 			out["last_update_time"] = lastUpdate.Format(time.RFC3339)

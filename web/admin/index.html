@@ -46,6 +46,12 @@
     th button{border:0;background:transparent;padding:0;cursor:pointer;font-weight:700}
     .tag{padding:2px 8px;border-radius:999px;background:var(--primary-soft);color:var(--primary-strong);font-size:12px}
     .status-ok{color:var(--ok)} .status-warn{color:var(--warn)} .hidden{display:none}
+    .funnel-row{margin:10px 0;padding:8px;border:1px solid #f9dbe8;border-radius:10px;background:#fff8fb}
+    .funnel-title{font-weight:700;margin-bottom:6px}
+    .funnel-bars{display:flex;gap:6px;align-items:center}
+    .funnel-bar{height:12px;border-radius:999px;min-width:2px}
+    .funnel-input{background:#f9a8d4}.funnel-stage1{background:#fb7185}.funnel-stage2{background:#f43f5e}
+    .funnel-meta{font-size:12px;color:var(--muted);margin-top:4px}
     pre{margin:0;background:#fff5f8;border:1px solid var(--border);padding:10px;border-radius:10px;overflow:auto}
     @media (max-width:980px){.layout{grid-template-columns:1fr}.grid{grid-template-columns:repeat(2,minmax(140px,1fr))}}
   </style>
@@ -67,6 +73,7 @@
     <section id="dashboard" class="tab">
       <div class="grid" id="overviewCards"></div>
       <div class="section"><h2>健康状态</h2><div id="healthSummary"></div></div>
+      <div class="section"><h2>按协议 Stage 漏斗图（input → stage1 → stage2）</h2><div id="stageFunnel"></div></div>
     </section>
 
     <section id="proxies" class="tab hidden">
@@ -107,7 +114,8 @@ const $=s=>document.querySelector(s);
 function setTab(tab){document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('hidden',t.id!==tab));$('#pageTitle').textContent=document.querySelector(`.nav button[data-tab="${tab}"]`).textContent;}
 async function jget(u){const r=await fetch(u);if(!r.ok)throw new Error(`${u} => ${r.status}`);return r.json();}
 async function jpost(u,b={}){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});if(!r.ok)throw new Error(`${u} => ${r.status}`);return r.json();}
-function renderCards(ov){const cards=[["Strict 可用",ov.strict.available],["Relaxed 可用",ov.relaxed.available],["Mixed 可用",ov.mixed.available],["All Healthy",ov.all_healthy]];$('#overviewCards').innerHTML=cards.map(([k,v])=>`<div class="card"><div class="label">${k}</div><div class="value">${v}</div></div>`).join('');$('#healthSummary').innerHTML=`<p>严格池: <b class="${ov.strict.available>0?'status-ok':'status-warn'}">${ov.strict.available>0?'正常':'空池'}</b></p><p>宽松池: <b class="${ov.relaxed.available>0?'status-ok':'status-warn'}">${ov.relaxed.available>0?'正常':'空池'}</b></p><p>上次更新: ${ov.last_update_time||'-'}</p><p>上次检查: ${ov.last_health_check_time||'-'}</p>`;$('#lastSyncLabel').textContent=`Last Sync: ${ov.last_update_time||'-'}`;}
+function renderStageFunnel(ov){const funnel=ov.mixed_stage_funnel_by_proto||{};const protocols=Object.keys(funnel).sort();if(!protocols.length){$('#stageFunnel').innerHTML='<p class="label">暂无 stage 漏斗数据（需完成一次 mixed 两阶段健康检查）。</p>';return;}$('#stageFunnel').innerHTML=protocols.map(proto=>{const x=funnel[proto]||{};const input=Math.max(0,Number(x.input||0));const s1=Math.max(0,Number(x.stage1||0));const s2=Math.max(0,Number(x.stage2||0));const base=input||1;const w1=220;const wi=Math.max(2,Math.round(w1*input/base));const ws1=Math.max(2,Math.round(w1*s1/base));const ws2=Math.max(2,Math.round(w1*s2/base));return `<div class="funnel-row"><div class="funnel-title">${proto}</div><div class="funnel-bars"><div class="funnel-bar funnel-input" style="width:${wi}px" title="input=${input}"></div><div class="funnel-bar funnel-stage1" style="width:${ws1}px" title="stage1=${s1}"></div><div class="funnel-bar funnel-stage2" style="width:${ws2}px" title="stage2=${s2}"></div></div><div class="funnel-meta">input=${input} → stage1=${s1} (${input?((s1/input)*100).toFixed(1):'0.0'}%) → stage2=${s2} (${input?((s2/input)*100).toFixed(1):'0.0'}%)</div></div>`;}).join('');}
+function renderCards(ov){const cards=[["Strict 可用",ov.strict.available],["Relaxed 可用",ov.relaxed.available],["Mixed 可用",ov.mixed.available],["All Healthy",ov.all_healthy]];$('#overviewCards').innerHTML=cards.map(([k,v])=>`<div class="card"><div class="label">${k}</div><div class="value">${v}</div></div>`).join('');$('#healthSummary').innerHTML=`<p>严格池: <b class="${ov.strict.available>0?'status-ok':'status-warn'}">${ov.strict.available>0?'正常':'空池'}</b></p><p>宽松池: <b class="${ov.relaxed.available>0?'status-ok':'status-warn'}">${ov.relaxed.available>0?'正常':'空池'}</b></p><p>上次更新: ${ov.last_update_time||'-'}</p><p>上次检查: ${ov.last_health_check_time||'-'}</p>`;renderStageFunnel(ov);$('#lastSyncLabel').textContent=`Last Sync: ${ov.last_update_time||'-'}`;}
 function applyTable(){const q=$('#searchInput').value.trim().toLowerCase();const p=$('#poolFilter').value;const proto=$('#protocolFilter').value;let data=state.proxies.filter(x=>(!q||x.address.toLowerCase().includes(q))&&(!p||x.pool===p)&&(!proto||x.protocol===proto));data.sort((a,b)=>{const ka=a[state.sortKey],kb=b[state.sortKey];if(typeof ka==='number'&&typeof kb==='number')return state.sortAsc?ka-kb:kb-ka;return state.sortAsc?String(ka).localeCompare(String(kb)):String(kb).localeCompare(String(ka));});$('#proxyTbody').innerHTML=data.map(x=>`<tr><td>${x.address}</td><td><span class="tag">${x.protocol}</span></td><td>${x.pool}</td><td>${x.latency_ms}</td><td>${x.current?'✅':''}</td></tr>`).join('');}
 async function loadOverview(){renderCards(await jget('/api/overview'));}
 async function loadProxies(){const d=await jget('/api/proxies');state.proxies=d.items||[];applyTable();}
