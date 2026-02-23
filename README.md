@@ -396,6 +396,12 @@ axios.get('https://api.ipify.org', {
 - **连接复用**: HTTP传输连接池
 - **快速过滤**: 拒绝TLS握手>5秒的代理
 
+### 健康检查日志口径说明
+
+- `MIXED-TLS-PHASE` 日志中的 `tcp_connect` 默认来自 `httptrace.Connect*` 事件。
+- 对 `socks5/socks5h` 上游，如果 `httptrace` 没有产出 `tcp_connect`，会使用代理拨号阶段耗时兜底填充。
+- 新增字段 `proxy_dial` 表示“从代理 `DialContext` 开始到连接建立成功”的总耗时；在 socks5 场景下，该值可用于识别代理拨号开销。
+
 ### 故障排除
 
 **问题："No available proxies"**
