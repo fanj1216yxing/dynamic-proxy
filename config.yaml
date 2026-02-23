@@ -1,15 +1,15 @@
-﻿# 鍔ㄦ€佷唬鐞嗛厤缃枃浠?
+# 动态代理配置文件
 
-# 浠ｇ悊鍒楄〃URL锛堟敮鎸佸绉嶅崗璁牸寮忥紝绾瓧绗︿覆澶勭悊锛?
-# 鏀寔鏍煎紡锛?
-#   - 绾?ip:port           鈫?192.168.1.1:8080
+# 代理列表URL（支持多种协议格式，纯字符串处理）
+# 支持格式：
+#   - 纯 ip:port           → 192.168.1.1:8080
 #   - http://ip:port       鈫?http://1.2.3.4:80
 #   - https://ip:port      鈫?https://5.6.7.8:443
 #   - socks5://ip:port     鈫?socks5://9.10.11.12:1080
 #   - socks4://ip:port     鈫?socks4://13.14.15.16:1080
 proxy_list_urls:
   - "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt"
-  # 鍙互娣诲姞鏇村浠ｇ悊婧愶紙鏀寔 http/https/socks4/socks5 鍗忚锛?
+  # 可以添加更多代理源（支持 http/https/socks4/socks5 协议）
   - "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/socks5/raw/all.txt"
   - "https://raw.githubusercontent.com/kssku/guaxue/main/data/proxies.yaml"
   - "https://raw.githubusercontent.com/waterbaizhang/tv/main/final.yaml"
@@ -20,11 +20,11 @@ proxy_list_urls:
   # - "https://example.com/http-proxies.txt"
   # - "https://example.com/socks4-proxies.txt"
 
-# 鐗规畩浠ｇ悊鍒楄〃URL锛堝鏉傛牸寮忥紝鏀寔棰濆鏂囨湰鎻忚堪锛?
-# 浣跨敤绠€鍗曟鍒欒嚜鍔ㄦ彁鍙?ip:port锛屽拷鐣ュ崗璁墠缂€鍜屾弿杩版枃鏈?
-# 渚嬪锛歴ocks5://83.217.209.26:1 [[瀹跺] 鑻卞浗 鑻辨牸鍏?绾戒集閲?[Vodafone Broadband]]
-#       http://1.2.3.4:8080 [缇庡浗 绾界害]
-#       闅忎究浠€涔?192.168.1.1:8080 涔变竷鍏碂
+# 特殊代理列表URL（复杂格式，支持额外文本描述）
+# 使用简单正则自动提取 ip:port，忽略协议前缀和描述文本
+# 例如：socks5://83.217.209.26:1 [[家宽] 英国 英格兰 纽伯里 [Vodafone Broadband]]
+#       http://1.2.3.4:8080 [美国 纽约]
+#       随便什么 192.168.1.1:8080 乱七八糟
 special_proxy_list_urls:
   # - "https://example.com/complex-format-list.txt"
   # - "https://example.org/another-complex-list.txt"
@@ -38,48 +38,48 @@ subscription_use_env_proxy: false
 # enabled=true 且 url 非空时，固定使用该代理；方便后续随时修改
 # url 支持 http:// / https:// / socks5:// / socks5h://；也支持直接写 host:port（程序自动补 http://）
 subscription_proxy:
-  enabled: true
+  enabled: false
   url: "http://127.0.0.1:2081"
 
 # 健康检查并发数（同时测试多少个代理）
 health_check_concurrency: 2000
 
-# 浠ｇ悊姹犳洿鏂伴棿闅旓紙鍒嗛挓锛?
+# 代理池更新间隔（分钟）
 update_interval_minutes: 360
 
-# 鑷姩杞崲闂撮殧锛堝垎閽燂級
-# 榛樿 30锛屽～ now 琛ㄧず姣忔璇锋眰閮借疆鎹竴娆′唬鐞?
+# 自动轮换间隔（分钟）
+# 默认 30，填 now 表示每次请求都轮换一次代理
 proxy_switch_interval_min: 30
 
-# 鍗曢樁娈靛仴搴锋鏌ヨ秴鏃惰缃紙褰?two-stage 鍏抽棴鏃剁敓鏁堬級
+# 单阶段健康检查超时设置（当 two-stage 关闭时生效）
 health_check:
-  # 鎬昏秴鏃舵椂闂达紙绉掞級
+  # 总超时时间（秒）
   total_timeout_seconds: 8
-  # TLS鎻℃墜鎬ц兘闃堝€硷紙绉掞級
+  # TLS握手性能阈值（秒）
   tls_handshake_threshold_seconds: 4
 
-# 涓ら樁娈靛仴搴锋鏌ワ紙閫傚悎瓒呭ぇ瑙勬ā浠ｇ悊姹狅級
+# 两阶段健康检查（适合超大规模代理池）
 health_check_two_stage:
   enabled: true
-  # 绗簩闃舵鏄惁鍚敤涓ユ牸璇佷功鏍￠獙锛堝奖鍝?cert_verify 鎸囨爣锛?
+  # 第二阶段是否启用严格证书校验（影响 cert_verify 指标）
   strict_mode: true
-  # 绗竴闃舵锛氬揩閫熸窐姹帮紙浠呭缓绔嬮毀閬擄級
+  # 第一阶段：快速淘汰（仅建立隧道）
   stage_one:
     total_timeout_seconds: 6
     tls_handshake_threshold_seconds: 3
-  # 绗簩闃舵锛氱湡瀹炵珯鐐归獙璇侊紙TLS/HTTP锛?
+  # 第二阶段：真实站点验证（TLS/HTTP）
   stage_two:
     total_timeout_seconds: 20
     tls_handshake_threshold_seconds: 10
 
-# 鍗忚鍒嗙骇瓒呮椂寤鸿鍊硷細
-# - http/https锛氬揩妫€妗ｏ紙stage1/stage2 寤鸿閮?5s锛?
-# - ss/ssr/trojan锛氬鏉炬。锛坰tage1 10s锛宻tage2 30~60s锛屾彙鎵嬮槇鍊肩嫭绔嬭皟浼橈級
-# - vmess锛氬钩琛℃。锛坰tage1 6s锛宻tage2 15s锛?
-# - vless/hy2锛氶珮寤惰繜鏀惧妗ｏ紙stage1 6s锛宻tage2 30s锛?
+# 协议分级超时建议值：
+# - http/https：快检档（stage1/stage2 建议都 5s）
+# - ss/ssr/trojan：宽松档（stage1 10s，stage2 30~60s，握手阈值独立调优）
+# - vmess：平衡档（stage1 6s，stage2 15s）
+# - vless/hy2：高延迟放宽档（stage1 6s，stage2 30s）
 
-# 鍗忚绾ц秴鏃惰鍐欙紙涓ら樁娈垫ā鍨嬶級
-# 鍛戒腑椤哄簭锛氬崗璁笓鐢?> health_check_two_stage 瀵瑰簲 stage 榛樿鍊?> health_check 鍏ㄥ眬鍊?
+# 协议级超时覆写（两阶段模型）
+# 命中顺序：协议专用 > health_check_two_stage 对应 stage 默认值 > health_check 全局值
 health_check_protocol_overrides:
   http:
     stage_one:
@@ -138,26 +138,26 @@ health_check_protocol_overrides:
       total_timeout_seconds: 30
       tls_handshake_threshold_seconds: 12
 
-# 鍏抽敭 TLS 鍙傛暟琛ュ叏绛栫暐锛坴less/trojan/hy2锛?
+# 关键 TLS 参数补全策略（vless/trojan/hy2）
 tls_param_policy:
   default_allow_insecure: false
   default_alpn: ["h2", "http/1.1"]
 
-# cert_verify_failed 鐧藉悕鍗曪紙浠呭彈鎺у満鏅紑鏀?insecure=true锛?
+# cert_verify_failed 白名单（仅受控场景开放 insecure=true）
 cert_verify_whitelist:
   enabled: false
   allowed_hosts: []
   require_insecure: true
   enforce_strict_audit: true
 
-# HTTP Mainstream 娣峰悎鍏ュ彛闄嶇骇绛栫暐
-# fallback_http_socks: 涓绘祦鍗忚姹犱笉鍙敤鏃跺洖閫€鍒?http/socks 姹?
-# explicit_error: 涓绘祦鍗忚姹犱笉鍙敤鏃惰繑鍥炴樉寮?503 閿欒锛堢敱涓氬姟鑷澶勭悊锛?
+# HTTP Mainstream 混合入口降级策略
+# fallback_http_socks: 主流协议池不可用时回退到 http/socks 池
+# explicit_error: 主流协议池不可用时返回显式 503 错误（由业务自行处理）
 mainstream_mixed:
   degrade_strategy: "explicit_error"
   explicit_error_message: "Mainstream upstream unavailable"
 
-# 鍗忚绾?SLO锛堜富娴佸崗璁睜锛?
+# 协议级 SLO（主流协议池）
 protocol_slo:
   enabled: true
   min_healthy:
@@ -165,52 +165,52 @@ protocol_slo:
     hy2: 1
     trojan: 1
 
-# 鍛婅绛栫暐
+# 告警策略
 alerting:
-  # 褰?mainstream=0 杩炵画瓒呰繃璇ュ懆鏈熸暟鏃惰Е鍙?P1 鍛婅
+  # 当 mainstream=0 连续超过该周期数时触发 P1 告警
   zero_mainstream_tolerance_cycles: 1
 
-# 宸紓鎺㈡祴锛堥粍閲戞牱鏈?+ DNS 绛栫暐 + strict/relaxed A/B锛?
+# 差异探测（黄金样本 + DNS 策略 + strict/relaxed A/B）
 differential_probe:
   enabled: false
   target_url: "https://www.google.com"
   golden_sample_file: "golden-proxies.yaml"
   samples_per_protocol: 5
-  compare_tls_policy: "relaxed" # client/server 瀵规瘮鏃朵娇鐢ㄥ悓涓€ TLS 绛栫暐: strict|relaxed
+  compare_tls_policy: "relaxed" # client/server 对比时使用同一 TLS 策略: strict|relaxed
   report_output_file: "diff-probe-report.json"
   dns:
     mode: "system" # system | doh | dot
     doh_endpoint: "https://dns.google/resolve"
     dot_server: "1.1.1.1:853"
 
-# 涓绘祦鍗忚鍐呮牳閰嶇疆锛堢敤浜?ss/ssr/trojan/vmess/vless/hy2 绛夋嫧鍙凤級
+# 主流协议内核配置（用于 ss/ssr/trojan/vmess/vless/hy2 等拨号）
 detector:
-  core: "singbox" # 宸查儴缃叉牳蹇冪ず渚? mihomo | meta | singbox
+  core: "singbox" # 已部署核心示例: mihomo | meta | singbox
 
-# 鏈嶅姟鍣ㄧ鍙ｉ厤缃?
+# 服务器端口配置
 ports:
   socks5_strict: ":17283"
   socks5_relaxed: ":17284"
   http_strict: ":17285"
   http_relaxed: ":17286"
-  http_mixed: ":17288"      # HTTP鍏ュ彛锛氫粎鑷姩閫夋嫨 HTTP/HTTPS/SOCKS5 涓婃父浠ｇ悊
-  http_mainstream_mixed: ":17290" # HTTP鍏ュ彛锛氫粎鑷姩閫夋嫨 VMESS/VLESS/HY2 绛変富娴佸崗璁笂娓镐唬鐞?
-  http_cf_mixed: ":17289"   # HTTP鍏ュ彛锛氳嚜鍔ㄩ€夋嫨鍙€氳繃 CF 鎸戞垬鐨?HTTP/HTTPS/SOCKS5 涓婃父浠ｇ悊
-  rotate_control: ":17287" # 璁块棶璇ョ鍙ｄ細闅忔満鍒囨崲鍒颁竴涓柊鐨勫仴搴蜂唬鐞?
+  http_mixed: ":17288"      # HTTP入口：仅自动选择 HTTP/HTTPS/SOCKS5 上游代理
+  http_mainstream_mixed: ":17290" # HTTP入口：仅自动选择 VMESS/VLESS/HY2 等主流协议上游代理
+  http_cf_mixed: ":17289"   # HTTP入口：自动选择可通过 CF 挑战的 HTTP/HTTPS/SOCKS5 上游代理
+  rotate_control: ":17287" # 访问该端口会随机切换到一个新的健康代理
 
-# 浠ｇ悊璁よ瘉閰嶇疆锛堝彲閫夛級
-# 濡傛灉鍚敤锛寀sername/password 蹇呴』鍚屾椂璁剧疆
+# 代理认证配置（可选）
+# 如果启用，username/password 必须同时设置
 auth:
   username: ""
   password: ""
 
-# Cloudflare 鎸戞垬鍙€氳繃鎬ф娴嬶紙鍙€夛級
+# Cloudflare 挑战可通过性检测（可选）
 cf_challenge_check:
   enabled: false
-  # 寤鸿濉啓浣犺嚜宸辩殑 CF 淇濇姢椤甸潰锛岀敤浜庣瓫閫夊彲鑷姩閫氳繃鎸戞垬鐨勪唬鐞?
+  # 建议填写你自己的 CF 保护页面，用于筛选可自动通过挑战的代理
   url: "https://linux.do"
   expected_statuses: [200]
-  # 椤甸潰鑻ュ寘鍚互涓嬪叧閿瘝鍒欏垽瀹氫负鏈€氳繃鎸戞垬
+  # 页面若包含以下关键词则判定为未通过挑战
   block_indicators:
     - "just a moment"
     - "cf-challenge"
