@@ -16,6 +16,7 @@ proxy_list_urls:
   - "https://qybndbviblvt.us-west-1.clawcloudrun.com/api/v1/subscribe?token=u0bt57u81cui26g1vc&target=v2ray&list=true"
   - "https://raw.githubusercontent.com/nekosolo1233/p1oxy/main/v2.yaml"
   - "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt"
+  - "https://gist.githubusercontent.com/beck-8/cfdd91729b358903ccc2da0b42524029/raw/7b598c64f8460c87bc8a97a6d5dab8b57ef125ba/all.yaml"
 
   # - "https://example.com/http-proxies.txt"
   # - "https://example.com/socks4-proxies.txt"
