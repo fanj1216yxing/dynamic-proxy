@@ -87,6 +87,70 @@ func TestParserRegressionBase64ExportLike(t *testing.T) {
 	assertSchemeCoverage(t, entries, "vmess", "vless", "hy2", "ss", "trojan")
 }
 
+func TestParseRegularProxyContentMixedExpandsPlainEndpointsByProtocol(t *testing.T) {
+	content := strings.Join([]string{
+		"103.210.22.17:3128",
+		"38.3.162.129:999",
+		"210.61.216.63:60808",
+		"154.64.211.145:999",
+		"139.59.1.14:80",
+		"103.191.165.146:8090",
+	}, "\n")
+
+	entries, format := parseRegularProxyContentMixed(content)
+	if format != "plain" {
+		t.Fatalf("expected plain format, got %s", format)
+	}
+	if len(entries) != 24 {
+		t.Fatalf("expected 24 expanded entries, got %d", len(entries))
+	}
+
+	counts := protocolHealthyCounts(entries)
+	if counts["http"] != 6 || counts["https"] != 6 || counts["socks4"] != 6 || counts["socks5"] != 6 {
+		t.Fatalf("unexpected expanded protocol counts: %#v", counts)
+	}
+}
+
+func TestParseSpecialProxyURLMixedExpandsPlainEndpointAndKeepsExplicitScheme(t *testing.T) {
+	content := strings.Join([]string{
+		"103.210.22.17:3128",
+		"socks4://38.3.162.129:999",
+		"proxy 210.61.216.63:60808 note",
+	}, "\n")
+
+	entries := parseSpecialProxyURLMixed(content)
+	counts := protocolHealthyCounts(entries)
+	if counts["http"] != 2 || counts["https"] != 2 || counts["socks5"] != 2 || counts["socks4"] != 3 {
+		t.Fatalf("unexpected special parser protocol counts: %#v", counts)
+	}
+}
+
+func TestParseMixedProxySupportsSocks4(t *testing.T) {
+	scheme, addr, auth, _, err := parseMixedProxy("socks4://user@103.210.22.17:3128")
+	if err != nil {
+		t.Fatalf("expected socks4 parse success, got err=%v", err)
+	}
+	if scheme != "socks4" || addr != "103.210.22.17:3128" {
+		t.Fatalf("unexpected socks4 parse output scheme=%s addr=%s", scheme, addr)
+	}
+	if auth == nil || auth.User != "user" {
+		t.Fatalf("expected socks4 user auth to be preserved, got %#v", auth)
+	}
+}
+
+func TestBuildUpstreamDialerSupportsSocks4(t *testing.T) {
+	dialer, scheme, err := buildUpstreamDialer("socks4://103.210.22.17:3128")
+	if err != nil {
+		t.Fatalf("expected buildUpstreamDialer success, got %v", err)
+	}
+	if scheme != "socks4" {
+		t.Fatalf("expected scheme socks4, got %s", scheme)
+	}
+	if _, ok := dialer.(*socks4UpstreamDialer); !ok {
+		t.Fatalf("expected socks4 upstream dialer, got %T", dialer)
+	}
+}
+
 func TestNormalizeMixedProxyEntryCompletesCriticalTLSParams(t *testing.T) {
 	config = Config{}
 	config.TLSParamPolicy.DefaultALPN = []string{"h2", "http/1.1"}

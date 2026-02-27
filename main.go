@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	_ "embed"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -959,6 +960,7 @@ type clashSubscription struct {
 var mixedSupportedSchemes = map[string]bool{
 	"http":      true,
 	"https":     true,
+	"socks4":    true,
 	"socks5":    true,
 	"socks5h":   true,
 	"vmess":     true,
@@ -977,6 +979,7 @@ var mixedSupportedSchemes = map[string]bool{
 var httpSocksMixedSchemes = map[string]bool{
 	"http":    true,
 	"https":   true,
+	"socks4":  true,
 	"socks5":  true,
 	"socks5h": true,
 }
@@ -984,9 +987,12 @@ var httpSocksMixedSchemes = map[string]bool{
 var mainstreamMixedExcludedSchemes = map[string]bool{
 	"http":    true,
 	"https":   true,
+	"socks4":  true,
 	"socks5":  true,
 	"socks5h": true,
 }
+
+var plainProxyProbeSchemes = []string{"http", "https", "socks4", "socks5"}
 
 func parseClashSubscriptionForStrictRelaxed(content string) ([]string, bool) {
 	var sub clashSubscription
@@ -1046,6 +1052,45 @@ func parseRegularProxyContent(content string) ([]string, string) {
 	return proxies, "plain"
 }
 
+func extractPlainProxyHostPort(raw string) (string, bool) {
+	line := strings.TrimSpace(raw)
+	if line == "" || strings.Contains(line, "://") {
+		return "", false
+	}
+
+	if matches := simpleProxyRegex.FindStringSubmatch(line); len(matches) >= 3 {
+		return net.JoinHostPort(matches[1], matches[2]), true
+	}
+
+	host, port, err := net.SplitHostPort(line)
+	if err != nil {
+		return "", false
+	}
+	host = strings.TrimSpace(host)
+	port = strings.TrimSpace(port)
+	if host == "" || port == "" {
+		return "", false
+	}
+	portNum, convErr := strconv.Atoi(port)
+	if convErr != nil || portNum <= 0 || portNum > 65535 {
+		return "", false
+	}
+	return net.JoinHostPort(host, port), true
+}
+
+func expandPlainProxyForMixed(raw string) ([]string, bool) {
+	hostPort, ok := extractPlainProxyHostPort(raw)
+	if !ok {
+		return nil, false
+	}
+
+	expanded := make([]string, 0, len(plainProxyProbeSchemes))
+	for _, scheme := range plainProxyProbeSchemes {
+		expanded = append(expanded, fmt.Sprintf("%s://%s", scheme, hostPort))
+	}
+	return expanded, true
+}
+
 func parseRegularProxyContentMixed(content string) ([]string, string) {
 	content = preprocessSubscriptionContent(content)
 	if clashProxies, ok := parseClashSubscriptionForMixed(content); ok {
@@ -1066,8 +1111,16 @@ func parseRegularProxyContentMixed(content string) ([]string, string) {
 			continue
 		}
 
-		normalized, ok := normalizeMixedProxyEntry(line)
-		if ok {
+		if expanded, ok := expandPlainProxyForMixed(line); ok {
+			for _, candidate := range expanded {
+				if normalized, normalizedOK := normalizeMixedProxyEntry(candidate); normalizedOK {
+					proxies = append(proxies, normalized)
+				}
+			}
+			continue
+		}
+
+		if normalized, ok := normalizeMixedProxyEntry(line); ok {
 			proxies = append(proxies, normalized)
 		} else {
 			sampleParseFailureLine("parse_failed", line, "normalize_failed")
@@ -1199,7 +1252,7 @@ func parseClashSubscriptionForMixed(content string) ([]string, bool) {
 				continue
 			}
 			entry = fmt.Sprintf("trojan://%s@%s", url.QueryEscape(p.Password), host)
-		case "http", "https", "socks5", "socks5h":
+		case "http", "https", "socks4", "socks5", "socks5h":
 			if p.Username != "" {
 				entry = fmt.Sprintf("%s://%s:%s@%s", proxyType, url.QueryEscape(p.Username), url.QueryEscape(p.Password), host)
 			} else {
@@ -2250,6 +2303,100 @@ func (d *socksUpstreamDialer) DialContext(ctx context.Context, network, addr str
 		adapterMetrics.AddDial("socks5", "success", "", dialCost)
 		return result.conn, nil
 	}
+}
+
+type socks4UpstreamDialer struct {
+	proxyAddr string
+	userID    string
+}
+
+func buildSOCKS4ConnectRequest(targetAddr string, userID string) ([]byte, error) {
+	host, portRaw, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid target address: %w", err)
+	}
+	portNum, err := strconv.Atoi(portRaw)
+	if err != nil || portNum <= 0 || portNum > 65535 {
+		return nil, fmt.Errorf("invalid target port: %s", portRaw)
+	}
+
+	request := make([]byte, 0, 16+len(host)+len(userID))
+	request = append(request, 0x04, 0x01)
+	portBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBytes, uint16(portNum))
+	request = append(request, portBytes...)
+
+	if ip := net.ParseIP(host); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			request = append(request, ip4...)
+			request = append(request, []byte(userID)...)
+			request = append(request, 0x00)
+			return request, nil
+		}
+	}
+
+	// SOCKS4a: use domain name when target is not an IPv4 literal.
+	request = append(request, 0x00, 0x00, 0x00, 0x01)
+	request = append(request, []byte(userID)...)
+	request = append(request, 0x00)
+	request = append(request, []byte(host)...)
+	request = append(request, 0x00)
+	return request, nil
+}
+
+func (d *socks4UpstreamDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if network != "tcp" {
+		return nil, fmt.Errorf("unsupported network %s for SOCKS4 upstream", network)
+	}
+
+	ctx, cancel := withDialTimeout(ctx)
+	defer cancel()
+	start := time.Now()
+
+	netDialer := &net.Dialer{}
+	conn, err := netDialer.DialContext(ctx, "tcp", d.proxyAddr)
+	if err != nil {
+		adapterMetrics.AddDial("socks4", "error", "dial_failed", time.Since(start))
+		return nil, err
+	}
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+
+	request, err := buildSOCKS4ConnectRequest(addr, d.userID)
+	if err != nil {
+		_ = conn.Close()
+		adapterMetrics.AddDial("socks4", "error", "target_invalid", time.Since(start))
+		return nil, err
+	}
+
+	if _, err := conn.Write(request); err != nil {
+		_ = conn.Close()
+		adapterMetrics.AddDial("socks4", "error", "write_failed", time.Since(start))
+		return nil, err
+	}
+
+	response := make([]byte, 8)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		_ = conn.Close()
+		adapterMetrics.AddDial("socks4", "error", "read_failed", time.Since(start))
+		return nil, err
+	}
+
+	if response[0] != 0x00 {
+		_ = conn.Close()
+		adapterMetrics.AddDial("socks4", "error", "invalid_reply", time.Since(start))
+		return nil, fmt.Errorf("invalid SOCKS4 response version: 0x%02x", response[0])
+	}
+	if response[1] != 0x5A {
+		_ = conn.Close()
+		adapterMetrics.AddDial("socks4", "error", "connect_rejected", time.Since(start))
+		return nil, fmt.Errorf("SOCKS4 connect rejected with code 0x%02x", response[1])
+	}
+
+	adapterMetrics.AddDial("socks4", "success", "", time.Since(start))
+	return conn, nil
 }
 
 type httpConnectUpstreamDialer struct {
@@ -3678,6 +3825,12 @@ func buildUpstreamDialer(entry string) (UpstreamDialer, string, error) {
 	switch dialScheme {
 	case "socks5", "socks5h":
 		return &socksUpstreamDialer{proxyAddr: dialAddr, auth: auth}, scheme, nil
+	case "socks4":
+		userID := ""
+		if auth != nil {
+			userID = auth.User
+		}
+		return &socks4UpstreamDialer{proxyAddr: dialAddr, userID: userID}, scheme, nil
 	case "http", "https":
 		return &httpConnectUpstreamDialer{proxyScheme: dialScheme, proxyAddr: dialAddr, proxyAuthHeader: httpAuthHeader}, scheme, nil
 	case "vmess", "vless", "hy2", "hysteria", "hysteria2", "trojan", "ss", "ssr", "tuic", "wg", "wireguard":
@@ -3696,6 +3849,18 @@ func parseSpecialProxyURLMixed(content string) []string {
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if expanded, ok := expandPlainProxyForMixed(line); ok {
+			for _, candidate := range expanded {
+				if normalized, normalizedOK := normalizeMixedProxyEntry(candidate); normalizedOK {
+					if !proxySet[normalized] {
+						proxySet[normalized] = true
+						proxies = append(proxies, normalized)
+					}
+				}
+			}
 			continue
 		}
 
@@ -3721,22 +3886,36 @@ func parseSpecialProxyURLMixed(content string) []string {
 			continue
 		}
 
-		scheme := "socks5"
+		scheme := ""
 		switch {
 		case strings.Contains(lowerLine, "https://"):
 			scheme = "https"
 		case strings.Contains(lowerLine, "http://"):
 			scheme = "http"
+		case strings.Contains(lowerLine, "socks4://"):
+			scheme = "socks4"
 		case strings.Contains(lowerLine, "socks5h://"):
 			scheme = "socks5h"
 		case strings.Contains(lowerLine, "socks5://"):
 			scheme = "socks5"
 		}
 
-		entry := fmt.Sprintf("%s://%s:%s", scheme, matches[1], matches[2])
-		if !proxySet[entry] {
-			proxySet[entry] = true
-			proxies = append(proxies, entry)
+		if scheme != "" {
+			entry := fmt.Sprintf("%s://%s:%s", scheme, matches[1], matches[2])
+			if !proxySet[entry] {
+				proxySet[entry] = true
+				proxies = append(proxies, entry)
+			}
+			continue
+		}
+
+		hostPort := net.JoinHostPort(matches[1], matches[2])
+		for _, candidateScheme := range plainProxyProbeSchemes {
+			entry := fmt.Sprintf("%s://%s", candidateScheme, hostPort)
+			if !proxySet[entry] {
+				proxySet[entry] = true
+				proxies = append(proxies, entry)
+			}
 		}
 	}
 
@@ -6351,14 +6530,14 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 		mixedPool.Update(httpSocksCombined)
 		log.Printf("[HTTP-MIXED] Pool updated with %d proxies (mixed http/socks + strict/relaxed imports)", len(httpSocksCombined))
 	} else {
-		log.Println("[HTTP-MIXED] Warning: No mixed HTTP/HTTPS/SOCKS proxies and no strict/relaxed imports found, keeping existing pool")
+		log.Println("[HTTP-MIXED] Warning: No mixed HTTP/HTTPS/SOCKS4/SOCKS5 proxies and no strict/relaxed imports found, keeping existing pool")
 	}
 
 	if len(mainstreamHealthy) > 0 {
 		mainstreamMixedPool.Update(mainstreamHealthy)
-		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy non-http/socks5 mixed proxies", len(mainstreamHealthy))
+		log.Printf("[HTTP-MAINSTREAM-MIXED] Pool updated with %d healthy non-http/socks4/socks5 mixed proxies", len(mainstreamHealthy))
 	} else {
-		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy non-http/socks5 mixed proxies found, keeping existing pool")
+		log.Println("[HTTP-MAINSTREAM-MIXED] Warning: No healthy non-http/socks4/socks5 mixed proxies found, keeping existing pool")
 	}
 
 	updateStatus, healthReasons := evaluateMainstreamHealth(mainstreamHealthy)
@@ -7961,7 +8140,7 @@ func main() {
 	log.Printf("  - SOCKS5 Relaxed port: %s", config.Ports.SOCKS5Relaxed)
 	log.Printf("  - HTTP Strict port: %s", config.Ports.HTTPStrict)
 	log.Printf("  - HTTP Relaxed port: %s", config.Ports.HTTPRelaxed)
-	log.Printf("  - HTTP Mixed port (HTTP/HTTPS/SOCKS): %s", config.Ports.HTTPMixed)
+	log.Printf("  - HTTP Mixed port (HTTP/HTTPS/SOCKS4/SOCKS5): %s", config.Ports.HTTPMixed)
 	log.Printf("  - HTTP Mixed port (VMESS/VLESS/HY2): %s", config.Ports.HTTPMainstreamMix)
 	log.Printf("  - HTTP Mixed CF-pass port: %s", config.Ports.HTTPCFMixed)
 	if isProxyAuthEnabled() {
@@ -8091,7 +8270,7 @@ func main() {
 		}
 	}()
 
-	// HTTP Mixed (HTTP/HTTPS/SOCKS5 upstream)
+	// HTTP Mixed (HTTP/HTTPS/SOCKS4/SOCKS5 upstream)
 	go func() {
 		defer wg.Done()
 		if err := startHTTPServer(mixedHTTPPool, nil, config.Ports.HTTPMixed, "MIXED"); err != nil {
@@ -8126,8 +8305,8 @@ func main() {
 	log.Println("All servers started successfully")
 	log.Println("  [STRICT] SOCKS5: " + config.Ports.SOCKS5Strict + " | HTTP: " + config.Ports.HTTPStrict)
 	log.Println("  [RELAXED] SOCKS5: " + config.Ports.SOCKS5Relaxed + " | HTTP: " + config.Ports.HTTPRelaxed)
-	log.Println("  [MIXED] HTTP (HTTP/HTTPS/SOCKS upstream): " + config.Ports.HTTPMixed)
-	log.Println("  [MAINSTREAM-MIXED] HTTP (all non-http/socks5 upstream): " + config.Ports.HTTPMainstreamMix)
+	log.Println("  [MIXED] HTTP (HTTP/HTTPS/SOCKS4/SOCKS5 upstream): " + config.Ports.HTTPMixed)
+	log.Println("  [MAINSTREAM-MIXED] HTTP (all non-http/socks4/socks5 upstream): " + config.Ports.HTTPMainstreamMix)
 	log.Printf("  [MAINSTREAM-MIXED] Degrade strategy: %s", config.MainstreamMixed.DegradeStrategy)
 	log.Println("  [CF-MIXED] HTTP (CF-pass SOCKS5/HTTP upstream): " + config.Ports.HTTPCFMixed)
 	log.Println("  [ROTATE] Control: " + config.Ports.RotateControl)
