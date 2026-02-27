@@ -105,6 +105,86 @@ func TestNormalizeMixedProxyEntryCompletesCriticalTLSParams(t *testing.T) {
 	}
 }
 
+func TestNormalizeMixedProxyEntryPreservesAllowInsecureAlias(t *testing.T) {
+	config = Config{}
+	config.TLSParamPolicy.DefaultALPN = []string{"h2", "http/1.1"}
+	entry, ok := normalizeMixedProxyEntry("trojan://pass@example.com:443?allow_insecure=true")
+	if !ok {
+		t.Fatalf("expected trojan entry to normalize")
+	}
+	if !strings.Contains(entry, "insecure=true") {
+		t.Fatalf("expected insecure=true to be preserved, got %s", entry)
+	}
+	if !strings.Contains(entry, "allow_insecure=true") {
+		t.Fatalf("expected allow_insecure=true to be preserved, got %s", entry)
+	}
+}
+
+func TestParseTrojanNodeForKernelAcceptsAllowInsecureUnderscore(t *testing.T) {
+	node, ok := parseTrojanNodeForKernel("trojan://pass@example.com:443?sni=example.com&allow_insecure=true")
+	if !ok {
+		t.Fatalf("expected trojan node parse success")
+	}
+	if !node.Insecure {
+		t.Fatalf("expected allow_insecure=true to set Insecure=true")
+	}
+}
+
+func TestParseTrojanNodeForKernelParsesFingerprint(t *testing.T) {
+	node, ok := parseTrojanNodeForKernel("trojan://pass@example.com:443?sni=example.com&fp=chrome")
+	if !ok {
+		t.Fatalf("expected trojan node parse success")
+	}
+	if node.Fingerprint != "chrome" {
+		t.Fatalf("expected fp=chrome to be preserved, got %q", node.Fingerprint)
+	}
+}
+
+func TestBuildRuntimeSingboxOutboundTrojanAddsUTLS(t *testing.T) {
+	config = Config{}
+	config.TLSParamPolicy.DefaultALPN = []string{"h2", "http/1.1"}
+	node := kernelNodeConfig{Protocol: "trojan", Address: "example.com", Port: "443"}
+	node.Trojan.Password = "pass"
+	node.Trojan.SNI = "example.com"
+	node.Trojan.Fingerprint = "random"
+
+	out, err := buildRuntimeSingboxOutbound(node)
+	if err != nil {
+		t.Fatalf("expected build success: %v", err)
+	}
+	tlsRaw, ok := out["tls"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected tls map")
+	}
+	utlsRaw, ok := tlsRaw["utls"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected utls map")
+	}
+	if utlsRaw["fingerprint"] != "randomized" {
+		t.Fatalf("expected random fp normalized to randomized, got %v", utlsRaw["fingerprint"])
+	}
+}
+
+func TestParseKernelNodeConfigInsecureAliases(t *testing.T) {
+	vlessEntry := "vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&security=tls&sni=example.com&allow_insecure=true"
+	vlessNode, err := parseKernelNodeConfig("vless", vlessEntry, "example.com:443")
+	if err != nil {
+		t.Fatalf("expected vless parse success: %v", err)
+	}
+	if !vlessNode.VLESS.AllowInsecure {
+		t.Fatalf("expected vless allow_insecure=true to set AllowInsecure=true")
+	}
+
+	hy2Entry := "hy2://pass@example.com:443?sni=example.com&allow_insecure=true"
+	hy2Node, err := parseKernelNodeConfig("hy2", hy2Entry, "example.com:443")
+	if err != nil {
+		t.Fatalf("expected hy2 parse success: %v", err)
+	}
+	if !hy2Node.HY2.AllowInsecure {
+		t.Fatalf("expected hy2 allow_insecure=true to set AllowInsecure=true")
+	}
+}
+
 func TestShouldAllowInsecureByWhitelist(t *testing.T) {
 	config = Config{}
 	config.CertVerifyWhitelist.Enabled = true
@@ -224,6 +304,82 @@ func TestClassifyHealthFailureCoreUnavailable(t *testing.T) {
 	category, reason := classifyHealthFailure(err)
 	if category != healthFailureCoreUnavailable || reason != "core_unconfigured" {
 		t.Fatalf("unexpected classification: category=%s reason=%s", category, reason)
+	}
+}
+
+func TestExternalKernelHealthCheckAutoStartSidecarRetriesProbe(t *testing.T) {
+	originalProbe := sidecarProbeFunc
+	originalAutostart := sidecarAutoStartFunc
+	t.Cleanup(func() {
+		sidecarProbeFunc = originalProbe
+		sidecarAutoStartFunc = originalAutostart
+	})
+
+	probeCalls := 0
+	sidecarProbeFunc = func(ctx context.Context, addr string) error {
+		probeCalls++
+		if probeCalls == 1 {
+			return errors.New("connection refused")
+		}
+		return nil
+	}
+
+	autostartCalls := 0
+	sidecarAutoStartFunc = func(ctx context.Context, coreName, sidecarAddr string) error {
+		autostartCalls++
+		if coreName != "singbox" {
+			t.Fatalf("unexpected core name: %s", coreName)
+		}
+		if sidecarAddr != "127.0.0.1:19081" {
+			t.Fatalf("unexpected sidecar addr: %s", sidecarAddr)
+		}
+		return nil
+	}
+
+	backend := &externalKernelBackend{
+		info:        mainstreamCoreInfo{Name: "singbox"},
+		sidecarAddr: "127.0.0.1:19081",
+	}
+	err := backend.HealthCheck(context.Background(), kernelNodeConfig{Protocol: "vless"})
+	if err != nil {
+		t.Fatalf("expected health check to succeed after autostart, got err=%v", err)
+	}
+	if autostartCalls != 1 {
+		t.Fatalf("expected one autostart attempt, got=%d", autostartCalls)
+	}
+	if probeCalls != 2 {
+		t.Fatalf("expected two probe attempts, got=%d", probeCalls)
+	}
+}
+
+func TestExternalKernelHealthCheckReturnsCoreUnavailableWhenAutostartFails(t *testing.T) {
+	originalProbe := sidecarProbeFunc
+	originalAutostart := sidecarAutoStartFunc
+	t.Cleanup(func() {
+		sidecarProbeFunc = originalProbe
+		sidecarAutoStartFunc = originalAutostart
+	})
+
+	sidecarProbeFunc = func(ctx context.Context, addr string) error {
+		return errors.New("connection refused")
+	}
+	sidecarAutoStartFunc = func(ctx context.Context, coreName, sidecarAddr string) error {
+		return errors.New("start failed")
+	}
+
+	backend := &externalKernelBackend{
+		info:        mainstreamCoreInfo{Name: "singbox"},
+		sidecarAddr: "127.0.0.1:19081",
+	}
+	err := backend.HealthCheck(context.Background(), kernelNodeConfig{Protocol: "vless"})
+	if err == nil {
+		t.Fatalf("expected core_unavailable error when autostart fails")
+	}
+	if !strings.Contains(err.Error(), "core_unavailable") {
+		t.Fatalf("expected core_unavailable marker, got err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "sidecar_probe_failed") {
+		t.Fatalf("expected sidecar probe failure marker, got err=%v", err)
 	}
 }
 

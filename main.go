@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -22,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -162,6 +164,8 @@ const requestForwardMaxRetries = 3
 const retryBaseBackoff = 150 * time.Millisecond
 const breakerFailureThreshold = 3
 const breakerOpenTimeout = 30 * time.Second
+const sidecarAutoStartRetryInterval = 15 * time.Second
+const sidecarAutoStartWaitTimeout = 6 * time.Second
 
 var mixedHealthCheckURL = defaultMixedHealthCheckURL
 var mixedProxyHealthChecker = checkMainstreamProxyHealth
@@ -178,8 +182,30 @@ const parseFailureSampleLimit = 50
 
 var upstreamDialerBuilder = buildUpstreamDialer
 var mainstreamAdapterFactory = func() mainstreamDialAdapter { return &mainstreamTCPConnectAdapter{} }
+var sidecarProbeFunc = probeSidecarAddr
+var sidecarAutoStartFunc = autoStartCoreSidecar
 var adapterMetrics = newAdapterObservabilityMetrics()
 var adapterBreaker = newUpstreamBreaker()
+
+type runtimeSidecarContextKey struct{}
+
+var runtimeSidecarConfigSerial atomic.Uint64
+
+var runtimeSidecarSupportedSchemes = map[string]bool{
+	"ss":        true,
+	"trojan":    true,
+	"vless":     true,
+	"vmess":     true,
+	"hy2":       true,
+	"hysteria2": true,
+}
+
+var sidecarAutoStartState = struct {
+	sync.Mutex
+	lastAttempt map[string]time.Time
+}{lastAttempt: make(map[string]time.Time)}
+
+var errSidecarAutoStartCooldown = errors.New("sidecar autostart cooldown")
 
 type runtimeHealthState struct {
 	mu                            sync.RWMutex
@@ -1530,14 +1556,9 @@ func applyCriticalTLSParams(scheme string, u *url.URL) {
 	if strings.TrimSpace(q.Get("alpn")) == "" {
 		q.Set("alpn", strings.Join(defaultALPNForScheme(scheme), ","))
 	}
-	insecure := "false"
-	if config.TLSParamPolicy.DefaultAllowInsecure {
-		insecure = "true"
-	}
-	if strings.TrimSpace(q.Get("insecure")) == "" {
-		q.Set("insecure", insecure)
-		q.Set("allow_insecure", insecure)
-	}
+	insecure := strconv.FormatBool(parseInsecureQueryValue(q, config.TLSParamPolicy.DefaultAllowInsecure))
+	q.Set("insecure", insecure)
+	q.Set("allow_insecure", insecure)
 	u.RawQuery = q.Encode()
 }
 
@@ -2102,6 +2123,37 @@ func parseBoolWithDefault(raw string, def bool) bool {
 	return v
 }
 
+func parseInsecureQueryValue(q url.Values, def bool) bool {
+	if q == nil {
+		return def
+	}
+	for _, key := range []string{"insecure", "allow_insecure", "allowInsecure"} {
+		if raw := strings.TrimSpace(q.Get(key)); raw != "" {
+			return parseBoolWithDefault(raw, def)
+		}
+	}
+	return def
+}
+
+func parseInsecureRawQuery(rawQuery string, def bool) bool {
+	rawQuery = strings.TrimSpace(rawQuery)
+	if rawQuery == "" {
+		return def
+	}
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return def
+	}
+	return parseInsecureQueryValue(q, def)
+}
+
+func contextWithoutCancelFallback(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return context.WithoutCancel(ctx)
+}
+
 func filterSSPluginQuery(rawQuery string) string {
 	q, err := url.ParseQuery(rawQuery)
 	if err != nil {
@@ -2253,6 +2305,7 @@ type kernelNodeConfig struct {
 		SNI           string
 		ALPN          []string
 		AllowInsecure bool
+		Fingerprint   string
 		Network       string
 		Path          string
 		Host          string
@@ -2496,6 +2549,44 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
+type connWithCleanup struct {
+	net.Conn
+	cleanup func()
+	once    sync.Once
+}
+
+func (c *connWithCleanup) Close() error {
+	var err error
+	if c.Conn != nil {
+		err = c.Conn.Close()
+	}
+	c.once.Do(func() {
+		if c.cleanup != nil {
+			c.cleanup()
+		}
+	})
+	return err
+}
+
+type readCloserWithCleanup struct {
+	io.ReadCloser
+	cleanup func()
+	once    sync.Once
+}
+
+func (r *readCloserWithCleanup) Close() error {
+	var err error
+	if r.ReadCloser != nil {
+		err = r.ReadCloser.Close()
+	}
+	r.once.Do(func() {
+		if r.cleanup != nil {
+			r.cleanup()
+		}
+	})
+	return err
+}
+
 func (b *externalKernelBackend) protocolHealthCommand(protocol string) string {
 	if b.protocolHealthChecks == nil {
 		return ""
@@ -2512,6 +2603,460 @@ func runKernelHealthCommand(ctx context.Context, cmd string) error {
 		return fmt.Errorf("health check command failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func sidecarAutoStartEnabled() bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("DP_DISABLE_SIDECAR_AUTOSTART")))
+	return raw != "1" && raw != "true" && raw != "yes" && raw != "on"
+}
+
+func allowSidecarAutoStartAttempt(key string) bool {
+	if strings.TrimSpace(key) == "" {
+		return false
+	}
+	now := time.Now()
+	sidecarAutoStartState.Lock()
+	defer sidecarAutoStartState.Unlock()
+	if last, ok := sidecarAutoStartState.lastAttempt[key]; ok && now.Sub(last) < sidecarAutoStartRetryInterval {
+		return false
+	}
+	sidecarAutoStartState.lastAttempt[key] = now
+	return true
+}
+
+func probeSidecarAddr(ctx context.Context, addr string) error {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
+}
+
+func isLoopbackSidecar(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func firstExistingPath(candidates []string) string {
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func resolveSingboxBinaryPath() (string, error) {
+	binaryPath := firstExistingPath([]string{
+		filepath.Join("sing-box", "sing-box.exe"),
+		filepath.Join("sing-box", "sing-box"),
+		filepath.Join("sing-box", "sing-box-linux-amd64"),
+		filepath.Join("sing-box", "sing-box-windows-amd64.exe"),
+	})
+	if binaryPath == "" {
+		if lookPath, err := exec.LookPath("sing-box"); err == nil {
+			binaryPath = lookPath
+		}
+	}
+	if binaryPath == "" {
+		return "", fmt.Errorf("sing-box binary not found")
+	}
+	return binaryPath, nil
+}
+
+func resolveSingboxSidecarCommand() (string, []string, error) {
+	configPath := firstExistingPath([]string{
+		filepath.Join("sing-box", "sidecar.local.json"),
+		filepath.Join("sing-box", "sidecar.docker.json"),
+	})
+	if configPath == "" {
+		return "", nil, fmt.Errorf("sidecar config not found in sing-box directory")
+	}
+	binaryPath, err := resolveSingboxBinaryPath()
+	if err != nil {
+		return "", nil, err
+	}
+
+	return binaryPath, []string{"run", "-c", configPath}, nil
+}
+
+func autoStartCoreSidecar(ctx context.Context, coreName, sidecarAddr string) error {
+	coreName = strings.ToLower(strings.TrimSpace(coreName))
+	sidecarAddr = strings.TrimSpace(sidecarAddr)
+	if !sidecarAutoStartEnabled() {
+		return fmt.Errorf("autostart disabled by DP_DISABLE_SIDECAR_AUTOSTART")
+	}
+	if coreName != "singbox" {
+		return fmt.Errorf("autostart unsupported core=%s", coreName)
+	}
+	if !isLoopbackSidecar(sidecarAddr) {
+		return fmt.Errorf("autostart only allowed for loopback sidecar addr=%s", sidecarAddr)
+	}
+
+	attemptKey := coreName + "|" + sidecarAddr
+	if !allowSidecarAutoStartAttempt(attemptKey) {
+		return errSidecarAutoStartCooldown
+	}
+
+	binaryPath, args, err := resolveSingboxSidecarCommand()
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.Command(binaryPath, args...)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start sidecar failed: %w", err)
+	}
+	if cmd.Process != nil {
+		_ = cmd.Process.Release()
+	}
+	log.Printf("[CORE-SIDECAR] auto-start launched core=%s addr=%s binary=%s", coreName, sidecarAddr, binaryPath)
+
+	waitCtx, cancel := context.WithTimeout(contextWithoutCancelFallback(ctx), sidecarAutoStartWaitTimeout)
+	defer cancel()
+	var lastErr error
+	for {
+		if err := sidecarProbeFunc(waitCtx, sidecarAddr); err == nil {
+			log.Printf("[CORE-SIDECAR] auto-start ready core=%s addr=%s", coreName, sidecarAddr)
+			return nil
+		} else {
+			lastErr = err
+		}
+
+		select {
+		case <-waitCtx.Done():
+			if lastErr == nil {
+				lastErr = waitCtx.Err()
+			}
+			return fmt.Errorf("sidecar not ready after autostart: %w", lastErr)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+func withRuntimeSidecarAddr(ctx context.Context, addr string) context.Context {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, runtimeSidecarContextKey{}, addr)
+}
+
+func runtimeSidecarAddrFromContext(ctx context.Context) (string, bool) {
+	v := ctx.Value(runtimeSidecarContextKey{})
+	if v == nil {
+		return "", false
+	}
+	addr, ok := v.(string)
+	if !ok {
+		return "", false
+	}
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", false
+	}
+	return addr, true
+}
+
+type runtimeSidecarSession struct {
+	addr       string
+	process    *os.Process
+	configPath string
+}
+
+func (s *runtimeSidecarSession) Close() {
+	if s == nil {
+		return
+	}
+	if s.process != nil {
+		_ = s.process.Kill()
+		_, _ = s.process.Wait()
+	}
+	if strings.TrimSpace(s.configPath) != "" {
+		_ = os.Remove(s.configPath)
+	}
+}
+
+func buildRuntimeWSOutbound(network, path, host string) map[string]interface{} {
+	if !strings.EqualFold(strings.TrimSpace(network), "ws") {
+		return nil
+	}
+	transport := map[string]interface{}{"type": "ws"}
+	if p := strings.TrimSpace(path); p != "" {
+		transport["path"] = p
+	}
+	if h := strings.TrimSpace(host); h != "" {
+		transport["headers"] = map[string]interface{}{"Host": h}
+	}
+	return transport
+}
+
+func buildRuntimeTLS(serverName string, insecure bool, alpn []string) map[string]interface{} {
+	tlsCfg := map[string]interface{}{
+		"enabled":  true,
+		"insecure": insecure,
+	}
+	if s := strings.TrimSpace(serverName); s != "" {
+		tlsCfg["server_name"] = s
+	}
+	if len(alpn) > 0 {
+		tlsCfg["alpn"] = alpn
+	}
+	return tlsCfg
+}
+
+func normalizeUTLSFingerprint(raw string) string {
+	fp := strings.ToLower(strings.TrimSpace(raw))
+	if fp == "" {
+		return ""
+	}
+	if fp == "random" {
+		fp = "randomized"
+	}
+	allowed := map[string]bool{
+		"chrome":     true,
+		"firefox":    true,
+		"safari":     true,
+		"edge":       true,
+		"ios":        true,
+		"android":    true,
+		"360":        true,
+		"qq":         true,
+		"randomized": true,
+	}
+	if !allowed[fp] {
+		return ""
+	}
+	return fp
+}
+
+func buildRuntimeSingboxOutbound(node kernelNodeConfig) (map[string]interface{}, error) {
+	port, err := strconv.Atoi(strings.TrimSpace(node.Port))
+	if err != nil || port <= 0 {
+		return nil, fmt.Errorf("invalid upstream port for runtime sidecar: %s", node.Port)
+	}
+
+	scheme := strings.ToLower(strings.TrimSpace(node.Protocol))
+	switch scheme {
+	case "ss":
+		return map[string]interface{}{
+			"type":        "shadowsocks",
+			"tag":         "upstream-proxy",
+			"server":      node.Address,
+			"server_port": port,
+			"method":      strings.TrimSpace(node.SS.Cipher),
+			"password":    strings.TrimSpace(node.SS.Password),
+		}, nil
+	case "trojan":
+		out := map[string]interface{}{
+			"type":        "trojan",
+			"tag":         "upstream-proxy",
+			"server":      node.Address,
+			"server_port": port,
+			"password":    strings.TrimSpace(node.Trojan.Password),
+		}
+		alpn := append([]string(nil), node.Trojan.ALPN...)
+		if len(alpn) == 0 {
+			alpn = append([]string(nil), config.TLSParamPolicy.DefaultALPN...)
+		}
+		tlsCfg := buildRuntimeTLS(firstNonEmpty(node.Trojan.SNI, node.Address), node.Trojan.AllowInsecure, alpn)
+		if fp := normalizeUTLSFingerprint(node.Trojan.Fingerprint); fp != "" {
+			tlsCfg["utls"] = map[string]interface{}{
+				"enabled":     true,
+				"fingerprint": fp,
+			}
+		}
+		out["tls"] = tlsCfg
+		if transport := buildRuntimeWSOutbound(node.Trojan.Network, node.Trojan.Path, node.Trojan.Host); transport != nil {
+			out["transport"] = transport
+		}
+		return out, nil
+	case "vless":
+		out := map[string]interface{}{
+			"type":        "vless",
+			"tag":         "upstream-proxy",
+			"server":      node.Address,
+			"server_port": port,
+			"uuid":        strings.TrimSpace(node.VLESS.UUID),
+		}
+		if flow := strings.TrimSpace(node.VLESS.Flow); flow != "" {
+			out["flow"] = flow
+		}
+		security := strings.ToLower(strings.TrimSpace(node.VLESS.Security))
+		if security == "tls" || security == "reality" {
+			out["tls"] = buildRuntimeTLS(firstNonEmpty(node.VLESS.ServerName, node.Address), node.VLESS.AllowInsecure, append([]string(nil), config.TLSParamPolicy.DefaultALPN...))
+		}
+		if transport := buildRuntimeWSOutbound(node.VLESS.Network, node.VLESS.Path, node.VLESS.Host); transport != nil {
+			out["transport"] = transport
+		}
+		return out, nil
+	case "vmess":
+		out := map[string]interface{}{
+			"type":        "vmess",
+			"tag":         "upstream-proxy",
+			"server":      node.Address,
+			"server_port": port,
+			"uuid":        strings.TrimSpace(node.VMESS.UUID),
+		}
+		if node.VMESS.AlterID > 0 {
+			out["alter_id"] = node.VMESS.AlterID
+		}
+		if sec := strings.TrimSpace(node.VMESS.Security); sec != "" {
+			out["security"] = sec
+		}
+		if node.VMESS.TLS {
+			out["tls"] = buildRuntimeTLS(firstNonEmpty(node.VMESS.ServerName, node.Address), false, append([]string(nil), config.TLSParamPolicy.DefaultALPN...))
+		}
+		if transport := buildRuntimeWSOutbound(node.VMESS.Network, node.VMESS.Path, node.VMESS.Host); transport != nil {
+			out["transport"] = transport
+		}
+		return out, nil
+	case "hy2", "hysteria2":
+		out := map[string]interface{}{
+			"type":        "hysteria2",
+			"tag":         "upstream-proxy",
+			"server":      node.Address,
+			"server_port": port,
+			"password":    strings.TrimSpace(node.HY2.Password),
+		}
+		alpn := nonEmptyALPN(node.HY2.ALPN)
+		if len(alpn) == 0 {
+			alpn = append([]string(nil), config.TLSParamPolicy.DefaultALPN...)
+		}
+		out["tls"] = buildRuntimeTLS(firstNonEmpty(node.HY2.ServerName, node.Address), node.HY2.AllowInsecure, alpn)
+		if obfsType := strings.TrimSpace(node.HY2.Obfs); obfsType != "" {
+			obfs := map[string]interface{}{"type": obfsType}
+			if password := strings.TrimSpace(node.HY2.ObfsPassword); password != "" {
+				obfs["password"] = password
+			}
+			out["obfs"] = obfs
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("runtime sidecar unsupported scheme=%s", scheme)
+	}
+}
+
+func buildRuntimeSingboxConfig(node kernelNodeConfig, listenPort int) ([]byte, error) {
+	outbound, err := buildRuntimeSingboxOutbound(node)
+	if err != nil {
+		return nil, err
+	}
+	cfg := map[string]interface{}{
+		"log": map[string]interface{}{
+			"level":     "error",
+			"timestamp": true,
+		},
+		"inbounds": []map[string]interface{}{
+			{
+				"type":        "mixed",
+				"tag":         "mixed-in",
+				"listen":      "127.0.0.1",
+				"listen_port": listenPort,
+			},
+		},
+		"outbounds": []interface{}{
+			outbound,
+			map[string]interface{}{
+				"type": "direct",
+				"tag":  "direct",
+			},
+		},
+		"route": map[string]interface{}{
+			"final": "upstream-proxy",
+		},
+	}
+	return json.Marshal(cfg)
+}
+
+func startRuntimeSingboxSidecarSession(ctx context.Context, proxyEntry string) (*runtimeSidecarSession, error) {
+	if !strings.EqualFold(strings.TrimSpace(config.Detector.Core), "singbox") && !strings.EqualFold(strings.TrimSpace(config.Detector.Core), "sing-box") {
+		return nil, nil
+	}
+
+	scheme, proxyAddr, _, _, err := parseMixedProxy(proxyEntry)
+	if err != nil {
+		return nil, err
+	}
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	if !runtimeSidecarSupportedSchemes[scheme] {
+		return nil, fmt.Errorf("runtime sidecar unsupported scheme=%s", scheme)
+	}
+
+	node, err := parseKernelNodeConfig(scheme, proxyEntry, proxyAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("allocate runtime sidecar port failed: %w", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	cfgBytes, err := buildRuntimeSingboxConfig(node, port)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll("runtime-logs", 0o755); err != nil {
+		return nil, fmt.Errorf("prepare runtime sidecar dir failed: %w", err)
+	}
+	serial := runtimeSidecarConfigSerial.Add(1)
+	cfgPath := filepath.Join("runtime-logs", fmt.Sprintf("singbox-runtime-%d.json", serial))
+	if err := os.WriteFile(cfgPath, cfgBytes, 0o644); err != nil {
+		return nil, fmt.Errorf("write runtime sidecar config failed: %w", err)
+	}
+
+	binaryPath, err := resolveSingboxBinaryPath()
+	if err != nil {
+		_ = os.Remove(cfgPath)
+		return nil, err
+	}
+
+	cmd := exec.Command(binaryPath, "run", "-c", cfgPath)
+	if err := cmd.Start(); err != nil {
+		_ = os.Remove(cfgPath)
+		return nil, fmt.Errorf("start runtime sidecar failed: %w", err)
+	}
+
+	session := &runtimeSidecarSession{
+		addr:       fmt.Sprintf("127.0.0.1:%d", port),
+		process:    cmd.Process,
+		configPath: cfgPath,
+	}
+	waitCtx, cancel := context.WithTimeout(contextWithoutCancelFallback(ctx), sidecarAutoStartWaitTimeout)
+	defer cancel()
+	var lastErr error
+	for {
+		if err := sidecarProbeFunc(waitCtx, session.addr); err == nil {
+			return session, nil
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-waitCtx.Done():
+			session.Close()
+			if lastErr == nil {
+				lastErr = waitCtx.Err()
+			}
+			return nil, fmt.Errorf("runtime sidecar not ready: %w", lastErr)
+		case <-time.After(120 * time.Millisecond):
+		}
+	}
 }
 
 func (b *externalKernelBackend) HealthCheck(ctx context.Context, node kernelNodeConfig) error {
@@ -2532,11 +3077,19 @@ func (b *externalKernelBackend) HealthCheck(ctx context.Context, node kernelNode
 		return nil
 	}
 
-	probeConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", b.sidecarAddr)
-	if err != nil {
+	if err := sidecarProbeFunc(ctx, b.sidecarAddr); err != nil {
+		autoErr := sidecarAutoStartFunc(ctx, b.info.Name, b.sidecarAddr)
+		if autoErr == nil {
+			if retryErr := sidecarProbeFunc(ctx, b.sidecarAddr); retryErr == nil {
+				return nil
+			} else {
+				err = retryErr
+			}
+		} else if !errors.Is(autoErr, errSidecarAutoStartCooldown) {
+			log.Printf("[CORE-SIDECAR] auto-start skipped core=%s addr=%s reason=%v", b.info.Name, b.sidecarAddr, autoErr)
+		}
 		return fmt.Errorf("%w: code=core_unavailable sidecar_probe_failed=%v", errMainstreamCoreUnavailable, err)
 	}
-	_ = probeConn.Close()
 	return nil
 }
 
@@ -2546,12 +3099,17 @@ func (b *externalKernelBackend) DialContext(ctx context.Context, node kernelNode
 	if network != "tcp" {
 		return nil, fmt.Errorf("external kernel backend unsupported network=%s", network)
 	}
-	if err := b.HealthCheck(ctx, node); err != nil {
-		return nil, err
+	sidecarAddr := b.sidecarAddr
+	if runtimeAddr, ok := runtimeSidecarAddrFromContext(ctx); ok {
+		sidecarAddr = runtimeAddr
+	} else {
+		if err := b.HealthCheck(ctx, node); err != nil {
+			return nil, err
+		}
 	}
 
 	_ = mapKernelNodeToExternal(node)
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", b.sidecarAddr)
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", sidecarAddr)
 	if err != nil {
 		return nil, fmt.Errorf("%w: code=core_unavailable sidecar_dial_failed=%v", errMainstreamCoreUnavailable, err)
 	}
@@ -2756,6 +3314,7 @@ func parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr string) (kernelNod
 		node.Trojan.SNI = n.SNI
 		node.Trojan.ALPN = append([]string(nil), n.ALPN...)
 		node.Trojan.AllowInsecure = n.Insecure
+		node.Trojan.Fingerprint = n.Fingerprint
 		node.Trojan.Network = n.Network
 		node.Trojan.Path = n.Path
 		node.Trojan.Host = n.Host
@@ -2790,7 +3349,7 @@ func parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr string) (kernelNod
 		node.VLESS.Path = n.Path
 		node.VLESS.Security = n.Security
 		node.VLESS.ServerName = firstNonEmpty(n.SNI, n.Host, n.Address)
-		node.VLESS.AllowInsecure = strings.Contains(strings.ToLower(n.RawQuery), "insecure=1") || strings.Contains(strings.ToLower(n.RawQuery), "allowinsecure=1")
+		node.VLESS.AllowInsecure = parseInsecureRawQuery(n.RawQuery, false)
 	case "hy2", "hysteria2":
 		n, ok := parseHY2Node(proxyEntry)
 		if !ok {
@@ -2803,7 +3362,7 @@ func parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr string) (kernelNod
 		node.HY2.ALPN = n.ALPN
 		node.HY2.Obfs = n.Obfs
 		node.HY2.ObfsPassword = n.ObfsPassword
-		node.HY2.AllowInsecure = strings.Contains(strings.ToLower(n.RawQuery), "insecure=1") || strings.Contains(strings.ToLower(n.RawQuery), "allowinsecure=1")
+		node.HY2.AllowInsecure = parseInsecureRawQuery(n.RawQuery, false)
 	}
 
 	if err := validateKernelNodeConfig(node); err != nil {
@@ -2919,15 +3478,16 @@ func parseSSRNodeForKernel(raw string) (ssrKernelNode, bool) {
 }
 
 type trojanKernelNode struct {
-	Address  string
-	Port     string
-	Password string
-	SNI      string
-	ALPN     []string
-	Insecure bool
-	Network  string
-	Path     string
-	Host     string
+	Address     string
+	Port        string
+	Password    string
+	SNI         string
+	ALPN        []string
+	Insecure    bool
+	Fingerprint string
+	Network     string
+	Path        string
+	Host        string
 }
 
 func parseTrojanNodeForKernel(raw string) (trojanKernelNode, bool) {
@@ -2944,14 +3504,15 @@ func parseTrojanNodeForKernel(raw string) (trojanKernelNode, bool) {
 	}
 	q := u.Query()
 	node = trojanKernelNode{
-		Address:  host,
-		Port:     port,
-		Password: password,
-		SNI:      strings.TrimSpace(q.Get("sni")),
-		Insecure: parseBoolWithDefault(firstNonEmpty(q.Get("allowInsecure"), q.Get("insecure")), false),
-		Network:  strings.TrimSpace(q.Get("type")),
-		Path:     strings.TrimSpace(q.Get("path")),
-		Host:     strings.TrimSpace(q.Get("host")),
+		Address:     host,
+		Port:        port,
+		Password:    password,
+		SNI:         strings.TrimSpace(q.Get("sni")),
+		Insecure:    parseInsecureQueryValue(q, false),
+		Fingerprint: strings.TrimSpace(firstNonEmpty(q.Get("fp"), q.Get("fingerprint"), q.Get("client-fingerprint"))),
+		Network:     strings.TrimSpace(q.Get("type")),
+		Path:        strings.TrimSpace(q.Get("path")),
+		Host:        strings.TrimSpace(q.Get("host")),
 	}
 	alpn := strings.TrimSpace(q.Get("alpn"))
 	if alpn != "" {
@@ -3001,12 +3562,14 @@ func (d *mainstreamUpstreamDialer) DialContext(ctx context.Context, network, add
 		adapterMetrics.AddDial(d.proxyScheme, "error", "adapter_unavailable", time.Since(start))
 		return nil, fmt.Errorf("%w: %s", errMainstreamAdapterUnavailable, d.proxyScheme)
 	}
-	if checker, ok := d.adapter.(interface {
-		CheckAvailability(ctx context.Context, proxyScheme, proxyEntry, proxyAddr string) error
-	}); ok {
-		if err := checker.CheckAvailability(ctx, d.proxyScheme, d.proxyEntry, d.proxyAddr); err != nil {
-			adapterMetrics.AddDial(d.proxyScheme, "error", "core_unavailable", time.Since(start))
-			return nil, err
+	if _, hasRuntimeSidecar := runtimeSidecarAddrFromContext(ctx); !hasRuntimeSidecar {
+		if checker, ok := d.adapter.(interface {
+			CheckAvailability(ctx context.Context, proxyScheme, proxyEntry, proxyAddr string) error
+		}); ok {
+			if err := checker.CheckAvailability(ctx, d.proxyScheme, d.proxyEntry, d.proxyAddr); err != nil {
+				adapterMetrics.AddDial(d.proxyScheme, "error", "core_unavailable", time.Since(start))
+				return nil, err
+			}
 		}
 	}
 	conn, err := d.adapter.DialContext(ctx, d.proxyScheme, d.proxyEntry, d.proxyAddr, network, addr)
@@ -5771,6 +6334,13 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 
 	httpSocksHealthy := filterMixedProxiesByScheme(result.Healthy, httpSocksMixedSchemes)
 	mainstreamHealthy := filterMixedProxiesByExcludedScheme(result.Healthy, mainstreamMixedExcludedSchemes)
+	if strings.EqualFold(strings.TrimSpace(config.Detector.Core), "singbox") || strings.EqualFold(strings.TrimSpace(config.Detector.Core), "sing-box") {
+		filtered := filterMixedProxiesByScheme(mainstreamHealthy, runtimeSidecarSupportedSchemes)
+		if len(filtered) != len(mainstreamHealthy) {
+			log.Printf("[HTTP-MAINSTREAM-MIXED] Filter unsupported runtime schemes for singbox: before=%d after=%d", len(mainstreamHealthy), len(filtered))
+		}
+		mainstreamHealthy = filtered
+	}
 	strictAsMixed := poolEntriesWithDefaultScheme(strictPool, "http")
 	relaxedAsMixed := poolEntriesWithDefaultScheme(relaxedPool, "http")
 	httpSocksCombined := mergeUniqueMixedEntries(httpSocksHealthy, append(strictAsMixed, relaxedAsMixed...))
@@ -6044,6 +6614,97 @@ func resolveConnectTarget(r *http.Request) (string, error) {
 	return target, nil
 }
 
+func maxRequestAttemptsForMode(mode string) int {
+	if strings.EqualFold(strings.TrimSpace(mode), "MAINSTREAM-MIXED") {
+		return 20
+	}
+	return requestForwardMaxRetries
+}
+
+func handleHTTPConnectWithRetries(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fallbackPool *ProxyPool, mode string) {
+	targetHost, targetErr := resolveConnectTarget(r)
+	if targetErr != nil {
+		log.Printf("[HTTP-%s] ERROR: Invalid CONNECT target %q: %v", mode, r.URL.String(), targetErr)
+		http.Error(w, "Invalid CONNECT target", http.StatusBadRequest)
+		return
+	}
+
+	var lastErr error
+	maxAttempts := maxRequestAttemptsForMode(mode)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		proxyAddr, err := selectProxyWithBreaker(pool, fallbackPool)
+		if err != nil {
+			lastErr = err
+			break
+		}
+
+		log.Printf("[HTTP-%s] CONNECT attempt %d/%d via proxy %s for target %s", mode, attempt, maxAttempts, proxyAddr, targetHost)
+		upstreamDialer, upstreamScheme, err := buildUpstreamDialer(proxyAddr)
+		if err != nil {
+			log.Printf("[HTTP-%s] ERROR: Unsupported upstream proxy %s: %v", mode, proxyAddr, err)
+			lastErr = err
+			adapterBreaker.RecordFailure("unknown", proxyAddr)
+			rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, err)
+			if attempt < maxAttempts {
+				time.Sleep(retryBackoff(attempt))
+			}
+			continue
+		}
+
+		reqCtx := r.Context()
+		var runtimeSidecar *runtimeSidecarSession
+		if mode == "MAINSTREAM-MIXED" {
+			session, prepErr := startRuntimeSingboxSidecarSession(reqCtx, proxyAddr)
+			if prepErr != nil {
+				log.Printf("[HTTP-%s] ERROR: Failed to prepare runtime sidecar for proxy %s: %v", mode, proxyAddr, prepErr)
+				lastErr = prepErr
+				adapterBreaker.RecordFailure(upstreamScheme, proxyAddr)
+				rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, prepErr)
+				if attempt < maxAttempts {
+					time.Sleep(retryBackoff(attempt))
+				}
+				continue
+			}
+			if session != nil {
+				runtimeSidecar = session
+				reqCtx = withRuntimeSidecarAddr(reqCtx, session.addr)
+			}
+		}
+
+		targetConn, dialErr := upstreamDialer.DialContext(reqCtx, "tcp", targetHost)
+		if dialErr != nil {
+			if runtimeSidecar != nil {
+				runtimeSidecar.Close()
+			}
+			log.Printf("[HTTPS-%s] ERROR: Failed to connect to %s via proxy %s (attempt=%d/%d): %v", mode, targetHost, proxyAddr, attempt, maxAttempts, dialErr)
+			lastErr = dialErr
+			adapterBreaker.RecordFailure(upstreamScheme, proxyAddr)
+			rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, dialErr)
+			if attempt < maxAttempts {
+				time.Sleep(retryBackoff(attempt))
+			}
+			continue
+		}
+
+		if runtimeSidecar != nil {
+			targetConn = &connWithCleanup{
+				Conn:    targetConn,
+				cleanup: runtimeSidecar.Close,
+			}
+		}
+		adapterBreaker.RecordSuccess(upstreamScheme, proxyAddr)
+		relayHTTPSTunnel(w, r, targetHost, targetConn, proxyAddr, mode)
+		return
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("no available proxies")
+	}
+	log.Printf("[HTTP-%s] ERROR: CONNECT failed for %s after %d attempts: %v", mode, targetHost, maxAttempts, lastErr)
+	adapterMetrics.IncRetryExhausted()
+	http.Error(w, fmt.Sprintf("Failed to connect to target: %v", lastErr), http.StatusBadGateway)
+}
+
 func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fallbackPool *ProxyPool, mode string) {
 	if r.URL.Path == "/list" {
 		if !validateBasicAuth(r) {
@@ -6061,95 +6722,148 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 		return
 	}
 
-	proxyAddr, err := selectProxyWithBreaker(pool, fallbackPool)
-	if err != nil {
-		log.Printf("[HTTP-%s] ERROR: No proxy available for %s %s: %v", mode, r.Method, r.URL.String(), err)
-		if mode == "MAINSTREAM-MIXED" && config.MainstreamMixed.DegradeStrategy == "explicit_error" {
-			http.Error(w, config.MainstreamMixed.ExplicitErrorMessage, http.StatusServiceUnavailable)
-			return
-		}
-		http.Error(w, "No available proxies", http.StatusServiceUnavailable)
-		return
-	}
-
-	log.Printf("[HTTP-%s] Using proxy %s for %s %s", mode, proxyAddr, r.Method, r.URL.String())
-
-	upstreamDialer, upstreamScheme, err := buildUpstreamDialer(proxyAddr)
-	if err != nil {
-		log.Printf("[HTTP-%s] ERROR: Unsupported upstream proxy %s: %v", mode, proxyAddr, err)
-		rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, err)
-		http.Error(w, "Unsupported upstream proxy", http.StatusBadGateway)
-		return
-	}
-
 	if r.Method == http.MethodConnect {
-		targetHost, targetErr := resolveConnectTarget(r)
-		if targetErr != nil {
-			log.Printf("[HTTP-%s] ERROR: Invalid CONNECT target %q: %v", mode, r.URL.String(), targetErr)
-			http.Error(w, "Invalid CONNECT target", http.StatusBadRequest)
+		handleHTTPConnectWithRetries(w, r, pool, fallbackPool, mode)
+		return
+	}
+
+	var requestBody []byte
+	var err error
+	if r.Body != nil {
+		requestBody, err = io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
 			return
 		}
-
-		handleHTTPSProxy(w, r, targetHost, func(target string) (net.Conn, error) {
-			return upstreamDialer.DialContext(r.Context(), "tcp", target)
-		}, pool, proxyAddr, mode)
-		return
 	}
-
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
-		DialContext: upstreamDialer.DialContext,
-	}
-	defer transport.CloseIdleConnections()
-	if upstreamScheme == "http" || upstreamScheme == "https" {
-		transport.Proxy = nil
-	}
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   30 * time.Second,
-	}
-
-	proxyReq, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
-	if err != nil {
-		http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
-		return
-	}
-
-	for key, values := range r.Header {
-		if strings.EqualFold(key, "Proxy-Authorization") {
-			continue
+	buildRequestBody := func() io.ReadCloser {
+		if requestBody == nil {
+			return nil
 		}
-		for _, value := range values {
-			proxyReq.Header.Add(key, value)
+		return io.NopCloser(bytes.NewReader(requestBody))
+	}
+	copyForwardHeaders := func(dst http.Header) {
+		for key, values := range r.Header {
+			if strings.EqualFold(key, "Proxy-Authorization") {
+				continue
+			}
+			for _, value := range values {
+				dst.Add(key, value)
+			}
 		}
 	}
 
 	var resp *http.Response
 	var lastErr error
-	for attempt := 1; attempt <= requestForwardMaxRetries; attempt++ {
-		resp, err = client.Do(proxyReq)
-		if err == nil {
-			lastErr = nil
+	var finalProxyAddr string
+	var finalUpstreamScheme string
+	maxAttempts := maxRequestAttemptsForMode(mode)
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		proxyAddr, selectErr := selectProxyWithBreaker(pool, fallbackPool)
+		if selectErr != nil {
+			lastErr = selectErr
 			break
 		}
-		lastErr = err
-		if attempt < requestForwardMaxRetries {
-			time.Sleep(retryBackoff(attempt))
+		log.Printf("[HTTP-%s] attempt %d/%d via proxy %s for %s %s", mode, attempt, maxAttempts, proxyAddr, r.Method, r.URL.String())
+
+		upstreamDialer, upstreamScheme, buildErr := buildUpstreamDialer(proxyAddr)
+		if buildErr != nil {
+			log.Printf("[HTTP-%s] ERROR: Unsupported upstream proxy %s: %v", mode, proxyAddr, buildErr)
+			lastErr = buildErr
+			adapterBreaker.RecordFailure("unknown", proxyAddr)
+			rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, buildErr)
+			if attempt < maxAttempts {
+				time.Sleep(retryBackoff(attempt))
+			}
+			continue
 		}
+
+		reqCtx := r.Context()
+		var runtimeSidecar *runtimeSidecarSession
+		if mode == "MAINSTREAM-MIXED" {
+			session, prepErr := startRuntimeSingboxSidecarSession(reqCtx, proxyAddr)
+			if prepErr != nil {
+				log.Printf("[HTTP-%s] ERROR: Failed to prepare runtime sidecar for proxy %s: %v", mode, proxyAddr, prepErr)
+				lastErr = prepErr
+				adapterBreaker.RecordFailure(upstreamScheme, proxyAddr)
+				rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, prepErr)
+				if attempt < maxAttempts {
+					time.Sleep(retryBackoff(attempt))
+				}
+				continue
+			}
+			if session != nil {
+				runtimeSidecar = session
+				reqCtx = withRuntimeSidecarAddr(reqCtx, session.addr)
+			}
+		}
+
+		transport := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+			DialContext: upstreamDialer.DialContext,
+		}
+		if upstreamScheme == "http" || upstreamScheme == "https" {
+			transport.Proxy = nil
+		}
+		client := &http.Client{
+			Transport: transport,
+			Timeout:   30 * time.Second,
+		}
+
+		proxyReq, reqErr := http.NewRequestWithContext(reqCtx, r.Method, r.URL.String(), buildRequestBody())
+		if reqErr != nil {
+			transport.CloseIdleConnections()
+			if runtimeSidecar != nil {
+				runtimeSidecar.Close()
+			}
+			http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
+			return
+		}
+		copyForwardHeaders(proxyReq.Header)
+
+		attemptResp, doErr := client.Do(proxyReq)
+		transport.CloseIdleConnections()
+		if doErr != nil {
+			if runtimeSidecar != nil {
+				runtimeSidecar.Close()
+			}
+			lastErr = doErr
+			adapterBreaker.RecordFailure(upstreamScheme, proxyAddr)
+			rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, doErr)
+			if attempt < maxAttempts {
+				time.Sleep(retryBackoff(attempt))
+			}
+			continue
+		}
+
+		if runtimeSidecar != nil {
+			attemptResp.Body = &readCloserWithCleanup{
+				ReadCloser: attemptResp.Body,
+				cleanup:    runtimeSidecar.Close,
+			}
+		}
+		resp = attemptResp
+		finalProxyAddr = proxyAddr
+		finalUpstreamScheme = upstreamScheme
+		lastErr = nil
+		break
 	}
 	if lastErr != nil {
-		log.Printf("[HTTP-%s] ERROR: Request failed for %s: %v", mode, r.URL.String(), err)
+		log.Printf("[HTTP-%s] ERROR: Request failed for %s after %d attempts: %v", mode, r.URL.String(), maxAttempts, lastErr)
 		adapterMetrics.IncRetryExhausted()
-		adapterBreaker.RecordFailure(upstreamScheme, proxyAddr)
-		rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, err)
-		http.Error(w, fmt.Sprintf("Proxy request failed: %v", err), http.StatusBadGateway)
+		if mode == "MAINSTREAM-MIXED" && config.MainstreamMixed.DegradeStrategy == "explicit_error" && strings.Contains(strings.ToLower(lastErr.Error()), "no available proxies") {
+			http.Error(w, config.MainstreamMixed.ExplicitErrorMessage, http.StatusServiceUnavailable)
+			return
+		}
+		http.Error(w, fmt.Sprintf("Proxy request failed: %v", lastErr), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-	adapterBreaker.RecordSuccess(upstreamScheme, proxyAddr)
+	adapterBreaker.RecordSuccess(finalUpstreamScheme, finalProxyAddr)
 
 	log.Printf("[HTTP-%s] SUCCESS: Got response %d for %s", mode, resp.StatusCode, r.URL.String())
 
@@ -6161,25 +6875,14 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("[proxy_error] mode=%s proxyAddr=%s target=%s method=%s error=%v", mode, proxyAddr, r.URL.String(), r.Method, err)
+		log.Printf("[proxy_error] mode=%s proxyAddr=%s target=%s method=%s error=%v", mode, finalProxyAddr, r.URL.String(), r.Method, err)
 	}
 }
 
-func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetHost string, targetDial func(string) (net.Conn, error), pool *ProxyPool, proxyAddr string, mode string) {
-	log.Printf("[HTTPS-%s] Connecting to %s via proxy %s", mode, targetHost, proxyAddr)
+func relayHTTPSTunnel(w http.ResponseWriter, r *http.Request, targetHost string, targetConn net.Conn, proxyAddr string, mode string) {
 	const tunnelIdleTimeout = 90 * time.Second
-
-	// Connect to target through upstream proxy
-	targetConn, err := targetDial(targetHost)
-	if err != nil {
-		log.Printf("[HTTPS-%s] ERROR: Failed to connect to %s via proxy %s: %v", mode, targetHost, proxyAddr, err)
-		rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, err)
-		http.Error(w, "Failed to connect to target", http.StatusBadGateway)
-		return
-	}
 	defer targetConn.Close()
 
-	// Hijack the connection
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		log.Printf("[HTTPS-%s] ERROR: Hijacking not supported for %s", mode, targetHost)
@@ -6195,7 +6898,6 @@ func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetHost string,
 	}
 	defer clientConn.Close()
 
-	// Send 200 Connection Established
 	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		log.Printf("[proxy_error] mode=%s proxyAddr=%s target=%s method=%s error=%v", mode, proxyAddr, targetHost, r.Method, err)
 		return
@@ -6281,6 +6983,19 @@ func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetHost string,
 			}
 		}
 	}
+}
+
+func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, targetHost string, targetDial func(string) (net.Conn, error), pool *ProxyPool, proxyAddr string, mode string) {
+	log.Printf("[HTTPS-%s] Connecting to %s via proxy %s", mode, targetHost, proxyAddr)
+
+	targetConn, err := targetDial(targetHost)
+	if err != nil {
+		log.Printf("[HTTPS-%s] ERROR: Failed to connect to %s via proxy %s: %v", mode, targetHost, proxyAddr, err)
+		rotatePoolOnUpstreamFailure(pool, mode, proxyAddr, err)
+		http.Error(w, "Failed to connect to target", http.StatusBadGateway)
+		return
+	}
+	relayHTTPSTunnel(w, r, targetHost, targetConn, proxyAddr, mode)
 }
 
 func dialTargetThroughHTTPProxy(ctx context.Context, proxyScheme string, proxyAddr string, proxyAuthHeader string, targetHost string) (net.Conn, error) {
