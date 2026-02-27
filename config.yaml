@@ -43,6 +43,7 @@ proxy_list_urls:
   - "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.yml"
   - "https://raw.githubusercontent.com/xiaoji235/airport-free/main/v2ray/v2rayshare.txt"
   - "https://raw.githubusercontent.com/xiaoji235/airport-free/main/clash/naidounode.txt"
+  - "https://proxy.scdn.io/text.php"
   
   # - "https://example.com/http-proxies.txt"
   # - "https://example.com/socks4-proxies.txt"
