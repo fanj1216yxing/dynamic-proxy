@@ -111,18 +111,39 @@ health_check_two_stage:
 health_check_protocol_overrides:
   http:
     stage_one:
-      total_timeout_seconds: 5
-      tls_handshake_threshold_seconds: 5
+      total_timeout_seconds: 6
+      tls_handshake_threshold_seconds: 6
     stage_two:
-      total_timeout_seconds: 5
-      tls_handshake_threshold_seconds: 5
+      total_timeout_seconds: 8
+      tls_handshake_threshold_seconds: 8
   https:
     stage_one:
-      total_timeout_seconds: 5
-      tls_handshake_threshold_seconds: 5
+      total_timeout_seconds: 6
+      tls_handshake_threshold_seconds: 6
     stage_two:
-      total_timeout_seconds: 5
-      tls_handshake_threshold_seconds: 5
+      total_timeout_seconds: 8
+      tls_handshake_threshold_seconds: 8
+  socks4:
+    stage_one:
+      total_timeout_seconds: 7
+      tls_handshake_threshold_seconds: 7
+    stage_two:
+      total_timeout_seconds: 9
+      tls_handshake_threshold_seconds: 9
+  socks5:
+    stage_one:
+      total_timeout_seconds: 7
+      tls_handshake_threshold_seconds: 7
+    stage_two:
+      total_timeout_seconds: 9
+      tls_handshake_threshold_seconds: 9
+  socks5h:
+    stage_one:
+      total_timeout_seconds: 7
+      tls_handshake_threshold_seconds: 7
+    stage_two:
+      total_timeout_seconds: 9
+      tls_handshake_threshold_seconds: 9
   ss:
     stage_one:
       total_timeout_seconds: 10

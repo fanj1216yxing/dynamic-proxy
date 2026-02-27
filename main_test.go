@@ -151,6 +151,13 @@ func TestBuildUpstreamDialerSupportsSocks4(t *testing.T) {
 	}
 }
 
+func TestParseVLESSNodeRejectsInvalidUUID(t *testing.T) {
+	_, ok := parseVLESSNode("vless://not-a-uuid@103.210.22.17:443?encryption=none&security=tls&sni=example.com")
+	if ok {
+		t.Fatalf("expected vless parse failure for invalid uuid")
+	}
+}
+
 func TestNormalizeMixedProxyEntryCompletesCriticalTLSParams(t *testing.T) {
 	config = Config{}
 	config.TLSParamPolicy.DefaultALPN = []string{"h2", "http/1.1"}
@@ -268,8 +275,8 @@ func TestProtocolHealthyCounts(t *testing.T) {
 	counts := protocolHealthyCounts([]string{
 		"http://1.1.1.1:80",
 		"socks5://2.2.2.2:1080",
-		"vless://uuid@vl.example.com:443?encryption=none",
-		"vless://uuid@vl2.example.com:443?encryption=none",
+		"vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?encryption=none",
+		"vless://22222222-2222-2222-2222-222222222222@vl2.example.com:443?encryption=none",
 		"trojan://pass@tr.example.com:443",
 	})
 
@@ -296,7 +303,7 @@ func TestEvaluateMainstreamHealthAlertAndSLO(t *testing.T) {
 	}
 
 	status3, reasons3 := evaluateMainstreamHealth([]string{
-		"vless://uuid@vl.example.com:443?encryption=none",
+		"vless://33333333-3333-3333-3333-333333333333@vl.example.com:443?encryption=none",
 		"hy2://pass@hy.example.com:443?sni=hy.example.com",
 		"trojan://pass@tr.example.com:443?sni=tr.example.com",
 	})

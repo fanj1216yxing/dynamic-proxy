@@ -420,6 +420,7 @@ func retryBackoff(attempt int) time.Duration {
 // Matches: [IP]:[port] and ignores any protocol prefixes or extra text
 var simpleProxyRegex = regexp.MustCompile(`([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})`)
 var mixedURITokenRegex = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://\S+)`)
+var uuidRegex = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 func normalizeSubscriptionProxyURL(raw string) (string, error) {
 	proxyURL := strings.TrimSpace(raw)
@@ -517,12 +518,24 @@ func loadConfig(filename string) (*Config, error) {
 	}
 	defaultProtocolOverrides := map[string]TwoStageHealthCheckSettings{
 		"http": {
-			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 5, TLSHandshakeThresholdSeconds: 5},
-			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 5, TLSHandshakeThresholdSeconds: 5},
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 6, TLSHandshakeThresholdSeconds: 6},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 8, TLSHandshakeThresholdSeconds: 8},
 		},
 		"https": {
-			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 5, TLSHandshakeThresholdSeconds: 5},
-			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 5, TLSHandshakeThresholdSeconds: 5},
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 6, TLSHandshakeThresholdSeconds: 6},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 8, TLSHandshakeThresholdSeconds: 8},
+		},
+		"socks4": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 7, TLSHandshakeThresholdSeconds: 7},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 9, TLSHandshakeThresholdSeconds: 9},
+		},
+		"socks5": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 7, TLSHandshakeThresholdSeconds: 7},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 9, TLSHandshakeThresholdSeconds: 9},
+		},
+		"socks5h": {
+			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 7, TLSHandshakeThresholdSeconds: 7},
+			StageTwo: HealthCheckSettings{TotalTimeoutSeconds: 9, TLSHandshakeThresholdSeconds: 9},
 		},
 		"ss": {
 			StageOne: HealthCheckSettings{TotalTimeoutSeconds: 10, TLSHandshakeThresholdSeconds: 6},
@@ -1184,7 +1197,7 @@ func parseClashSubscriptionForMixed(content string) ([]string, bool) {
 			}
 			entry = fmt.Sprintf("ss://%s:%s@%s", url.QueryEscape(p.Cipher), url.QueryEscape(p.Password), host)
 		case "vless":
-			if p.UUID == "" {
+			if p.UUID == "" || !isValidUUID(p.UUID) {
 				continue
 			}
 			q := url.Values{}
@@ -1890,6 +1903,10 @@ func parseVLESSNode(raw string) (vlessNode, bool) {
 		recordParseFailureReasonTag("vless", "invalid_userinfo")
 		return node, false
 	}
+	if !isValidUUID(uuid) {
+		recordParseFailureReasonTag("vless", "invalid_uuid")
+		return node, false
+	}
 	q := u.Query()
 	node = vlessNode{
 		Address:   host,
@@ -2035,6 +2052,9 @@ func validateMainstreamURI(scheme string, u *url.URL) bool {
 		if u.User == nil || strings.TrimSpace(u.User.Username()) == "" {
 			return false
 		}
+		if !isValidUUID(u.User.Username()) {
+			return false
+		}
 		if strings.TrimSpace(query.Get("sni")) == "" || strings.TrimSpace(query.Get("alpn")) == "" {
 			return false
 		}
@@ -2165,6 +2185,11 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
+
+func isValidUUID(raw string) bool {
+	return uuidRegex.MatchString(strings.TrimSpace(raw))
+}
+
 func parseBoolWithDefault(raw string, def bool) bool {
 	if strings.TrimSpace(raw) == "" {
 		return def
@@ -4041,7 +4066,7 @@ func fetchProxyList() ([]string, error) {
 }
 
 func fetchMixedProxyList() ([]string, error) {
-	log.Println("fetchMixedProxyList: mixed multi-scheme pool (http/https/socks and mainstream schemes)")
+	log.Println("fetchMixedProxyList: mixed multi-scheme pool (http/https/socks4/socks5 and mainstream schemes)")
 	client := subscriptionHTTPClient()
 
 	allProxies := make([]string, 0)
@@ -7398,7 +7423,7 @@ func buildPoolStatusPayload(strictPool *ProxyPool, relaxedPool *ProxyPool, cfPoo
 		"high_priority_alert":                highPriorityAlert,
 		"mainstream_listen_port":             config.Ports.HTTPMainstreamMix,
 		"status_listen_addr":                 port,
-		"mainstream_excluded_protocols":      []string{"http", "https", "socks5", "socks5h"},
+		"mainstream_excluded_protocols":      []string{"http", "https", "socks4", "socks5", "socks5h"},
 		"error_code_counts":                  mixedHealthErrorCodeMetrics.Snapshot(),
 	}
 }
