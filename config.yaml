@@ -67,7 +67,7 @@ subscription_use_env_proxy: false
 # enabled=true 且 url 非空时，固定使用该代理；方便后续随时修改
 # url 支持 http:// / https:// / socks5:// / socks5h://；也支持直接写 host:port（程序自动补 http://）
 subscription_proxy:
-  enabled: true
+  enabled: false
   url: "http://127.0.0.1:2081"
 
 # 健康检查并发数（同时测试多少个代理）
