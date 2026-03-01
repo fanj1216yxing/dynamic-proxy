@@ -499,21 +499,23 @@ func TestSupportsCoreUnavailableNativeFallbackExcludesMainstreamTCPProtocols(t *
 func TestExternalKernelHealthCheckAutoStartSidecarRetriesProbe(t *testing.T) {
 	originalProbe := sidecarProbeFunc
 	originalAutostart := sidecarAutoStartFunc
+	resetSidecarProbeCacheForTest()
 	t.Cleanup(func() {
 		sidecarProbeFunc = originalProbe
 		sidecarAutoStartFunc = originalAutostart
+		resetSidecarProbeCacheForTest()
 	})
 
+	autostartCalls := 0
 	probeCalls := 0
 	sidecarProbeFunc = func(ctx context.Context, addr string) error {
 		probeCalls++
-		if probeCalls == 1 {
+		if autostartCalls == 0 {
 			return errors.New("connection refused")
 		}
 		return nil
 	}
 
-	autostartCalls := 0
 	sidecarAutoStartFunc = func(ctx context.Context, coreName, sidecarAddr string) error {
 		autostartCalls++
 		if coreName != "singbox" {
@@ -536,17 +538,19 @@ func TestExternalKernelHealthCheckAutoStartSidecarRetriesProbe(t *testing.T) {
 	if autostartCalls != 1 {
 		t.Fatalf("expected one autostart attempt, got=%d", autostartCalls)
 	}
-	if probeCalls != 2 {
-		t.Fatalf("expected two probe attempts, got=%d", probeCalls)
+	if probeCalls < 4 {
+		t.Fatalf("expected retries before autostart, got probeCalls=%d", probeCalls)
 	}
 }
 
 func TestExternalKernelHealthCheckReturnsCoreUnavailableWhenAutostartFails(t *testing.T) {
 	originalProbe := sidecarProbeFunc
 	originalAutostart := sidecarAutoStartFunc
+	resetSidecarProbeCacheForTest()
 	t.Cleanup(func() {
 		sidecarProbeFunc = originalProbe
 		sidecarAutoStartFunc = originalAutostart
+		resetSidecarProbeCacheForTest()
 	})
 
 	sidecarProbeFunc = func(ctx context.Context, addr string) error {
@@ -569,6 +573,56 @@ func TestExternalKernelHealthCheckReturnsCoreUnavailableWhenAutostartFails(t *te
 	}
 	if !strings.Contains(err.Error(), "sidecar_probe_failed") {
 		t.Fatalf("expected sidecar probe failure marker, got err=%v", err)
+	}
+}
+
+func TestProbeSidecarAddrWithPolicyCachesRecentSuccess(t *testing.T) {
+	originalProbe := sidecarProbeFunc
+	resetSidecarProbeCacheForTest()
+	t.Cleanup(func() {
+		sidecarProbeFunc = originalProbe
+		resetSidecarProbeCacheForTest()
+	})
+
+	calls := 0
+	sidecarProbeFunc = func(ctx context.Context, addr string) error {
+		calls++
+		return nil
+	}
+
+	if err := probeSidecarAddrWithPolicy(context.Background(), "127.0.0.1:19081"); err != nil {
+		t.Fatalf("expected first probe success, got err=%v", err)
+	}
+	if err := probeSidecarAddrWithPolicy(context.Background(), "127.0.0.1:19081"); err != nil {
+		t.Fatalf("expected cached probe success, got err=%v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected one probe call with cache hit, got=%d", calls)
+	}
+}
+
+func TestProbeSidecarAddrWithPolicyRetriesTransientFailure(t *testing.T) {
+	originalProbe := sidecarProbeFunc
+	resetSidecarProbeCacheForTest()
+	t.Cleanup(func() {
+		sidecarProbeFunc = originalProbe
+		resetSidecarProbeCacheForTest()
+	})
+
+	calls := 0
+	sidecarProbeFunc = func(ctx context.Context, addr string) error {
+		calls++
+		if calls < 3 {
+			return errors.New("dial tcp 127.0.0.1:19081: connectex: Only one usage of each socket address (protocol/network address/port) is normally permitted.")
+		}
+		return nil
+	}
+
+	if err := probeSidecarAddrWithPolicy(context.Background(), "127.0.0.1:19081"); err != nil {
+		t.Fatalf("expected probe to recover after retries, got err=%v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("expected three attempts for transient failure, got=%d", calls)
 	}
 }
 

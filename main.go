@@ -167,6 +167,10 @@ const breakerFailureThreshold = 3
 const breakerOpenTimeout = 30 * time.Second
 const sidecarAutoStartRetryInterval = 15 * time.Second
 const sidecarAutoStartWaitTimeout = 6 * time.Second
+const sidecarProbeCacheTTL = 2 * time.Second
+const sidecarProbeRetryBackoff = 120 * time.Millisecond
+const sidecarProbeMaxAttempts = 3
+const sidecarProbeConcurrentLimit = 128
 
 var mixedHealthCheckURL = defaultMixedHealthCheckURL
 var mixedProxyHealthChecker = checkMainstreamProxyHealth
@@ -205,6 +209,13 @@ var sidecarAutoStartState = struct {
 	sync.Mutex
 	lastAttempt map[string]time.Time
 }{lastAttempt: make(map[string]time.Time)}
+
+var sidecarProbeLimiter = make(chan struct{}, sidecarProbeConcurrentLimit)
+
+var sidecarProbeState = struct {
+	sync.Mutex
+	lastSuccess map[string]time.Time
+}{lastSuccess: make(map[string]time.Time)}
 
 var errSidecarAutoStartCooldown = errors.New("sidecar autostart cooldown")
 
@@ -2903,6 +2914,112 @@ func probeSidecarAddr(ctx context.Context, addr string) error {
 	return nil
 }
 
+func sidecarProbeRecentlyHealthy(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return false
+	}
+	sidecarProbeState.Lock()
+	defer sidecarProbeState.Unlock()
+	last, ok := sidecarProbeState.lastSuccess[addr]
+	return ok && time.Since(last) <= sidecarProbeCacheTTL
+}
+
+func markSidecarProbeHealthy(addr string) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return
+	}
+	sidecarProbeState.Lock()
+	defer sidecarProbeState.Unlock()
+	sidecarProbeState.lastSuccess[addr] = time.Now()
+}
+
+func clearSidecarProbeHealthy(addr string) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return
+	}
+	sidecarProbeState.Lock()
+	defer sidecarProbeState.Unlock()
+	delete(sidecarProbeState.lastSuccess, addr)
+}
+
+func resetSidecarProbeCacheForTest() {
+	sidecarProbeState.Lock()
+	defer sidecarProbeState.Unlock()
+	sidecarProbeState.lastSuccess = make(map[string]time.Time)
+}
+
+func shouldRetrySidecarProbe(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if msg == "" {
+		return false
+	}
+	switch {
+	case strings.Contains(msg, "only one usage of each socket address"):
+		return true
+	case strings.Contains(msg, "connection refused"),
+		strings.Contains(msg, "actively refused"),
+		strings.Contains(msg, "i/o timeout"),
+		strings.Contains(msg, "timeout"),
+		strings.Contains(msg, "cannot assign requested address"),
+		strings.Contains(msg, "no buffer space"):
+		return true
+	default:
+		return false
+	}
+}
+
+func probeSidecarAddrLimited(ctx context.Context, addr string) error {
+	select {
+	case sidecarProbeLimiter <- struct{}{}:
+		defer func() { <-sidecarProbeLimiter }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return sidecarProbeFunc(ctx, addr)
+}
+
+func probeSidecarAddrWithPolicy(ctx context.Context, addr string) error {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return errors.New("sidecar addr is empty")
+	}
+	if sidecarProbeRecentlyHealthy(addr) {
+		return nil
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= sidecarProbeMaxAttempts; attempt++ {
+		if err := probeSidecarAddrLimited(ctx, addr); err == nil {
+			markSidecarProbeHealthy(addr)
+			return nil
+		} else {
+			lastErr = err
+		}
+
+		if attempt >= sidecarProbeMaxAttempts || !shouldRetrySidecarProbe(lastErr) {
+			break
+		}
+		backoff := sidecarProbeRetryBackoff * time.Duration(attempt)
+		select {
+		case <-ctx.Done():
+			clearSidecarProbeHealthy(addr)
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+	clearSidecarProbeHealthy(addr)
+	if lastErr == nil {
+		lastErr = errors.New("sidecar probe failed")
+	}
+	return lastErr
+}
+
 func isLoopbackSidecar(addr string) bool {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
 	if err != nil {
@@ -3364,10 +3481,10 @@ func (b *externalKernelBackend) HealthCheck(ctx context.Context, node kernelNode
 		return nil
 	}
 
-	if err := sidecarProbeFunc(ctx, b.sidecarAddr); err != nil {
+	if err := probeSidecarAddrWithPolicy(ctx, b.sidecarAddr); err != nil {
 		autoErr := sidecarAutoStartFunc(ctx, b.info.Name, b.sidecarAddr)
 		if autoErr == nil {
-			if retryErr := sidecarProbeFunc(ctx, b.sidecarAddr); retryErr == nil {
+			if retryErr := probeSidecarAddrWithPolicy(ctx, b.sidecarAddr); retryErr == nil {
 				return nil
 			} else {
 				err = retryErr
@@ -3398,6 +3515,7 @@ func (b *externalKernelBackend) DialContext(ctx context.Context, node kernelNode
 	_ = mapKernelNodeToExternal(node)
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", sidecarAddr)
 	if err != nil {
+		clearSidecarProbeHealthy(sidecarAddr)
 		return nil, fmt.Errorf("%w: code=core_unavailable sidecar_dial_failed=%v", errMainstreamCoreUnavailable, err)
 	}
 
