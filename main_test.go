@@ -113,6 +113,36 @@ func TestParserRegressionBase64ExportLike(t *testing.T) {
 	assertSchemeCoverage(t, entries, "vmess", "vless", "hy2", "ss", "trojan")
 }
 
+func TestParseRegularProxyContentMixedTreatsClashWithEmptyProxiesAsClash(t *testing.T) {
+	content := `proxies: []
+rules:
+  - DOMAIN-SUFFIX,example.com,REJECT
+`
+	entries, format := parseRegularProxyContentMixed(content)
+	if format != "clash" {
+		t.Fatalf("expected clash format, got %s", format)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected no entries from empty clash proxies, got %v", entries)
+	}
+}
+
+func TestParseRegularProxyContentTreatsClashWithEmptyProxiesAsClash(t *testing.T) {
+	content := `proxies: []
+proxy-groups:
+  - name: auto
+    type: select
+    proxies: []
+`
+	entries, format := parseRegularProxyContent(content)
+	if format != "clash" {
+		t.Fatalf("expected clash format, got %s", format)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected no entries from empty clash proxies, got %v", entries)
+	}
+}
+
 func TestParseRegularProxyContentMixedExpandsPlainEndpointsByProtocol(t *testing.T) {
 	content := strings.Join([]string{
 		"103.210.22.17:3128",
@@ -161,6 +191,79 @@ func TestParseMixedProxySupportsSocks4(t *testing.T) {
 	}
 	if auth == nil || auth.User != "user" {
 		t.Fatalf("expected socks4 user auth to be preserved, got %#v", auth)
+	}
+}
+
+func TestNormalizeMixedProxyEntryConvertsHTTPSMasqueradedVLESS(t *testing.T) {
+	config = Config{}
+	config.TLSParamPolicy.DefaultALPN = []string{"h2", "http/1.1"}
+
+	raw := "https://336501b6-51d2-11ee-a993-f23c9164ca5d:336501b6-51d2-11ee-a993-f23c9164ca5d@24559b96-t1yxs0-t8kd6j-1c9em.de.oshuawei.com:443?sni=24559b96-t1yxs0-t8kd6j-1c9em.de.oshuawei.com"
+	entry, ok := normalizeMixedProxyEntry(raw)
+	if !ok {
+		t.Fatalf("expected masqueraded vless entry to normalize")
+	}
+	if !strings.HasPrefix(entry, "vless://336501b6-51d2-11ee-a993-f23c9164ca5d@24559b96-t1yxs0-t8kd6j-1c9em.de.oshuawei.com:443") {
+		t.Fatalf("expected converted vless prefix, got %s", entry)
+	}
+	if strings.HasPrefix(entry, "https://") {
+		t.Fatalf("expected entry not to stay https, got %s", entry)
+	}
+	if !strings.Contains(entry, "security=tls") {
+		t.Fatalf("expected converted entry to carry tls security, got %s", entry)
+	}
+}
+
+func TestParseMixedProxyConvertsHTTPSMasqueradedVLESS(t *testing.T) {
+	raw := "https://336501b6-51d2-11ee-a993-f23c9164ca5d:336501b6-51d2-11ee-a993-f23c9164ca5d@24559b96-t1yxs0-t8kd6j-1c9em.de.oshuawei.com:443?sni=24559b96-t1yxs0-t8kd6j-1c9em.de.oshuawei.com"
+	scheme, addr, auth, _, err := parseMixedProxy(raw)
+	if err != nil {
+		t.Fatalf("expected parseMixedProxy success, got err=%v", err)
+	}
+	if scheme != "vless" {
+		t.Fatalf("expected scheme vless, got %s", scheme)
+	}
+	if addr != "24559b96-t1yxs0-t8kd6j-1c9em.de.oshuawei.com:443" {
+		t.Fatalf("unexpected addr: %s", addr)
+	}
+	if auth == nil || auth.User != "336501b6-51d2-11ee-a993-f23c9164ca5d" {
+		t.Fatalf("unexpected auth: %#v", auth)
+	}
+}
+
+func TestNormalizeMixedProxyEntryKeepsNormalHTTPSProxy(t *testing.T) {
+	raw := "https://11111111-1111-1111-1111-111111111111:plain-pass@example.com:8443"
+	entry, ok := normalizeMixedProxyEntry(raw)
+	if !ok {
+		t.Fatalf("expected regular https proxy to normalize")
+	}
+	if !strings.HasPrefix(entry, "https://11111111-1111-1111-1111-111111111111:plain-pass@example.com:8443") {
+		t.Fatalf("expected https scheme to stay unchanged, got %s", entry)
+	}
+}
+
+func TestNormalizeMixedProxyEntryRejectsRuleLikePlainText(t *testing.T) {
+	raw := "- DOMAIN-SUFFIX,makeup89.com,REJECT"
+	if entry, ok := normalizeMixedProxyEntry(raw); ok {
+		t.Fatalf("expected rule-like plain text to be rejected, got %s", entry)
+	}
+}
+
+func TestParseRegularProxyContentMixedCountsMasqueradedHTTPSAsVLESS(t *testing.T) {
+	content := "https://336501b6-51d2-11ee-a993-f23c9164ca5d:336501b6-51d2-11ee-a993-f23c9164ca5d@24559b96-t1yxs0-t8kd6j-1c9em.de.oshuawei.com:443?sni=24559b96-t1yxs0-t8kd6j-1c9em.de.oshuawei.com#tag"
+	entries, format := parseRegularProxyContentMixed(content)
+	if format != "plain" {
+		t.Fatalf("expected plain format, got %s", format)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one parsed entry, got %d (%v)", len(entries), entries)
+	}
+	counts := protocolHealthyCounts(entries)
+	if counts["vless"] != 1 {
+		t.Fatalf("expected vless count=1, got %#v", counts)
+	}
+	if counts["https"] != 0 {
+		t.Fatalf("expected https count=0 for masqueraded vless, got %#v", counts)
 	}
 }
 
@@ -485,14 +588,53 @@ func TestClassifyHealthFailureCoreUnavailable(t *testing.T) {
 	}
 }
 
-func TestSupportsCoreUnavailableNativeFallbackExcludesMainstreamTCPProtocols(t *testing.T) {
-	for _, scheme := range []string{"vless", "vmess", "trojan"} {
-		if supportsCoreUnavailableNativeFallback(scheme) {
-			t.Fatalf("expected scheme %s to be excluded from core-unavailable native fallback", scheme)
+func TestResolveHealthErrorCodeUsesProtocolSpecificPrefix(t *testing.T) {
+	cases := []struct {
+		scheme string
+		want   string
+	}{
+		{scheme: "vless", want: "DP-VLS-101"},
+		{scheme: "hy2", want: "DP-HY2-101"},
+		{scheme: "trojan", want: "DP-TRJ-101"},
+		{scheme: "socks5", want: "DP-SK5-103"},
+		{scheme: "https", want: "DP-HPS-201"},
+		{scheme: "unknown", want: "DP-GEN-101"},
+	}
+
+	gotCoreVless := resolveHealthErrorCode("vless", healthFailureCoreUnavailable, "core_unconfigured")
+	if gotCoreVless != "DP-VLS-101" {
+		t.Fatalf("unexpected vless core_unconfigured code: %s", gotCoreVless)
+	}
+
+	gotUnreachableSocks5 := resolveHealthErrorCode("socks5", healthFailureUnreachable, "dial_failed")
+	if gotUnreachableSocks5 != "DP-SK5-103" {
+		t.Fatalf("unexpected socks5 unreachable code: %s", gotUnreachableSocks5)
+	}
+
+	for _, tc := range cases {
+		var category healthFailureCategory
+		switch tc.want[len(tc.want)-3:] {
+		case "101":
+			category = healthFailureCoreUnavailable
+		case "103":
+			category = healthFailureUnreachable
+		case "201":
+			category = healthFailureTimeout
+		default:
+			category = healthFailureCoreUnavailable
+		}
+		got := resolveHealthErrorCode(tc.scheme, category, "reason")
+		if got != tc.want {
+			t.Fatalf("unexpected code for scheme=%s: got=%s want=%s", tc.scheme, got, tc.want)
 		}
 	}
-	if !supportsCoreUnavailableNativeFallback("hy2") {
-		t.Fatalf("expected hy2 to keep core-unavailable native fallback")
+}
+
+func TestSupportsCoreUnavailableNativeFallbackIncludesMainstreamTCPProtocols(t *testing.T) {
+	for _, scheme := range []string{"vless", "vmess", "trojan", "hy2", "ss"} {
+		if !supportsCoreUnavailableNativeFallback(scheme) {
+			t.Fatalf("expected scheme %s to use core-unavailable native fallback", scheme)
+		}
 	}
 }
 

@@ -1019,9 +1019,20 @@ var mainstreamMixedExcludedSchemes = map[string]bool{
 var plainProxyProbeSchemes = []string{"http", "https", "socks4", "socks5"}
 
 func parseClashSubscriptionForStrictRelaxed(content string) ([]string, bool) {
-	var sub clashSubscription
-	if err := yaml.Unmarshal([]byte(content), &sub); err != nil || len(sub.Proxies) == 0 {
+	var root map[string]interface{}
+	if err := yaml.Unmarshal([]byte(content), &root); err != nil {
 		return nil, false
+	}
+	if _, exists := root["proxies"]; !exists {
+		return nil, false
+	}
+
+	var sub clashSubscription
+	if err := yaml.Unmarshal([]byte(content), &sub); err != nil {
+		return nil, false
+	}
+	if len(sub.Proxies) == 0 {
+		return []string{}, true
 	}
 
 	result := make([]string, 0, len(sub.Proxies))
@@ -1044,7 +1055,7 @@ func parseClashSubscriptionForStrictRelaxed(content string) ([]string, bool) {
 		}
 	}
 
-	return result, len(result) > 0
+	return result, true
 }
 
 func parseRegularProxyContent(content string) ([]string, string) {
@@ -1155,9 +1166,20 @@ func parseRegularProxyContentMixed(content string) ([]string, string) {
 }
 
 func parseClashSubscriptionForMixed(content string) ([]string, bool) {
-	var sub clashSubscription
-	if err := yaml.Unmarshal([]byte(content), &sub); err != nil || len(sub.Proxies) == 0 {
+	var root map[string]interface{}
+	if err := yaml.Unmarshal([]byte(content), &root); err != nil {
 		return nil, false
+	}
+	if _, exists := root["proxies"]; !exists {
+		return nil, false
+	}
+
+	var sub clashSubscription
+	if err := yaml.Unmarshal([]byte(content), &sub); err != nil {
+		return nil, false
+	}
+	if len(sub.Proxies) == 0 {
+		return []string{}, true
 	}
 
 	result := make([]string, 0, len(sub.Proxies))
@@ -1299,7 +1321,7 @@ func parseClashSubscriptionForMixed(content string) ([]string, bool) {
 		}
 	}
 
-	return result, len(result) > 0
+	return result, true
 }
 
 func detectProxyScheme(entry string, defaultScheme string) string {
@@ -1518,6 +1540,9 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 	}
 
 	if strings.Contains(line, "://") {
+		if converted, ok := maybeNormalizeMasqueradedVLESS(line); ok {
+			line = converted
+		}
 		lowerLine := strings.ToLower(line)
 		if strings.HasPrefix(lowerLine, "ss://") {
 			if normalized, ok := normalizeSSURI(line); ok {
@@ -1606,7 +1631,11 @@ func normalizeMixedProxyEntry(raw string) (string, bool) {
 		return normalized, true
 	}
 
-	return "socks5://" + line, true
+	if hostPort, ok := extractPlainProxyHostPort(line); ok {
+		return "socks5://" + hostPort, true
+	}
+	recordParseFailureReasonTag("normalize", "invalid_plain_endpoint")
+	return "", false
 }
 
 func defaultALPNForScheme(scheme string) []string {
@@ -2152,6 +2181,81 @@ func validateMainstreamURI(scheme string, u *url.URL) bool {
 	}
 
 	return true
+}
+
+func maybeNormalizeMasqueradedVLESS(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", false
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil || u == nil || strings.TrimSpace(u.Host) == "" {
+		return "", false
+	}
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	if u.User == nil {
+		return "", false
+	}
+
+	user := strings.TrimSpace(u.User.Username())
+	if !isValidUUID(user) {
+		return "", false
+	}
+
+	password, hasPassword := u.User.Password()
+	password = strings.TrimSpace(password)
+	if hasPassword && password != "" && !strings.EqualFold(password, user) && !isValidUUID(password) {
+		return "", false
+	}
+
+	q := u.Query()
+	sni := strings.TrimSpace(firstNonEmpty(q.Get("sni"), q.Get("server_name")))
+	if sni == "" {
+		return "", false
+	}
+
+	hasVLESSHints := false
+	for _, key := range []string{"security", "type", "network", "path", "host", "flow", "pbk", "sid", "fp", "alpn", "insecure", "allow_insecure", "encryption"} {
+		if strings.TrimSpace(q.Get(key)) != "" {
+			hasVLESSHints = true
+			break
+		}
+	}
+	if !hasVLESSHints && !(hasPassword && strings.EqualFold(password, user)) {
+		return "", false
+	}
+
+	vlessQuery := url.Values{}
+	for _, key := range []string{"encryption", "security", "sni", "server_name", "alpn", "insecure", "allow_insecure", "type", "network", "host", "path", "flow", "pbk", "sid", "fp"} {
+		if value := strings.TrimSpace(q.Get(key)); value != "" {
+			vlessQuery.Set(key, value)
+		}
+	}
+	if strings.TrimSpace(vlessQuery.Get("encryption")) == "" {
+		vlessQuery.Set("encryption", "none")
+	}
+	if strings.TrimSpace(vlessQuery.Get("security")) == "" && scheme == "https" {
+		vlessQuery.Set("security", "tls")
+	}
+	if strings.TrimSpace(vlessQuery.Get("sni")) == "" {
+		if value := strings.TrimSpace(vlessQuery.Get("server_name")); value != "" {
+			vlessQuery.Set("sni", value)
+		}
+	}
+	if strings.TrimSpace(vlessQuery.Get("server_name")) == "" {
+		if value := strings.TrimSpace(vlessQuery.Get("sni")); value != "" {
+			vlessQuery.Set("server_name", value)
+		}
+	}
+
+	normalized := fmt.Sprintf("vless://%s@%s", url.QueryEscape(user), u.Host)
+	if encoded := vlessQuery.Encode(); encoded != "" {
+		normalized += "?" + encoded
+	}
+	return normalized, true
 }
 
 func normalizeSSURI(raw string) (string, bool) {
@@ -4029,7 +4133,7 @@ func supportsNativeAvailabilityFallback(proxyScheme string) bool {
 
 func supportsCoreUnavailableNativeFallback(proxyScheme string) bool {
 	switch strings.ToLower(strings.TrimSpace(proxyScheme)) {
-	case "ss", "ssr", "hy2", "hysteria", "hysteria2", "tuic", "wg", "wireguard":
+	case "ss", "ssr", "hy2", "hysteria", "hysteria2", "tuic", "wg", "wireguard", "trojan", "vmess", "vless":
 		return true
 	default:
 		return false
@@ -4072,7 +4176,14 @@ func (a *mainstreamTCPConnectAdapter) CheckAvailability(ctx context.Context, pro
 	if healthAware, ok := backend.(mainstreamHealthAwareBackend); ok {
 		if err := healthAware.HealthCheck(ctx, node); err != nil {
 			if category, _ := classifyHealthFailure(err); category == healthFailureCoreUnavailable && supportsCoreUnavailableNativeFallback(proxyScheme) {
-				return performNativeProtocolHealthCheck(ctx, node)
+				log.Printf("[CORE-FALLBACK] stage=stage1 scheme=%s reason=core_unconfigured detail=%v action=native_probe", proxyScheme, err)
+				nativeErr := performNativeProtocolHealthCheck(ctx, node)
+				if nativeErr != nil {
+					log.Printf("[CORE-FALLBACK] stage=stage1 scheme=%s action=native_probe result=failed detail=%v", proxyScheme, nativeErr)
+					return nativeErr
+				}
+				log.Printf("[CORE-FALLBACK] stage=stage1 scheme=%s action=native_probe result=success", proxyScheme)
+				return nil
 			}
 			return err
 		}
@@ -4641,6 +4752,9 @@ func fetchAndProcessMixedProxyBatches(batchSize int, onBatch func([]string)) err
 
 func parseMixedProxy(entry string) (scheme string, addr string, auth *proxy.Auth, httpAuthHeader string, err error) {
 	if strings.Contains(entry, "://") {
+		if normalized, ok := maybeNormalizeMasqueradedVLESS(entry); ok {
+			entry = normalized
+		}
 		lower := strings.ToLower(strings.TrimSpace(entry))
 		if strings.HasPrefix(lower, "vmess://") {
 			node, ok := parseVMESSNode(entry)
@@ -5287,12 +5401,32 @@ var mixedHealthErrorCodeMetrics = &healthErrorCodeMetrics{counts: make(map[strin
 
 func healthProtocolCodePrefix(scheme string) string {
 	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "http":
+		return "HTP"
+	case "https":
+		return "HPS"
+	case "socks4":
+		return "SK4"
+	case "socks5", "socks5h":
+		return "SK5"
+	case "vmess":
+		return "VMS"
+	case "vless":
+		return "VLS"
+	case "hy2", "hysteria2":
+		return "HY2"
+	case "hysteria":
+		return "HYS"
 	case "ss":
 		return "SS"
 	case "ssr":
 		return "SSR"
 	case "trojan":
 		return "TRJ"
+	case "tuic":
+		return "TUC"
+	case "wg", "wireguard":
+		return "WGR"
 	default:
 		return "GEN"
 	}
@@ -5721,16 +5855,20 @@ func (m *stagePromMetrics) RenderPrometheus() string {
 
 var mixedStageMetrics = newStagePromMetrics()
 
-func logMixedHealthFailure(stage, scheme string, category healthFailureCategory, errorCode string, failPhase mixedFailPhase, err error) {
+func logMixedHealthFailure(stage, scheme, proxyEntry string, category healthFailureCategory, errorCode string, failPhase mixedFailPhase, err error) {
 	if scheme == "" {
 		scheme = "unknown"
+	}
+	proxy := sanitizeSampleLine(proxyEntry)
+	if proxy == "" {
+		proxy = "unknown"
 	}
 	detail := ""
 	if err != nil {
 		detail = strings.ReplaceAll(err.Error(), "\n", " ")
 	}
-	log.Printf("[MIXED-HEALTH-FAIL] stage=%s scheme=%s category=%s error_code=%s fail_phase=%s detail=%s",
-		stage, scheme, category, errorCode, failPhase, detail)
+	log.Printf("[MIXED-HEALTH-FAIL] stage=%s scheme=%s proxy=%s category=%s error_code=%s fail_phase=%s detail=%s",
+		stage, scheme, proxy, category, errorCode, failPhase, detail)
 }
 
 func mixedHealthTargetAddr() string {
@@ -5795,12 +5933,12 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 		}
 		if strings.Contains(err.Error(), "invalid") {
 			errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_proxy_entry")
-			logMixedHealthFailure("stage1", scheme, healthFailureParse, errorCode, failPhase, err)
+			logMixedHealthFailure("stage1", scheme, proxyEntry, healthFailureParse, errorCode, failPhase, err)
 			return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}
 		}
 		category, reasonCode := classifyHealthFailure(err)
 		errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
-		logMixedHealthFailure("stage1", scheme, category, errorCode, failPhase, err)
+		logMixedHealthFailure("stage1", scheme, proxyEntry, category, errorCode, failPhase, err)
 		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}
 	}
 
@@ -5815,7 +5953,7 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 			err := fmt.Errorf("%w: %s", errMainstreamAdapterUnavailable, md.proxyScheme)
 			category, reasonCode := classifyHealthFailure(err)
 			errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
-			logMixedHealthFailure("stage1", scheme, category, errorCode, mixedFailPhaseDialerBuild, err)
+			logMixedHealthFailure("stage1", scheme, proxyEntry, category, errorCode, mixedFailPhaseDialerBuild, err)
 			return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}
 		}
 		if checker, ok := md.adapter.(interface {
@@ -5828,14 +5966,14 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 				}
 				category, reasonCode := classifyHealthFailure(err)
 				errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
-				logMixedHealthFailure("stage1", scheme, category, errorCode, failPhase, err)
+				logMixedHealthFailure("stage1", scheme, proxyEntry, category, errorCode, failPhase, err)
 				return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}
 			}
 
 			if time.Since(start) > threshold {
 				errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "stage1_connect_timeout")
 				timeoutErr := errors.New("stage1 availability probe exceeded threshold")
-				logMixedHealthFailure("stage1", scheme, healthFailureTimeout, errorCode, mixedFailPhaseCoreCheck, timeoutErr)
+				logMixedHealthFailure("stage1", scheme, proxyEntry, healthFailureTimeout, errorCode, mixedFailPhaseCoreCheck, timeoutErr)
 				return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, timeoutErr)}
 			}
 
@@ -5847,7 +5985,7 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 	if err != nil {
 		category, reasonCode := classifyHealthFailure(err)
 		errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
-		logMixedHealthFailure("stage1", scheme, category, errorCode, mixedFailPhaseTCPConnect, err)
+		logMixedHealthFailure("stage1", scheme, proxyEntry, category, errorCode, mixedFailPhaseTCPConnect, err)
 		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}
 	}
 	_ = conn.Close()
@@ -5855,7 +5993,7 @@ func checkMainstreamProxyHealthStage1(proxyEntry string, settings HealthCheckSet
 	if time.Since(start) > threshold {
 		errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "stage1_connect_timeout")
 		timeoutErr := errors.New("stage1 tunnel connect exceeded threshold")
-		logMixedHealthFailure("stage1", scheme, healthFailureTimeout, errorCode, mixedFailPhaseTCPConnect, timeoutErr)
+		logMixedHealthFailure("stage1", scheme, proxyEntry, healthFailureTimeout, errorCode, mixedFailPhaseTCPConnect, timeoutErr)
 		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, timeoutErr)}
 	}
 
@@ -5883,7 +6021,7 @@ func checkMainstreamProxyHealthStage1WithHardTimeout(proxyEntry string, settings
 		}
 		errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "stage1_hard_timeout")
 		timeoutErr := errors.New("stage1 hard timeout exceeded")
-		logMixedHealthFailure("stage1", scheme, healthFailureTimeout, errorCode, mixedFailPhaseTCPConnect, timeoutErr)
+		logMixedHealthFailure("stage1", scheme, proxyEntry, healthFailureTimeout, errorCode, mixedFailPhaseTCPConnect, timeoutErr)
 		return proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, timeoutErr)}
 	}
 }
@@ -5893,10 +6031,17 @@ func tryStage2NativeFallbackOnCoreUnavailable(proxyEntry, scheme string, totalTi
 	if !supportsCoreUnavailableNativeFallback(scheme) {
 		return mixedStageCheckResult{}, false
 	}
+	log.Printf("[MIXED-2STAGE-FALLBACK] scheme=%s reason=core_unconfigured action=native_probe", scheme)
 
 	parsedScheme, proxyAddr, _, _, err := parseMixedProxy(proxyEntry)
 	if err != nil {
-		return mixedStageCheckResult{}, false
+		errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_proxy_entry")
+		log.Printf("[MIXED-2STAGE-FALLBACK] scheme=%s action=native_probe result=failed category=parse_failed error_code=%s detail=%v", scheme, errorCode, err)
+		logMixedHealthFailure("stage2", scheme, proxyEntry, healthFailureParse, errorCode, mixedFailPhaseCoreCheck, err)
+		return mixedStageCheckResult{
+			Status:  proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)},
+			Latency: latency,
+		}, true
 	}
 	parsedScheme = strings.ToLower(strings.TrimSpace(parsedScheme))
 	if parsedScheme == "" {
@@ -5908,7 +6053,13 @@ func tryStage2NativeFallbackOnCoreUnavailable(proxyEntry, scheme string, totalTi
 
 	node, err := parseKernelNodeConfig(parsedScheme, proxyEntry, proxyAddr)
 	if err != nil {
-		return mixedStageCheckResult{}, false
+		errorCode := resolveHealthErrorCode(parsedScheme, healthFailureParse, "invalid_proxy_entry")
+		log.Printf("[MIXED-2STAGE-FALLBACK] scheme=%s action=native_probe result=failed category=parse_failed error_code=%s detail=%v", parsedScheme, errorCode, err)
+		logMixedHealthFailure("stage2", parsedScheme, proxyEntry, healthFailureParse, errorCode, mixedFailPhaseCoreCheck, err)
+		return mixedStageCheckResult{
+			Status:  proxyHealthStatus{Healthy: false, Scheme: parsedScheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)},
+			Latency: latency,
+		}, true
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
@@ -5916,13 +6067,20 @@ func tryStage2NativeFallbackOnCoreUnavailable(proxyEntry, scheme string, totalTi
 
 	start := time.Now()
 	if err := performNativeProtocolHealthCheck(ctx, node); err != nil {
-		return mixedStageCheckResult{}, false
+		category, reasonCode := classifyHealthFailure(err)
+		errorCode := resolveHealthErrorCode(parsedScheme, category, reasonCode)
+		log.Printf("[MIXED-2STAGE-FALLBACK] scheme=%s action=native_probe result=failed category=%s error_code=%s detail=%v", parsedScheme, category, errorCode, err)
+		logMixedHealthFailure("stage2", parsedScheme, proxyEntry, category, errorCode, mixedFailPhaseCoreCheck, err)
+		return mixedStageCheckResult{
+			Status:  proxyHealthStatus{Healthy: false, Scheme: parsedScheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)},
+			Latency: latency,
+		}, true
 	}
 	if latency <= 0 {
 		latency = time.Since(start)
 	}
 
-	log.Printf("[MIXED-2STAGE-FALLBACK] scheme=%s reason=core_unconfigured mode=native_probe", parsedScheme)
+	log.Printf("[MIXED-2STAGE-FALLBACK] scheme=%s action=native_probe result=success", parsedScheme)
 	return mixedStageCheckResult{
 		Status:  proxyHealthStatus{Healthy: true, Scheme: parsedScheme, Category: healthFailureNone, ErrorCode: ""},
 		Latency: latency,
@@ -5941,12 +6099,12 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 		}
 		if strings.Contains(err.Error(), "invalid") {
 			errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_proxy_entry")
-			logMixedHealthFailure("stage2", scheme, healthFailureParse, errorCode, failPhase, err)
+			logMixedHealthFailure("stage2", scheme, proxyEntry, healthFailureParse, errorCode, failPhase, err)
 			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}}
 		}
 		category, reasonCode := classifyHealthFailure(err)
 		errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
-		logMixedHealthFailure("stage2", scheme, category, errorCode, failPhase, err)
+		logMixedHealthFailure("stage2", scheme, proxyEntry, category, errorCode, failPhase, err)
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}}
 	}
 
@@ -5956,7 +6114,7 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 	targetURL, parseErr := url.Parse(mixedHealthCheckURL)
 	if parseErr != nil {
 		errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_healthcheck_url")
-		logMixedHealthFailure("stage2", scheme, healthFailureParse, errorCode, mixedFailPhaseHTTPRequest, parseErr)
+		logMixedHealthFailure("stage2", scheme, proxyEntry, healthFailureParse, errorCode, mixedFailPhaseHTTPRequest, parseErr)
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, parseErr)}}
 	}
 
@@ -6000,7 +6158,7 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 	req, reqErr := http.NewRequest(http.MethodGet, mixedHealthCheckURL, nil)
 	if reqErr != nil {
 		errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_request")
-		logMixedHealthFailure("stage2", scheme, healthFailureParse, errorCode, mixedFailPhaseHTTPRequest, reqErr)
+		logMixedHealthFailure("stage2", scheme, proxyEntry, healthFailureParse, errorCode, mixedFailPhaseHTTPRequest, reqErr)
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, reqErr)}}
 	}
 	reqCtx, dialPhaseMetric := withDialPhase(req.Context())
@@ -6054,12 +6212,12 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 				}
 			}
 			errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
-			logMixedHealthFailure("stage2", scheme, category, errorCode, mixedFailPhaseTLSHandshake, verifyErr)
+			logMixedHealthFailure("stage2", scheme, proxyEntry, category, errorCode, mixedFailPhaseTLSHandshake, verifyErr)
 			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, verifyErr)}, Latency: latency}
 		}
 		if isTimeoutError(err) && !tlsHandshakeDone {
 			errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "tls_handshake_timeout")
-			logMixedHealthFailure("stage2", scheme, healthFailureTimeout, errorCode, mixedFailPhaseTLSHandshake, err)
+			logMixedHealthFailure("stage2", scheme, proxyEntry, healthFailureTimeout, errorCode, mixedFailPhaseTLSHandshake, err)
 			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}, Latency: latency}
 		}
 		category, reasonCode := classifyHealthFailure(err)
@@ -6073,7 +6231,7 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 		if !tlsHandshakeDone {
 			phase = mixedFailPhaseTCPConnect
 		}
-		logMixedHealthFailure("stage2", scheme, category, errorCode, phase, err)
+		logMixedHealthFailure("stage2", scheme, proxyEntry, category, errorCode, phase, err)
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, err)}, Latency: latency}
 	}
 	defer resp.Body.Close()
@@ -6081,7 +6239,7 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 	if resp.StatusCode < 200 || resp.StatusCode >= 500 {
 		errorCode := resolveHealthErrorCode(scheme, healthFailureUnreachable, "unexpected_status")
 		statusErr := fmt.Errorf("unexpected status: %d", resp.StatusCode)
-		logMixedHealthFailure("stage2", scheme, healthFailureUnreachable, errorCode, mixedFailPhaseHTTPRequest, statusErr)
+		logMixedHealthFailure("stage2", scheme, proxyEntry, healthFailureUnreachable, errorCode, mixedFailPhaseHTTPRequest, statusErr)
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureUnreachable, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, statusErr)}, Latency: latency}
 	}
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified {
@@ -6092,12 +6250,12 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 			if readErr == nil {
 				readErr = io.EOF
 			}
-			logMixedHealthFailure("stage2", scheme, healthFailureUnreachable, errorCode, mixedFailPhaseHTTPRequest, readErr)
+			logMixedHealthFailure("stage2", scheme, proxyEntry, healthFailureUnreachable, errorCode, mixedFailPhaseHTTPRequest, readErr)
 			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureUnreachable, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, readErr)}, Latency: latency}
 		}
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			errorCode := resolveHealthErrorCode(scheme, healthFailureUnreachable, "response_read_failed")
-			logMixedHealthFailure("stage2", scheme, healthFailureUnreachable, errorCode, mixedFailPhaseHTTPRequest, readErr)
+			logMixedHealthFailure("stage2", scheme, proxyEntry, healthFailureUnreachable, errorCode, mixedFailPhaseHTTPRequest, readErr)
 			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureUnreachable, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, readErr)}, Latency: latency}
 		}
 	}
@@ -6105,7 +6263,7 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 	if tlsHandshakeDone && phase.TLSHello+phase.CertVerify > threshold {
 		errorCode := resolveHealthErrorCode(scheme, healthFailureTimeout, "stage2_tls_threshold_timeout")
 		timeoutErr := errors.New("stage2 tls handshake exceeded threshold")
-		logMixedHealthFailure("stage2", scheme, healthFailureTimeout, errorCode, mixedFailPhaseTLSHandshake, timeoutErr)
+		logMixedHealthFailure("stage2", scheme, proxyEntry, healthFailureTimeout, errorCode, mixedFailPhaseTLSHandshake, timeoutErr)
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureTimeout, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, timeoutErr)}, Latency: latency}
 	}
 	proxyDial := dialPhaseMetric.ProxyDial
