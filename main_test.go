@@ -59,6 +59,32 @@ func TestParserRegressionClashMixedProtocols(t *testing.T) {
 	assertSchemeCoverage(t, entries, "vmess", "vless", "hy2", "ss", "trojan")
 }
 
+func TestParserRegressionClashDropsVLESSIPWithoutDomainSNI(t *testing.T) {
+	content := `proxies:
+  - {name: bad-vless, type: vless, server: 1.2.3.4, port: 443, uuid: 11111111-1111-1111-1111-111111111111, network: ws, tls: true}
+  - {name: good-vless, type: vless, server: 2.3.4.5, port: 443, uuid: 22222222-2222-2222-2222-222222222222, network: ws, tls: true, sni: example.com}
+`
+	entries, format := parseRegularProxyContentMixed(content)
+	if format != "clash" {
+		t.Fatalf("expected clash format, got %s", format)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry, "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443") {
+			t.Fatalf("unexpected ip-only-sni vless entry accepted: %s", entry)
+		}
+	}
+	foundGood := false
+	for _, entry := range entries {
+		if strings.Contains(entry, "vless://22222222-2222-2222-2222-222222222222@2.3.4.5:443") {
+			foundGood = true
+			break
+		}
+	}
+	if !foundGood {
+		t.Fatalf("expected vless entry with domain sni to be retained, entries=%v", entries)
+	}
+}
+
 func TestParserRegressionSingboxExportLikeLines(t *testing.T) {
 	content := strings.Join([]string{
 		"\ufeffvless://33333333-3333-3333-3333-333333333333@vl2.example.com:443?encryption=none&security=tls",
@@ -158,6 +184,42 @@ func TestParseVLESSNodeRejectsInvalidUUID(t *testing.T) {
 	}
 }
 
+func TestParseVMESSNodeRejectsInvalidUUID(t *testing.T) {
+	_, ok := parseVMESSNode("vmess://vm.example.com:443?id=not-a-uuid&net=ws&tls=tls")
+	if ok {
+		t.Fatalf("expected vmess parse failure for invalid uuid")
+	}
+}
+
+func TestNormalizeMixedProxyEntryRejectsVLESSIPWithoutDomainSNI(t *testing.T) {
+	entry, ok := normalizeMixedProxyEntry("vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443?encryption=none")
+	if ok {
+		t.Fatalf("expected ip-only-sni vless to be rejected, got %s", entry)
+	}
+}
+
+func TestNormalizeMixedProxyEntryAcceptsVLESSIPWithDomainSNI(t *testing.T) {
+	entry, ok := normalizeMixedProxyEntry("vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443?encryption=none&sni=example.com")
+	if !ok {
+		t.Fatalf("expected vless with domain sni to normalize")
+	}
+	if !strings.Contains(entry, "sni=example.com") {
+		t.Fatalf("expected normalized entry to preserve domain sni, got %s", entry)
+	}
+}
+
+func TestNormalizeMixedProxyEntryFillsVLESSEncryptionNone(t *testing.T) {
+	config = Config{}
+	config.TLSParamPolicy.DefaultALPN = []string{"h2", "http/1.1"}
+	entry, ok := normalizeMixedProxyEntry("vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&sni=example.com")
+	if !ok {
+		t.Fatalf("expected vless entry to normalize")
+	}
+	if !strings.Contains(entry, "encryption=none") {
+		t.Fatalf("expected normalized vless entry to include encryption=none, got %s", entry)
+	}
+}
+
 func TestNormalizeMixedProxyEntryCompletesCriticalTLSParams(t *testing.T) {
 	config = Config{}
 	config.TLSParamPolicy.DefaultALPN = []string{"h2", "http/1.1"}
@@ -236,6 +298,37 @@ func TestBuildRuntimeSingboxOutboundTrojanAddsUTLS(t *testing.T) {
 	}
 }
 
+func TestBuildRuntimeSingboxOutboundVLESSRealityIncludesRealityConfig(t *testing.T) {
+	config = Config{}
+	config.TLSParamPolicy.DefaultALPN = []string{"h2", "http/1.1"}
+	node := kernelNodeConfig{Protocol: "vless", Address: "example.com", Port: "443"}
+	node.VLESS.UUID = "11111111-1111-1111-1111-111111111111"
+	node.VLESS.Security = "reality"
+	node.VLESS.ServerName = "example.com"
+	node.VLESS.RealityPublicKey = "reality-public-key"
+	node.VLESS.RealityShortID = "abcd"
+	node.VLESS.Fingerprint = "chrome"
+
+	out, err := buildRuntimeSingboxOutbound(node)
+	if err != nil {
+		t.Fatalf("expected build success: %v", err)
+	}
+	tlsRaw, ok := out["tls"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected tls map")
+	}
+	realityRaw, ok := tlsRaw["reality"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected reality map")
+	}
+	if realityRaw["public_key"] != "reality-public-key" {
+		t.Fatalf("expected reality public key, got %v", realityRaw["public_key"])
+	}
+	if realityRaw["short_id"] != "abcd" {
+		t.Fatalf("expected reality short id, got %v", realityRaw["short_id"])
+	}
+}
+
 func TestParseKernelNodeConfigInsecureAliases(t *testing.T) {
 	vlessEntry := "vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&security=tls&sni=example.com&allow_insecure=true"
 	vlessNode, err := parseKernelNodeConfig("vless", vlessEntry, "example.com:443")
@@ -253,6 +346,20 @@ func TestParseKernelNodeConfigInsecureAliases(t *testing.T) {
 	}
 	if !hy2Node.HY2.AllowInsecure {
 		t.Fatalf("expected hy2 allow_insecure=true to set AllowInsecure=true")
+	}
+}
+
+func TestParseKernelNodeConfigRejectsVLESSRealityWithoutPBK(t *testing.T) {
+	_, err := parseKernelNodeConfig("vless", "vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&security=reality&sni=example.com", "example.com:443")
+	if err == nil || !strings.Contains(err.Error(), "missing public key") {
+		t.Fatalf("expected reality missing public key error, got: %v", err)
+	}
+}
+
+func TestParseKernelNodeConfigRejectsVLESSVisionWithNonTCP(t *testing.T) {
+	_, err := parseKernelNodeConfig("vless", "vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&security=reality&sni=example.com&flow=xtls-rprx-vision&type=ws&pbk=test", "example.com:443")
+	if err == nil || !strings.Contains(err.Error(), "vision flow network") {
+		t.Fatalf("expected vision network validation error, got: %v", err)
 	}
 }
 
@@ -375,6 +482,17 @@ func TestClassifyHealthFailureCoreUnavailable(t *testing.T) {
 	category, reason := classifyHealthFailure(err)
 	if category != healthFailureCoreUnavailable || reason != "core_unconfigured" {
 		t.Fatalf("unexpected classification: category=%s reason=%s", category, reason)
+	}
+}
+
+func TestSupportsCoreUnavailableNativeFallbackExcludesMainstreamTCPProtocols(t *testing.T) {
+	for _, scheme := range []string{"vless", "vmess", "trojan"} {
+		if supportsCoreUnavailableNativeFallback(scheme) {
+			t.Fatalf("expected scheme %s to be excluded from core-unavailable native fallback", scheme)
+		}
+	}
+	if !supportsCoreUnavailableNativeFallback("hy2") {
+		t.Fatalf("expected hy2 to keep core-unavailable native fallback")
 	}
 }
 
@@ -559,6 +677,38 @@ func TestHealthCheckMixedProxiesTwoStageBoundaryInputOne(t *testing.T) {
 	}
 	if row["input"] != 1 || row["stage1"] != 1 || row["stage1_pass"] != 1 || row["stage2"] != 1 || row["stage2_pass"] != 1 {
 		t.Fatalf("unexpected vmess funnel row: %#v", row)
+	}
+}
+
+func TestCheckMainstreamProxyHealthStage2RejectsEmptyResponseBody(t *testing.T) {
+	config = Config{}
+	config.HealthCheckTwoStage.StageTwo = HealthCheckSettings{TotalTimeoutSeconds: 2, TLSHandshakeThresholdSeconds: 2}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	mixedHealthCheckURL = srv.URL
+	t.Cleanup(func() {
+		mixedHealthCheckURL = defaultMixedHealthCheckURL
+	})
+
+	origBuilder := upstreamDialerBuilder
+	upstreamDialerBuilder = func(entry string) (UpstreamDialer, string, error) {
+		target := strings.TrimPrefix(srv.URL, "http://")
+		return &testDirectDialer{target: target}, "vless", nil
+	}
+	t.Cleanup(func() {
+		upstreamDialerBuilder = origBuilder
+	})
+
+	result := checkMainstreamProxyHealthStage2("vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&security=tls&sni=example.com", false, HealthCheckSettings{TotalTimeoutSeconds: 2, TLSHandshakeThresholdSeconds: 2})
+	if result.Status.Healthy {
+		t.Fatalf("expected stage2 health check to reject empty response body")
+	}
+	if !strings.Contains(result.Status.ErrorCode, "103") {
+		t.Fatalf("expected unreachable error code, got %s", result.Status.ErrorCode)
 	}
 }
 

@@ -1167,7 +1167,7 @@ func parseClashSubscriptionForMixed(content string) ([]string, bool) {
 		}
 		switch proxyType {
 		case "vmess":
-			if p.UUID == "" {
+			if p.UUID == "" || !isValidUUID(p.UUID) {
 				continue
 			}
 			q := url.Values{}
@@ -1274,9 +1274,17 @@ func parseClashSubscriptionForMixed(content string) ([]string, bool) {
 		default:
 			entry = fmt.Sprintf("%s://%s", proxyType, host)
 		}
-		if !seen[entry] {
-			seen[entry] = true
-			result = append(result, entry)
+
+		normalized := strings.TrimSpace(entry)
+		if v, ok := normalizeMixedProxyEntry(entry); ok {
+			normalized = v
+		} else {
+			continue
+		}
+
+		if !seen[normalized] {
+			seen[normalized] = true
+			result = append(result, normalized)
 		}
 	}
 
@@ -1608,12 +1616,18 @@ func applyCriticalTLSParams(scheme string, u *url.URL) {
 		return
 	}
 	q := u.Query()
+	if scheme == "vless" && strings.TrimSpace(q.Get("encryption")) == "" {
+		q.Set("encryption", "none")
+	}
 	sni := strings.TrimSpace(q.Get("sni"))
 	if sni == "" {
 		sni = strings.TrimSpace(q.Get("server_name"))
 	}
 	if sni == "" {
-		sni = strings.TrimSpace(u.Hostname())
+		host := strings.TrimSpace(u.Hostname())
+		if !isLiteralIP(host) {
+			sni = host
+		}
 	}
 	if sni != "" {
 		q.Set("sni", sni)
@@ -1694,7 +1708,7 @@ var mixedCommonQueryWhitelist = map[string]bool{
 }
 
 var mixedSchemeQueryWhitelist = map[string]map[string]bool{
-	"vmess":     {"id": true, "aid": true, "net": true, "tls": true},
+	"vmess":     {"id": true, "uuid": true, "aid": true, "net": true, "tls": true},
 	"vless":     {"encryption": true},
 	"hy2":       {"peer": true, "up": true, "down": true, "mport": true, "ports": true, "password": true},
 	"hysteria2": {"peer": true, "up": true, "down": true, "mport": true, "ports": true, "password": true},
@@ -1758,16 +1772,20 @@ type vmessNode struct {
 }
 
 type vlessNode struct {
-	Address   string
-	Port      string
-	UUID      string
-	SNI       string
-	Transport string
-	Host      string
-	Path      string
-	Security  string
-	Flow      string
-	RawQuery  string
+	Address          string
+	Port             string
+	UUID             string
+	Encryption       string
+	SNI              string
+	Transport        string
+	Host             string
+	Path             string
+	Security         string
+	Flow             string
+	RealityPublicKey string
+	RealityShortID   string
+	Fingerprint      string
+	RawQuery         string
 }
 
 type hy2Node struct {
@@ -1807,7 +1825,8 @@ func parseVMESSNode(raw string) (vmessNode, bool) {
 		if jsonErr := json.Unmarshal(payload, &node); jsonErr == nil {
 			node.Add = strings.TrimSpace(node.Add)
 			node.Port = strings.TrimSpace(node.Port)
-			if node.Add != "" && node.Port != "" {
+			node.ID = strings.TrimSpace(node.ID)
+			if node.Add != "" && node.Port != "" && isValidUUID(node.ID) {
 				if node.V == "" {
 					node.V = "2"
 				}
@@ -1839,7 +1858,7 @@ func parseVMESSNode(raw string) (vmessNode, bool) {
 		V:    "2",
 		Add:  host,
 		Port: port,
-		ID:   strings.TrimSpace(q.Get("id")),
+		ID:   strings.TrimSpace(firstNonEmpty(q.Get("id"), q.Get("uuid"))),
 		Aid:  strings.TrimSpace(q.Get("aid")),
 		Net:  strings.TrimSpace(q.Get("net")),
 		Type: strings.TrimSpace(q.Get("type")),
@@ -1869,6 +1888,10 @@ func parseVMESSNode(raw string) (vmessNode, bool) {
 	}
 	if node.Port == "" {
 		recordParseFailureReasonTag("vmess", "missing_port")
+		return vmessNode{}, false
+	}
+	if !isValidUUID(strings.TrimSpace(node.ID)) {
+		recordParseFailureReasonTag("vmess", "invalid_uuid")
 		return vmessNode{}, false
 	}
 	return node, true
@@ -1909,16 +1932,23 @@ func parseVLESSNode(raw string) (vlessNode, bool) {
 	}
 	q := u.Query()
 	node = vlessNode{
-		Address:   host,
-		Port:      port,
-		UUID:      uuid,
-		SNI:       strings.TrimSpace(q.Get("sni")),
-		Transport: strings.TrimSpace(q.Get("type")),
-		Host:      strings.TrimSpace(q.Get("host")),
-		Path:      strings.TrimSpace(q.Get("path")),
-		Security:  strings.TrimSpace(q.Get("security")),
-		Flow:      strings.TrimSpace(q.Get("flow")),
-		RawQuery:  filterRawQueryWithWhitelist(u.RawQuery, "vless"),
+		Address:          host,
+		Port:             port,
+		UUID:             uuid,
+		Encryption:       strings.TrimSpace(q.Get("encryption")),
+		SNI:              strings.TrimSpace(q.Get("sni")),
+		Transport:        strings.TrimSpace(q.Get("type")),
+		Host:             strings.TrimSpace(q.Get("host")),
+		Path:             strings.TrimSpace(q.Get("path")),
+		Security:         strings.TrimSpace(q.Get("security")),
+		Flow:             strings.TrimSpace(q.Get("flow")),
+		RealityPublicKey: strings.TrimSpace(q.Get("pbk")),
+		RealityShortID:   strings.TrimSpace(q.Get("sid")),
+		Fingerprint:      strings.TrimSpace(q.Get("fp")),
+		RawQuery:         filterRawQueryWithWhitelist(u.RawQuery, "vless"),
+	}
+	if node.Encryption == "" {
+		node.Encryption = "none"
 	}
 	if node.Transport == "" {
 		node.Transport = strings.TrimSpace(q.Get("network"))
@@ -2048,6 +2078,12 @@ func normalizeWireGuardURI(raw string) (string, bool) {
 func validateMainstreamURI(scheme string, u *url.URL) bool {
 	query := u.Query()
 	switch scheme {
+	case "vmess":
+		id := strings.TrimSpace(firstNonEmpty(query.Get("id"), query.Get("uuid")))
+		if !isValidUUID(id) {
+			return false
+		}
+		return true
 	case "vless":
 		if u.User == nil || strings.TrimSpace(u.User.Username()) == "" {
 			return false
@@ -2055,7 +2091,28 @@ func validateMainstreamURI(scheme string, u *url.URL) bool {
 		if !isValidUUID(u.User.Username()) {
 			return false
 		}
-		if strings.TrimSpace(query.Get("sni")) == "" || strings.TrimSpace(query.Get("alpn")) == "" {
+		if !strings.EqualFold(strings.TrimSpace(firstNonEmpty(query.Get("encryption"), "none")), "none") {
+			return false
+		}
+		sni := firstNonEmpty(query.Get("sni"), query.Get("server_name"))
+		if strings.TrimSpace(sni) == "" || strings.TrimSpace(query.Get("alpn")) == "" {
+			return false
+		}
+		security := strings.ToLower(strings.TrimSpace(query.Get("security")))
+		if security == "reality" && strings.TrimSpace(query.Get("pbk")) == "" {
+			return false
+		}
+		flow := strings.ToLower(strings.TrimSpace(query.Get("flow")))
+		if flow == "xtls-rprx-vision" {
+			netType := strings.ToLower(strings.TrimSpace(firstNonEmpty(query.Get("type"), query.Get("network"), "tcp")))
+			if netType != "tcp" {
+				return false
+			}
+			if security != "tls" && security != "reality" {
+				return false
+			}
+		}
+		if isLiteralIP(u.Hostname()) && isLiteralIP(sni) {
 			return false
 		}
 		return true
@@ -2063,7 +2120,11 @@ func validateMainstreamURI(scheme string, u *url.URL) bool {
 		if u.User == nil || strings.TrimSpace(u.User.Username()) == "" {
 			return false
 		}
-		if strings.TrimSpace(query.Get("sni")) == "" || strings.TrimSpace(query.Get("alpn")) == "" {
+		sni := firstNonEmpty(query.Get("sni"), query.Get("server_name"))
+		if strings.TrimSpace(sni) == "" || strings.TrimSpace(query.Get("alpn")) == "" {
+			return false
+		}
+		if isLiteralIP(u.Hostname()) && isLiteralIP(sni) {
 			return false
 		}
 		return true
@@ -2184,6 +2245,10 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func isLiteralIP(raw string) bool {
+	return net.ParseIP(strings.TrimSpace(raw)) != nil
 }
 
 func isValidUUID(raw string) bool {
@@ -2495,14 +2560,18 @@ type kernelNodeConfig struct {
 	}
 
 	VLESS struct {
-		UUID          string
-		Flow          string
-		Network       string
-		Host          string
-		Path          string
-		Security      string
-		ServerName    string
-		AllowInsecure bool
+		UUID             string
+		Encryption       string
+		Flow             string
+		Network          string
+		Host             string
+		Path             string
+		Security         string
+		ServerName       string
+		RealityPublicKey string
+		RealityShortID   string
+		Fingerprint      string
+		AllowInsecure    bool
 	}
 
 	HY2 struct {
@@ -2604,9 +2673,31 @@ func performNativeProtocolHealthCheck(ctx context.Context, node kernelNodeConfig
 			return fmt.Errorf("ss cipher/password missing")
 		}
 		return nil
+	case "trojan":
+		sni := strings.TrimSpace(firstNonEmpty(node.Trojan.SNI, node.Address))
+		if sni == "" || isLiteralIP(sni) {
+			return fmt.Errorf("trojan sni missing")
+		}
+		alpn := append([]string(nil), node.Trojan.ALPN...)
+		if len(alpn) == 0 {
+			alpn = append([]string(nil), config.TLSParamPolicy.DefaultALPN...)
+		}
+		tlsConn := tls.Client(conn, &tls.Config{
+			ServerName:         sni,
+			InsecureSkipVerify: node.Trojan.AllowInsecure,
+			NextProtos:         alpn,
+		})
+		defer tlsConn.Close()
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return fmt.Errorf("trojan tls handshake failed: %w", err)
+		}
+		return nil
 	case "vmess":
+		if !isValidUUID(strings.TrimSpace(node.VMESS.UUID)) {
+			return fmt.Errorf("vmess uuid invalid")
+		}
 		if !node.VMESS.TLS {
-			return nil
+			return fmt.Errorf("vmess non-tls native probe unsupported")
 		}
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: firstNonEmpty(node.VMESS.ServerName, node.Address), InsecureSkipVerify: true})
 		defer tlsConn.Close()
@@ -2615,6 +2706,13 @@ func performNativeProtocolHealthCheck(ctx context.Context, node kernelNodeConfig
 		}
 		return nil
 	case "vless":
+		if !isValidUUID(strings.TrimSpace(node.VLESS.UUID)) {
+			return fmt.Errorf("vless uuid invalid")
+		}
+		security := strings.ToLower(strings.TrimSpace(node.VLESS.Security))
+		if security != "tls" && security != "reality" {
+			return fmt.Errorf("vless non-tls native probe unsupported")
+		}
 		if strings.EqualFold(node.VLESS.Security, "tls") || strings.EqualFold(node.VLESS.Security, "reality") {
 			tlsConn := tls.Client(conn, &tls.Config{ServerName: firstNonEmpty(node.VLESS.ServerName, node.Address), InsecureSkipVerify: node.VLESS.AllowInsecure})
 			defer tlsConn.Close()
@@ -3069,7 +3167,24 @@ func buildRuntimeSingboxOutbound(node kernelNodeConfig) (map[string]interface{},
 		}
 		security := strings.ToLower(strings.TrimSpace(node.VLESS.Security))
 		if security == "tls" || security == "reality" {
-			out["tls"] = buildRuntimeTLS(firstNonEmpty(node.VLESS.ServerName, node.Address), node.VLESS.AllowInsecure, append([]string(nil), config.TLSParamPolicy.DefaultALPN...))
+			tlsCfg := buildRuntimeTLS(firstNonEmpty(node.VLESS.ServerName, node.Address), node.VLESS.AllowInsecure, append([]string(nil), config.TLSParamPolicy.DefaultALPN...))
+			if security == "reality" {
+				realityCfg := map[string]interface{}{
+					"enabled":    true,
+					"public_key": strings.TrimSpace(node.VLESS.RealityPublicKey),
+				}
+				if sid := strings.TrimSpace(node.VLESS.RealityShortID); sid != "" {
+					realityCfg["short_id"] = sid
+				}
+				tlsCfg["reality"] = realityCfg
+			}
+			if fp := normalizeUTLSFingerprint(node.VLESS.Fingerprint); fp != "" {
+				tlsCfg["utls"] = map[string]interface{}{
+					"enabled":     true,
+					"fingerprint": fp,
+				}
+			}
+			out["tls"] = tlsCfg
 		}
 		if transport := buildRuntimeWSOutbound(node.VLESS.Network, node.VLESS.Path, node.VLESS.Host); transport != nil {
 			out["transport"] = transport
@@ -3515,12 +3630,16 @@ func parseKernelNodeConfig(proxyScheme, proxyEntry, proxyAddr string) (kernelNod
 		node.Address = n.Address
 		node.Port = n.Port
 		node.VLESS.UUID = n.UUID
+		node.VLESS.Encryption = n.Encryption
 		node.VLESS.Flow = n.Flow
 		node.VLESS.Network = firstNonEmpty(n.Transport, "tcp")
 		node.VLESS.Host = n.Host
 		node.VLESS.Path = n.Path
 		node.VLESS.Security = n.Security
 		node.VLESS.ServerName = firstNonEmpty(n.SNI, n.Host, n.Address)
+		node.VLESS.RealityPublicKey = n.RealityPublicKey
+		node.VLESS.RealityShortID = n.RealityShortID
+		node.VLESS.Fingerprint = n.Fingerprint
 		node.VLESS.AllowInsecure = parseInsecureRawQuery(n.RawQuery, false)
 	case "hy2", "hysteria2":
 		n, ok := parseHY2Node(proxyEntry)
@@ -3568,6 +3687,9 @@ func validateKernelNodeConfig(node kernelNodeConfig) error {
 		if strings.TrimSpace(node.Trojan.Password) == "" {
 			return fmt.Errorf("invalid trojan entry missing password")
 		}
+		if strings.TrimSpace(node.Trojan.SNI) == "" {
+			return fmt.Errorf("invalid trojan entry missing sni")
+		}
 		for _, alpn := range node.Trojan.ALPN {
 			if strings.TrimSpace(alpn) == "" || strings.ContainsAny(alpn, " \t\n") {
 				return fmt.Errorf("invalid trojan alpn value")
@@ -3586,9 +3708,32 @@ func validateKernelNodeConfig(node kernelNodeConfig) error {
 		if strings.TrimSpace(node.VMESS.UUID) == "" {
 			return fmt.Errorf("invalid vmess entry missing id")
 		}
+		if !isValidUUID(node.VMESS.UUID) {
+			return fmt.Errorf("invalid vmess entry invalid id")
+		}
 	case "vless":
 		if strings.TrimSpace(node.VLESS.UUID) == "" {
 			return fmt.Errorf("invalid vless entry missing uuid")
+		}
+		if !isValidUUID(node.VLESS.UUID) {
+			return fmt.Errorf("invalid vless entry invalid uuid")
+		}
+		if !strings.EqualFold(strings.TrimSpace(firstNonEmpty(node.VLESS.Encryption, "none")), "none") {
+			return fmt.Errorf("invalid vless entry encryption must be none")
+		}
+		security := strings.ToLower(strings.TrimSpace(node.VLESS.Security))
+		if security == "reality" && strings.TrimSpace(node.VLESS.RealityPublicKey) == "" {
+			return fmt.Errorf("invalid vless reality entry missing public key")
+		}
+		flow := strings.ToLower(strings.TrimSpace(node.VLESS.Flow))
+		if flow == "xtls-rprx-vision" {
+			network := strings.ToLower(strings.TrimSpace(firstNonEmpty(node.VLESS.Network, "tcp")))
+			if network != "tcp" {
+				return fmt.Errorf("invalid vless vision flow network: %s", network)
+			}
+			if security != "reality" && security != "tls" {
+				return fmt.Errorf("invalid vless vision flow security: %s", security)
+			}
 		}
 	case "hy2", "hysteria2":
 		if strings.TrimSpace(node.HY2.Password) == "" {
@@ -3679,7 +3824,7 @@ func parseTrojanNodeForKernel(raw string) (trojanKernelNode, bool) {
 		Address:     host,
 		Port:        port,
 		Password:    password,
-		SNI:         strings.TrimSpace(q.Get("sni")),
+		SNI:         strings.TrimSpace(firstNonEmpty(q.Get("sni"), q.Get("server_name"))),
 		Insecure:    parseInsecureQueryValue(q, false),
 		Fingerprint: strings.TrimSpace(firstNonEmpty(q.Get("fp"), q.Get("fingerprint"), q.Get("client-fingerprint"))),
 		Network:     strings.TrimSpace(q.Get("type")),
@@ -3764,6 +3909,15 @@ func supportsNativeAvailabilityFallback(proxyScheme string) bool {
 	}
 }
 
+func supportsCoreUnavailableNativeFallback(proxyScheme string) bool {
+	switch strings.ToLower(strings.TrimSpace(proxyScheme)) {
+	case "ss", "ssr", "hy2", "hysteria", "hysteria2", "tuic", "wg", "wireguard":
+		return true
+	default:
+		return false
+	}
+}
+
 func shouldPreferNativeAvailabilityProbe(proxyScheme, backendName string) bool {
 	proxyScheme = strings.ToLower(strings.TrimSpace(proxyScheme))
 	backendName = strings.ToLower(strings.TrimSpace(backendName))
@@ -3786,7 +3940,7 @@ func (a *mainstreamTCPConnectAdapter) CheckAvailability(ctx context.Context, pro
 
 	backend, ok := resolveMainstreamCoreBackend(config.Detector.Core)
 	if !ok {
-		if supportsNativeAvailabilityFallback(proxyScheme) {
+		if supportsCoreUnavailableNativeFallback(proxyScheme) {
 			return performNativeProtocolHealthCheck(ctx, node)
 		}
 		return fmt.Errorf("%w: detector.core is empty", errMainstreamAdapterUnavailable)
@@ -3799,7 +3953,7 @@ func (a *mainstreamTCPConnectAdapter) CheckAvailability(ctx context.Context, pro
 	node.Core = backend.Info().Name
 	if healthAware, ok := backend.(mainstreamHealthAwareBackend); ok {
 		if err := healthAware.HealthCheck(ctx, node); err != nil {
-			if category, _ := classifyHealthFailure(err); category == healthFailureCoreUnavailable && supportsNativeAvailabilityFallback(proxyScheme) {
+			if category, _ := classifyHealthFailure(err); category == healthFailureCoreUnavailable && supportsCoreUnavailableNativeFallback(proxyScheme) {
 				return performNativeProtocolHealthCheck(ctx, node)
 			}
 			return err
@@ -5618,7 +5772,7 @@ func checkMainstreamProxyHealthStage1WithHardTimeout(proxyEntry string, settings
 
 func tryStage2NativeFallbackOnCoreUnavailable(proxyEntry, scheme string, totalTimeout, latency time.Duration) (mixedStageCheckResult, bool) {
 	scheme = strings.ToLower(strings.TrimSpace(scheme))
-	if !supportsNativeAvailabilityFallback(scheme) {
+	if !supportsCoreUnavailableNativeFallback(scheme) {
 		return mixedStageCheckResult{}, false
 	}
 
@@ -5630,7 +5784,7 @@ func tryStage2NativeFallbackOnCoreUnavailable(proxyEntry, scheme string, totalTi
 	if parsedScheme == "" {
 		parsedScheme = scheme
 	}
-	if !supportsNativeAvailabilityFallback(parsedScheme) {
+	if !supportsCoreUnavailableNativeFallback(parsedScheme) {
 		return mixedStageCheckResult{}, false
 	}
 
@@ -5811,6 +5965,23 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 		statusErr := fmt.Errorf("unexpected status: %d", resp.StatusCode)
 		logMixedHealthFailure("stage2", scheme, healthFailureUnreachable, errorCode, mixedFailPhaseHTTPRequest, statusErr)
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureUnreachable, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, statusErr)}, Latency: latency}
+	}
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified {
+		buf := make([]byte, 1)
+		n, readErr := resp.Body.Read(buf)
+		if n == 0 {
+			errorCode := resolveHealthErrorCode(scheme, healthFailureUnreachable, "empty_response_body")
+			if readErr == nil {
+				readErr = io.EOF
+			}
+			logMixedHealthFailure("stage2", scheme, healthFailureUnreachable, errorCode, mixedFailPhaseHTTPRequest, readErr)
+			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureUnreachable, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, readErr)}, Latency: latency}
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			errorCode := resolveHealthErrorCode(scheme, healthFailureUnreachable, "response_read_failed")
+			logMixedHealthFailure("stage2", scheme, healthFailureUnreachable, errorCode, mixedFailPhaseHTTPRequest, readErr)
+			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureUnreachable, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, readErr)}, Latency: latency}
+		}
 	}
 
 	if tlsHandshakeDone && phase.TLSHello+phase.CertVerify > threshold {
