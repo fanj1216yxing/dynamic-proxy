@@ -45,6 +45,7 @@ proxy_list_urls:
   - "https://raw.githubusercontent.com/xiaoji235/airport-free/main/clash/naidounode.txt"
   - "https://proxy.scdn.io/text.php"
   - "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt"
+  - "https://zenproxy.top/api/fetch?api_key=eaefa60f-7469-40fe-a2a7-40fb1682f5be&count=65535"
   
   # - "https://example.com/http-proxies.txt"
   # - "https://example.com/socks4-proxies.txt"
