@@ -5,7 +5,7 @@ services:
     build: .
     container_name: dynamic-proxy
     depends_on:
-      - sing-box
+      - singbox
     ports:
       - "17283:17283"  # SOCKS5 Strict (SSL verification enabled)
       - "17284:17284"  # SOCKS5 Relaxed (SSL verification disabled)
@@ -21,7 +21,7 @@ services:
     environment:
       - TZ=Asia/Shanghai  # Set timezone (optional)
       # Mainstream core sidecar (required when detector.core=singbox/meta/mihomo)
-      - DP_SINGBOX_SIDECAR_ADDR=${DP_SINGBOX_SIDECAR_ADDR:-sing-box:19081}
+      - DP_SINGBOX_SIDECAR_ADDR=${DP_SINGBOX_SIDECAR_ADDR:-http://singbox:9090}
       - DP_SINGBOX_HEALTHCHECK_CMD=${DP_SINGBOX_HEALTHCHECK_CMD:-}
       # Optional protocol-specific health check commands
       - DP_HEALTHCHECK_SS_CMD=${DP_HEALTHCHECK_SS_CMD:-}
@@ -30,9 +30,9 @@ services:
     networks:
       - proxy-network
 
-  sing-box:
+  singbox:
     image: ghcr.io/sagernet/sing-box:v1.12.22
-    container_name: sing-box-sidecar
+    container_name: singbox-sidecar
     restart: unless-stopped
     command: ["run", "-c", "/etc/sing-box/config.json"]
     volumes:

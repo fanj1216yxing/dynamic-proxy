@@ -167,10 +167,12 @@ const breakerFailureThreshold = 3
 const breakerOpenTimeout = 30 * time.Second
 const sidecarAutoStartRetryInterval = 15 * time.Second
 const sidecarAutoStartWaitTimeout = 6 * time.Second
+const runtimeSidecarStartWaitTimeout = 15 * time.Second
 const sidecarProbeCacheTTL = 2 * time.Second
 const sidecarProbeRetryBackoff = 120 * time.Millisecond
 const sidecarProbeMaxAttempts = 3
 const sidecarProbeConcurrentLimit = 128
+const runtimeSidecarStartConcurrentLimit = 4
 
 var mixedHealthCheckURL = defaultMixedHealthCheckURL
 var mixedProxyHealthChecker = checkMainstreamProxyHealth
@@ -189,6 +191,7 @@ var upstreamDialerBuilder = buildUpstreamDialer
 var mainstreamAdapterFactory = func() mainstreamDialAdapter { return &mainstreamTCPConnectAdapter{} }
 var sidecarProbeFunc = probeSidecarAddr
 var sidecarAutoStartFunc = autoStartCoreSidecar
+var runtimeSidecarSessionStarter = startRuntimeSingboxSidecarSession
 var adapterMetrics = newAdapterObservabilityMetrics()
 var adapterBreaker = newUpstreamBreaker()
 
@@ -204,6 +207,15 @@ var runtimeSidecarSupportedSchemes = map[string]bool{
 	"hy2":       true,
 	"hysteria2": true,
 }
+
+var runtimeSidecarHealthCheckSchemes = map[string]bool{
+	"vmess":     true,
+	"vless":     true,
+	"hy2":       true,
+	"hysteria2": true,
+}
+
+var runtimeSidecarStartLimiter = make(chan struct{}, runtimeSidecarStartConcurrentLimit)
 
 var sidecarAutoStartState = struct {
 	sync.Mutex
@@ -1008,12 +1020,11 @@ var httpSocksMixedSchemes = map[string]bool{
 	"socks5h": true,
 }
 
-var mainstreamMixedExcludedSchemes = map[string]bool{
-	"http":    true,
-	"https":   true,
-	"socks4":  true,
-	"socks5":  true,
-	"socks5h": true,
+var mainstreamMixedPrimarySchemes = map[string]bool{
+	"vmess":     true,
+	"vless":     true,
+	"hy2":       true,
+	"hysteria2": true,
 }
 
 var plainProxyProbeSchemes = []string{"http", "https", "socks4", "socks5"}
@@ -2207,9 +2218,6 @@ func maybeNormalizeMasqueradedVLESS(raw string) (string, bool) {
 
 	password, hasPassword := u.User.Password()
 	password = strings.TrimSpace(password)
-	if hasPassword && password != "" && !strings.EqualFold(password, user) && !isValidUUID(password) {
-		return "", false
-	}
 
 	q := u.Query()
 	sni := strings.TrimSpace(firstNonEmpty(q.Get("sni"), q.Get("server_name")))
@@ -2218,11 +2226,14 @@ func maybeNormalizeMasqueradedVLESS(raw string) (string, bool) {
 	}
 
 	hasVLESSHints := false
-	for _, key := range []string{"security", "type", "network", "path", "host", "flow", "pbk", "sid", "fp", "alpn", "insecure", "allow_insecure", "encryption"} {
+	for _, key := range []string{"security", "type", "network", "path", "host", "flow", "pbk", "sid", "fp", "alpn", "insecure", "allow_insecure", "encryption", "sni", "server_name"} {
 		if strings.TrimSpace(q.Get(key)) != "" {
 			hasVLESSHints = true
 			break
 		}
+	}
+	if hasPassword && password != "" && !strings.EqualFold(password, user) && !isValidUUID(password) && !hasVLESSHints {
+		return "", false
 	}
 	if !hasVLESSHints && !(hasPassword && strings.EqualFold(password, user)) {
 		return "", false
@@ -3010,12 +3021,74 @@ func allowSidecarAutoStartAttempt(key string) bool {
 }
 
 func probeSidecarAddr(ctx context.Context, addr string) error {
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	dialAddr, _, err := resolveSidecarDialAddr(addr)
+	if err != nil {
+		return err
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", dialAddr)
 	if err != nil {
 		return err
 	}
 	_ = conn.Close()
 	return nil
+}
+
+func resolveSidecarDialAddr(raw string) (dialAddr string, host string, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", errors.New("sidecar addr is empty")
+	}
+
+	parseHostPort := func(hostPort string) (string, string, error) {
+		hostName, port, splitErr := net.SplitHostPort(strings.TrimSpace(hostPort))
+		if splitErr != nil {
+			return "", "", splitErr
+		}
+		hostName = strings.TrimSpace(hostName)
+		port = strings.TrimSpace(port)
+		if hostName == "" || port == "" {
+			return "", "", fmt.Errorf("invalid sidecar addr=%s", raw)
+		}
+		return net.JoinHostPort(hostName, port), hostName, nil
+	}
+
+	if strings.Contains(raw, "://") {
+		u, parseErr := url.Parse(raw)
+		if parseErr != nil {
+			return "", "", fmt.Errorf("invalid sidecar addr=%s: %w", raw, parseErr)
+		}
+		scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+		if scheme != "http" && scheme != "https" {
+			return "", "", fmt.Errorf("unsupported sidecar addr scheme=%s", scheme)
+		}
+		hostPort := strings.TrimSpace(u.Host)
+		if hostPort == "" {
+			return "", "", fmt.Errorf("sidecar addr missing host:port: %s", raw)
+		}
+		normalizedAddr, normalizedHost, splitErr := parseHostPort(hostPort)
+		if splitErr == nil {
+			return normalizedAddr, normalizedHost, nil
+		}
+		if strings.Contains(strings.ToLower(splitErr.Error()), "missing port in address") {
+			defaultPort := "80"
+			if scheme == "https" {
+				defaultPort = "443"
+			}
+			hostName := strings.TrimSpace(u.Hostname())
+			if hostName == "" {
+				return "", "", fmt.Errorf("sidecar addr missing hostname: %s", raw)
+			}
+			joined := net.JoinHostPort(hostName, defaultPort)
+			return joined, hostName, nil
+		}
+		return "", "", fmt.Errorf("invalid sidecar addr host:port=%s: %w", hostPort, splitErr)
+	}
+
+	normalizedAddr, normalizedHost, splitErr := parseHostPort(raw)
+	if splitErr != nil {
+		return "", "", fmt.Errorf("invalid sidecar addr=%s: %w", raw, splitErr)
+	}
+	return normalizedAddr, normalizedHost, nil
 }
 
 func sidecarProbeRecentlyHealthy(addr string) bool {
@@ -3125,14 +3198,14 @@ func probeSidecarAddrWithPolicy(ctx context.Context, addr string) error {
 }
 
 func isLoopbackSidecar(addr string) bool {
-	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	_, host, err := resolveSidecarDialAddr(addr)
 	if err != nil {
 		return false
 	}
-	if strings.EqualFold(host, "localhost") {
+	if strings.EqualFold(strings.TrimSpace(host), "localhost") {
 		return true
 	}
-	ip := net.ParseIP(host)
+	ip := net.ParseIP(strings.TrimSpace(host))
 	return ip != nil && ip.IsLoopback()
 }
 
@@ -3266,6 +3339,7 @@ type runtimeSidecarSession struct {
 	addr       string
 	process    *os.Process
 	configPath string
+	logPath    string
 }
 
 func (s *runtimeSidecarSession) Close() {
@@ -3279,6 +3353,38 @@ func (s *runtimeSidecarSession) Close() {
 	if strings.TrimSpace(s.configPath) != "" {
 		_ = os.Remove(s.configPath)
 	}
+	if strings.TrimSpace(s.logPath) != "" {
+		_ = os.Remove(s.logPath)
+	}
+}
+
+func acquireRuntimeSidecarStartSlot(ctx context.Context) (func(), error) {
+	select {
+	case runtimeSidecarStartLimiter <- struct{}{}:
+		return func() {
+			select {
+			case <-runtimeSidecarStartLimiter:
+			default:
+			}
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func readRuntimeSidecarLogTail(path string, maxBytes int) string {
+	path = strings.TrimSpace(path)
+	if path == "" || maxBytes <= 0 {
+		return ""
+	}
+	content, err := os.ReadFile(path)
+	if err != nil || len(content) == 0 {
+		return ""
+	}
+	if len(content) > maxBytes {
+		content = content[len(content)-maxBytes:]
+	}
+	return strings.TrimSpace(string(content))
 }
 
 func buildRuntimeWSOutbound(network, path, host string) map[string]interface{} {
@@ -3494,6 +3600,12 @@ func startRuntimeSingboxSidecarSession(ctx context.Context, proxyEntry string) (
 	if !strings.EqualFold(strings.TrimSpace(config.Detector.Core), "singbox") && !strings.EqualFold(strings.TrimSpace(config.Detector.Core), "sing-box") {
 		return nil, nil
 	}
+	startCtx := contextWithoutCancelFallback(ctx)
+	releaseSlot, err := acquireRuntimeSidecarStartSlot(startCtx)
+	if err != nil {
+		return nil, fmt.Errorf("runtime sidecar queue wait failed: %w", err)
+	}
+	defer releaseSlot()
 
 	scheme, proxyAddr, _, _, err := parseMixedProxy(proxyEntry)
 	if err != nil {
@@ -3528,25 +3640,39 @@ func startRuntimeSingboxSidecarSession(ctx context.Context, proxyEntry string) (
 	if err := os.WriteFile(cfgPath, cfgBytes, 0o644); err != nil {
 		return nil, fmt.Errorf("write runtime sidecar config failed: %w", err)
 	}
+	logPath := filepath.Join("runtime-logs", fmt.Sprintf("singbox-runtime-%d.log", serial))
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		_ = os.Remove(cfgPath)
+		return nil, fmt.Errorf("prepare runtime sidecar log failed: %w", err)
+	}
 
 	binaryPath, err := resolveSingboxBinaryPath()
 	if err != nil {
+		_ = logFile.Close()
+		_ = os.Remove(logPath)
 		_ = os.Remove(cfgPath)
 		return nil, err
 	}
 
 	cmd := exec.Command(binaryPath, "run", "-c", cfgPath)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		_ = os.Remove(logPath)
 		_ = os.Remove(cfgPath)
 		return nil, fmt.Errorf("start runtime sidecar failed: %w", err)
 	}
+	_ = logFile.Close()
 
 	session := &runtimeSidecarSession{
 		addr:       fmt.Sprintf("127.0.0.1:%d", port),
 		process:    cmd.Process,
 		configPath: cfgPath,
+		logPath:    logPath,
 	}
-	waitCtx, cancel := context.WithTimeout(contextWithoutCancelFallback(ctx), sidecarAutoStartWaitTimeout)
+	waitCtx, cancel := context.WithTimeout(startCtx, runtimeSidecarStartWaitTimeout)
 	defer cancel()
 	var lastErr error
 	for {
@@ -3561,9 +3687,41 @@ func startRuntimeSingboxSidecarSession(ctx context.Context, proxyEntry string) (
 			if lastErr == nil {
 				lastErr = waitCtx.Err()
 			}
+			logTail := readRuntimeSidecarLogTail(logPath, 2048)
+			if logTail != "" {
+				return nil, fmt.Errorf("runtime sidecar not ready: %w (log=%s)", lastErr, logTail)
+			}
 			return nil, fmt.Errorf("runtime sidecar not ready: %w", lastErr)
 		case <-time.After(120 * time.Millisecond):
 		}
+	}
+}
+
+func shouldUseRuntimeSidecarForScheme(scheme string) bool {
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	if scheme == "" {
+		return false
+	}
+	core := strings.ToLower(strings.TrimSpace(config.Detector.Core))
+	if core != "singbox" && core != "sing-box" {
+		return false
+	}
+	return runtimeSidecarHealthCheckSchemes[scheme]
+}
+
+func normalizeRuntimeSidecarPrepareError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "sing-box binary not found"),
+		strings.Contains(msg, "sidecar config not found"),
+		strings.Contains(msg, "start runtime sidecar failed"),
+		strings.Contains(msg, "runtime sidecar unsupported scheme"):
+		return fmt.Errorf("%w: runtime_sidecar_prepare_failed=%v", errMainstreamCoreUnavailable, err)
+	default:
+		return err
 	}
 }
 
@@ -3617,7 +3775,11 @@ func (b *externalKernelBackend) DialContext(ctx context.Context, node kernelNode
 	}
 
 	_ = mapKernelNodeToExternal(node)
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", sidecarAddr)
+	dialSidecarAddr, _, resolveErr := resolveSidecarDialAddr(sidecarAddr)
+	if resolveErr != nil {
+		return nil, fmt.Errorf("%w: code=core_unavailable sidecar_addr_invalid=%v", errMainstreamCoreUnavailable, resolveErr)
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", dialSidecarAddr)
 	if err != nil {
 		clearSidecarProbeHealthy(sidecarAddr)
 		return nil, fmt.Errorf("%w: code=core_unavailable sidecar_dial_failed=%v", errMainstreamCoreUnavailable, err)
@@ -4282,7 +4444,7 @@ func parseSpecialProxyURLMixed(content string) []string {
 		sampleParseFailureLine("parse_failed", line, "normalize_failed")
 
 		lowerLine := strings.ToLower(line)
-		if strings.Contains(lowerLine, "ss://") || strings.Contains(lowerLine, "ssr://") || strings.Contains(lowerLine, "trojan://") {
+		if looksLikeMainstreamURIWithoutFallback(line) {
 			log.Printf("parse_failed: skip malformed mainstream line without fallback: %s", line)
 			sampleParseFailureLine("parse_failed", line, "malformed_mainstream")
 			continue
@@ -4328,6 +4490,41 @@ func parseSpecialProxyURLMixed(content string) []string {
 	}
 
 	return proxies
+}
+
+func looksLikeMainstreamURIWithoutFallback(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	lowerLine := strings.ToLower(trimmed)
+	for _, marker := range []string{
+		"ss://", "ssr://", "trojan://", "vmess://", "vless://",
+		"hy2://", "hysteria://", "hysteria2://", "tuic://", "wg://", "wireguard://",
+	} {
+		if strings.Contains(lowerLine, marker) {
+			return true
+		}
+	}
+
+	if !strings.HasPrefix(lowerLine, "http://") && !strings.HasPrefix(lowerLine, "https://") {
+		return false
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil || u == nil {
+		return false
+	}
+	if u.User == nil {
+		return false
+	}
+	user := strings.TrimSpace(u.User.Username())
+	if !isValidUUID(user) {
+		return false
+	}
+	q := u.Query()
+	for _, key := range []string{"security", "type", "network", "path", "host", "flow", "pbk", "sid", "fp", "alpn", "insecure", "allow_insecure", "encryption", "sni", "server_name"} {
+		if strings.TrimSpace(q.Get(key)) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func subscriptionHTTPClient() *http.Client {
@@ -6028,6 +6225,10 @@ func checkMainstreamProxyHealthStage1WithHardTimeout(proxyEntry string, settings
 
 func tryStage2NativeFallbackOnCoreUnavailable(proxyEntry, scheme string, totalTimeout, latency time.Duration) (mixedStageCheckResult, bool) {
 	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	if shouldUseRuntimeSidecarForScheme(scheme) {
+		log.Printf("[MIXED-2STAGE-FALLBACK] scheme=%s reason=core_unconfigured action=skip_native reason_detail=runtime_sidecar_enforced", scheme)
+		return mixedStageCheckResult{}, false
+	}
 	if !supportsCoreUnavailableNativeFallback(scheme) {
 		return mixedStageCheckResult{}, false
 	}
@@ -6118,6 +6319,29 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 		return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: healthFailureParse, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, parseErr)}}
 	}
 
+	requestCtx := context.Background()
+	var runtimeSidecar *runtimeSidecarSession
+	if shouldUseRuntimeSidecarForScheme(scheme) {
+		log.Printf("[MIXED-2STAGE-RUNTIME] scheme=%s action=prepare_runtime_sidecar", scheme)
+		session, prepErr := runtimeSidecarSessionStarter(requestCtx, proxyEntry)
+		if prepErr != nil {
+			prepErr = normalizeRuntimeSidecarPrepareError(prepErr)
+			category, reasonCode := classifyHealthFailure(prepErr)
+			errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
+			log.Printf("[MIXED-2STAGE-RUNTIME] scheme=%s action=prepare_runtime_sidecar result=failed category=%s error_code=%s detail=%v", scheme, category, errorCode, prepErr)
+			logMixedHealthFailure("stage2", scheme, proxyEntry, category, errorCode, mixedFailPhaseCoreCheck, prepErr)
+			return mixedStageCheckResult{Status: proxyHealthStatus{Healthy: false, Scheme: scheme, Category: category, ErrorCode: errorCode, Reason: formatHealthReason(errorCode, prepErr)}}
+		}
+		if session != nil {
+			runtimeSidecar = session
+			requestCtx = withRuntimeSidecarAddr(requestCtx, session.addr)
+			log.Printf("[MIXED-2STAGE-RUNTIME] scheme=%s action=prepare_runtime_sidecar result=success addr=%s", scheme, session.addr)
+		}
+	}
+	if runtimeSidecar != nil {
+		defer runtimeSidecar.Close()
+	}
+
 	serverName := targetURL.Hostname()
 	phase := &healthPhaseMetrics{}
 	var certVerifyDur time.Duration
@@ -6155,7 +6379,7 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 
 	var dnsStart, connStart, tlsStart, reqStart time.Time
 	var tlsHandshakeDone bool
-	req, reqErr := http.NewRequest(http.MethodGet, mixedHealthCheckURL, nil)
+	req, reqErr := http.NewRequestWithContext(requestCtx, http.MethodGet, mixedHealthCheckURL, nil)
 	if reqErr != nil {
 		errorCode := resolveHealthErrorCode(scheme, healthFailureParse, "invalid_request")
 		logMixedHealthFailure("stage2", scheme, proxyEntry, healthFailureParse, errorCode, mixedFailPhaseHTTPRequest, reqErr)
@@ -6222,8 +6446,12 @@ func checkMainstreamProxyHealthStage2(proxyEntry string, strictMode bool, settin
 		}
 		category, reasonCode := classifyHealthFailure(err)
 		if category == healthFailureCoreUnavailable {
-			if fallback, ok := tryStage2NativeFallbackOnCoreUnavailable(proxyEntry, scheme, totalTimeout, latency); ok {
-				return fallback
+			if !shouldUseRuntimeSidecarForScheme(scheme) {
+				if fallback, ok := tryStage2NativeFallbackOnCoreUnavailable(proxyEntry, scheme, totalTimeout, latency); ok {
+					return fallback
+				}
+			} else {
+				log.Printf("[MIXED-2STAGE-FALLBACK] scheme=%s reason=core_unconfigured action=skip_native reason_detail=runtime_sidecar_enforced", scheme)
 			}
 		}
 		errorCode := resolveHealthErrorCode(scheme, category, reasonCode)
@@ -6984,7 +7212,7 @@ func updateMixedProxyPool(mixedPool *ProxyPool, mainstreamMixedPool *ProxyPool, 
 	log.Printf("Streaming mixed health check complete: healthy=%d cf_pass=%d", len(result.Healthy), len(result.CFPass))
 
 	httpSocksHealthy := filterMixedProxiesByScheme(result.Healthy, httpSocksMixedSchemes)
-	mainstreamHealthy := filterMixedProxiesByExcludedScheme(result.Healthy, mainstreamMixedExcludedSchemes)
+	mainstreamHealthy := filterMixedProxiesByScheme(result.Healthy, mainstreamMixedPrimarySchemes)
 	if strings.EqualFold(strings.TrimSpace(config.Detector.Core), "singbox") || strings.EqualFold(strings.TrimSpace(config.Detector.Core), "sing-box") {
 		filtered := filterMixedProxiesByScheme(mainstreamHealthy, runtimeSidecarSupportedSchemes)
 		if len(filtered) != len(mainstreamHealthy) {
@@ -7305,7 +7533,7 @@ func handleHTTPConnectWithRetries(w http.ResponseWriter, r *http.Request, pool *
 		reqCtx := r.Context()
 		var runtimeSidecar *runtimeSidecarSession
 		if mode == "MAINSTREAM-MIXED" {
-			session, prepErr := startRuntimeSingboxSidecarSession(reqCtx, proxyAddr)
+			session, prepErr := runtimeSidecarSessionStarter(reqCtx, proxyAddr)
 			if prepErr != nil {
 				log.Printf("[HTTP-%s] ERROR: Failed to prepare runtime sidecar for proxy %s: %v", mode, proxyAddr, prepErr)
 				lastErr = prepErr
@@ -7434,7 +7662,7 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, fa
 		reqCtx := r.Context()
 		var runtimeSidecar *runtimeSidecarSession
 		if mode == "MAINSTREAM-MIXED" {
-			session, prepErr := startRuntimeSingboxSidecarSession(reqCtx, proxyAddr)
+			session, prepErr := runtimeSidecarSessionStarter(reqCtx, proxyAddr)
 			if prepErr != nil {
 				log.Printf("[HTTP-%s] ERROR: Failed to prepare runtime sidecar for proxy %s: %v", mode, proxyAddr, prepErr)
 				lastErr = prepErr

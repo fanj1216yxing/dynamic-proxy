@@ -267,6 +267,38 @@ func TestParseRegularProxyContentMixedCountsMasqueradedHTTPSAsVLESS(t *testing.T
 	}
 }
 
+func TestMaybeNormalizeMasqueradedVLESSAcceptsHintedNonUUIDPassword(t *testing.T) {
+	raw := "https://11111111-1111-1111-1111-111111111111:plain-pass@example.com:443?sni=example.com&security=tls&type=ws"
+	normalized, ok := maybeNormalizeMasqueradedVLESS(raw)
+	if !ok {
+		t.Fatalf("expected hinted masqueraded vless to normalize")
+	}
+	if !strings.HasPrefix(normalized, "vless://11111111-1111-1111-1111-111111111111@example.com:443") {
+		t.Fatalf("unexpected normalized output: %s", normalized)
+	}
+}
+
+func TestLooksLikeMainstreamURIWithoutFallbackDetectsMasqueradedVLESS(t *testing.T) {
+	line := "https://11111111-1111-1111-1111-111111111111:plain-pass@example.com:443?sni=example.com&security=tls&type=ws"
+	if !looksLikeMainstreamURIWithoutFallback(line) {
+		t.Fatalf("expected masqueraded vless to be treated as mainstream candidate")
+	}
+}
+
+func TestParseSpecialProxyURLMixedAvoidsHTTPSFallbackForMasqueradedVLESS(t *testing.T) {
+	content := "https://11111111-1111-1111-1111-111111111111:plain-pass@example.com:443?sni=example.com&security=tls&type=ws"
+	proxies := parseSpecialProxyURLMixed(content)
+	if len(proxies) != 1 {
+		t.Fatalf("expected one proxy, got %d (%v)", len(proxies), proxies)
+	}
+	if !strings.HasPrefix(proxies[0], "vless://") {
+		t.Fatalf("expected vless normalization, got %s", proxies[0])
+	}
+	if strings.HasPrefix(proxies[0], "https://") {
+		t.Fatalf("expected no https fallback for masqueraded vless, got %s", proxies[0])
+	}
+}
+
 func TestBuildUpstreamDialerSupportsSocks4(t *testing.T) {
 	dialer, scheme, err := buildUpstreamDialer("socks4://103.210.22.17:3128")
 	if err != nil {
@@ -635,6 +667,77 @@ func TestSupportsCoreUnavailableNativeFallbackIncludesMainstreamTCPProtocols(t *
 		if !supportsCoreUnavailableNativeFallback(scheme) {
 			t.Fatalf("expected scheme %s to use core-unavailable native fallback", scheme)
 		}
+	}
+}
+
+func TestShouldUseRuntimeSidecarForScheme(t *testing.T) {
+	original := config
+	t.Cleanup(func() { config = original })
+
+	config = Config{}
+	config.Detector.Core = "singbox"
+	if !shouldUseRuntimeSidecarForScheme("vless") {
+		t.Fatalf("expected vless to use runtime sidecar when core=singbox")
+	}
+	if shouldUseRuntimeSidecarForScheme("http") {
+		t.Fatalf("did not expect http to use runtime sidecar")
+	}
+
+	config.Detector.Core = "mihomo"
+	if shouldUseRuntimeSidecarForScheme("vless") {
+		t.Fatalf("did not expect runtime sidecar for non-singbox core")
+	}
+}
+
+func TestTryStage2NativeFallbackSkipsWhenRuntimeSidecarEnforced(t *testing.T) {
+	original := config
+	t.Cleanup(func() { config = original })
+
+	config = Config{}
+	config.Detector.Core = "singbox"
+
+	if _, ok := tryStage2NativeFallbackOnCoreUnavailable("vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&security=tls&sni=example.com", "vless", 2*time.Second, 0); ok {
+		t.Fatalf("expected native fallback to be skipped when runtime sidecar is enforced")
+	}
+}
+
+func TestNormalizeRuntimeSidecarPrepareErrorWrapsMissingCoreArtifacts(t *testing.T) {
+	err := normalizeRuntimeSidecarPrepareError(errors.New("sing-box binary not found"))
+	if !errors.Is(err, errMainstreamCoreUnavailable) {
+		t.Fatalf("expected core unavailable wrapper, got=%v", err)
+	}
+}
+
+func TestNormalizeRuntimeSidecarPrepareErrorKeepsRuntimeStartupTimeoutCategory(t *testing.T) {
+	raw := errors.New("runtime sidecar not ready: dial tcp 127.0.0.1:3000: connectex: No connection could be made because the target machine actively refused it.")
+	err := normalizeRuntimeSidecarPrepareError(raw)
+	if errors.Is(err, errMainstreamCoreUnavailable) {
+		t.Fatalf("did not expect core unavailable wrapper for runtime startup timeout, got=%v", err)
+	}
+}
+
+func TestResolveSidecarDialAddrSupportsHTTPURL(t *testing.T) {
+	dialAddr, host, err := resolveSidecarDialAddr("http://singbox:9090")
+	if err != nil {
+		t.Fatalf("expected http sidecar addr to parse, got err=%v", err)
+	}
+	if dialAddr != "singbox:9090" {
+		t.Fatalf("unexpected dial addr: %s", dialAddr)
+	}
+	if host != "singbox" {
+		t.Fatalf("unexpected host: %s", host)
+	}
+}
+
+func TestResolveSidecarDialAddrRejectsUnsupportedScheme(t *testing.T) {
+	if _, _, err := resolveSidecarDialAddr("socks5://127.0.0.1:9090"); err == nil {
+		t.Fatalf("expected unsupported sidecar scheme to fail")
+	}
+}
+
+func TestIsLoopbackSidecarSupportsURLFormat(t *testing.T) {
+	if !isLoopbackSidecar("http://127.0.0.1:9090") {
+		t.Fatalf("expected loopback sidecar url to be loopback")
 	}
 }
 
