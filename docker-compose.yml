@@ -7,6 +7,7 @@ services:
     depends_on:
       - singbox
     ports:
+      - "17233:17233"  # SOCKS5 Strict (SSL verification enabled)
       - "17283:17283"  # SOCKS5 Strict (SSL verification enabled)
       - "17284:17284"  # SOCKS5 Relaxed (SSL verification disabled)
       - "17285:17285"  # HTTP Strict (SSL verification enabled)
