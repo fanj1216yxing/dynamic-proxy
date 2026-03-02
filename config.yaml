@@ -9,79 +9,33 @@
 #   - socks4://ip:port     →socks4://13.14.15.16:1080
 proxy_list_urls:
   - 'https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt'
-  - 'https://cdn.jsdelivr.net/gh/xiaoji235/airport-free@main/v2ray.txt'
   # 可以添加更多代理源（支持 http/https/socks4/socks5 协议）
   - 'https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/socks5/raw/all.txt'
-  - 'https://raw.githubusercontent.com/kssku/guaxue/main/data/proxies.yaml'
-  - 'https://raw.githubusercontent.com/waterbaizhang/tv/main/final.yaml'
-  - 'https://qybndbviblvt.us-west-1.clawcloudrun.com/api/v1/subscribe?token=u0bt57u81cui26g1vc&target=v2ray&list=true'
   - 'https://raw.githubusercontent.com/nekosolo1233/p1oxy/main/v2.yaml'
   - 'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt'
-  - 'https://raw.githubusercontent.com/firefoxmmx2/v2rayshare_subcription/main/subscription/clash_sub.yaml'
-  - 'https://raw.githubusercontent.com/Q3dlaXpoaQ/V2rayN_Clash_Node_Getter/refs/heads/main/APIs/sc0.yaml'
   - 'https://raw.githubusercontent.com/mahdibland/SSAggregator/master/sub/sub_merge_yaml.yml'
-  - 'https://raw.githubusercontent.com/snakem982/proxypool/main/source/clash-meta.yaml'
   - 'https://raw.githubusercontent.com/chengaopan/AutoMergePublicNodes/master/list.yml'
-  - 'https://raw.githubusercontent.com/zhangkaiitugithub/passcro/main/speednodes.yaml'
-  - 'https://raw.githubusercontent.com/aiboboxx/v2rayfree/refs/heads/main/README.md'
   - 'https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/snippets/nodes.meta.yml'
   - 'https://raw.githubusercontent.com/Ruk1ng001/freeSub/main/clash.yaml'
-  - 'https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/all_configs.txt'
-  - 'https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash'
-  - 'https://raw.githubusercontent.com/go4sharing/sub/main/sub.yaml'
-  - 'https://raw.githubusercontent.com/actionsfz/v2ray/refs/heads/master/all.yaml'
-  - 'https://raw.githubusercontent.com/Pawdroid/Free-servers/refs/heads/main/sub'
   - 'https://raw.githubusercontent.com/acymz/AutoVPN/main/data/V2.txt'
-  - 'https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/wenode.txt'
-  - 'https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/v2rayshare.txt'
-  - 'https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/nodefree.txt'
-  - 'https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/ndnode.txt'
-  - 'https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/clashmeta.txt'
-  - 'https://raw.githubusercontent.com/xiaoji235/airport-free/main/v2ray.txt'
   - 'https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.meta.yml'
   - 'https://raw.githubusercontent.com/anaer/Sub/refs/heads/main/clash.yaml'
-  - 'https://raw.githubusercontent.com/free18/v2ray/refs/heads/main/c.yaml'
   - 'https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.yml'
-  - 'https://raw.githubusercontent.com/xiaoji235/airport-free/main/v2ray/v2rayshare.txt'
-  - 'https://raw.githubusercontent.com/xiaoji235/airport-free/main/clash/naidounode.txt'
   - 'https://proxy.scdn.io/text.php'
   - 'https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt'
-  - 'https://zenproxy.top/api/fetch?api_key=eaefa60f-7469-40fe-a2a7-40fb1682f5be&count=65535'
-  - "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt"
+  - 'https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt'
   # 可以添加更多代理源（支持 http/https/socks4/socks5 协议）
-  - "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/socks5/raw/all.txt"
-  - "https://raw.githubusercontent.com/kssku/guaxue/main/data/proxies.yaml"
-  - "https://raw.githubusercontent.com/waterbaizhang/tv/main/final.yaml"
-  - "https://qybndbviblvt.us-west-1.clawcloudrun.com/api/v1/subscribe?token=u0bt57u81cui26g1vc&target=v2ray&list=true"
-  - "https://raw.githubusercontent.com/nekosolo1233/p1oxy/main/v2.yaml"
-  - "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt"
-  - "https://raw.githubusercontent.com/firefoxmmx2/v2rayshare_subcription/main/subscription/clash_sub.yaml"
-  - "https://raw.githubusercontent.com/Q3dlaXpoaQ/V2rayN_Clash_Node_Getter/refs/heads/main/APIs/sc0.yaml"
-  - "https://raw.githubusercontent.com/mahdibland/SSAggregator/master/sub/sub_merge_yaml.yml"
-  - "https://raw.githubusercontent.com/snakem982/proxypool/main/source/clash-meta.yaml"
-  - "https://raw.githubusercontent.com/chengaopan/AutoMergePublicNodes/master/list.yml"
-  - "https://raw.githubusercontent.com/zhangkaiitugithub/passcro/main/speednodes.yaml"
-  - "https://raw.githubusercontent.com/aiboboxx/v2rayfree/refs/heads/main/README.md"
-  - "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/snippets/nodes.meta.yml"
-  - "https://raw.githubusercontent.com/Ruk1ng001/freeSub/main/clash.yaml"
-  - "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/all_configs.txt"
-  - "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash"
-  - "https://raw.githubusercontent.com/go4sharing/sub/main/sub.yaml"
-  - "https://raw.githubusercontent.com/actionsfz/v2ray/refs/heads/master/all.yaml"
-  - "https://raw.githubusercontent.com/Pawdroid/Free-servers/refs/heads/main/sub"
-  - "https://raw.githubusercontent.com/acymz/AutoVPN/main/data/V2.txt"
-  - "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/wenode.txt"
-  - "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/v2rayshare.txt"
-  - "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/nodefree.txt"
-  - "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/ndnode.txt"
-  - "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/clashmeta.txt"
-  - "https://raw.githubusercontent.com/xiaoji235/airport-free/main/v2ray.txt"
-  - "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.meta.yml"
-  - "https://raw.githubusercontent.com/anaer/Sub/refs/heads/main/clash.yaml"
-  - "https://raw.githubusercontent.com/free18/v2ray/refs/heads/main/c.yaml"
-  - "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.yml"
-  - "https://raw.githubusercontent.com/xiaoji235/airport-free/main/v2ray/v2rayshare.txt"
-  - "https://raw.githubusercontent.com/xiaoji235/airport-free/main/clash/naidounode.txt"
+  - 'https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/socks5/raw/all.txt'
+  - 'https://raw.githubusercontent.com/nekosolo1233/p1oxy/main/v2.yaml'
+  - 'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt'
+  - 'https://raw.githubusercontent.com/mahdibland/SSAggregator/master/sub/sub_merge_yaml.yml'
+  - 'https://raw.githubusercontent.com/chengaopan/AutoMergePublicNodes/master/list.yml'
+  - 'https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/snippets/nodes.meta.yml'
+  - 'https://raw.githubusercontent.com/Ruk1ng001/freeSub/main/clash.yaml'
+  - 'https://raw.githubusercontent.com/acymz/AutoVPN/main/data/V2.txt'
+  - 'https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.meta.yml'
+  - 'https://raw.githubusercontent.com/anaer/Sub/refs/heads/main/clash.yaml'
+  - 'https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.yml'
   # - "https://example.com/http-proxies.txt"
   # - "https://example.com/socks4-proxies.txt"
 
@@ -102,8 +56,8 @@ subscription_use_env_proxy: false
 # enabled=true 且 url 非空时，固定使用该代理；方便后续随时修改
 # url 支持 http:// / https:// / socks5:// / socks5h://；也支持直接写 host:port（程序自动补 http://）
 subscription_proxy:
-  enabled: false
-  url: "http://127.0.0.1:2081"
+  enabled: true
+  url: 'http://127.0.0.1:2081'
 
 # 健康检查并发数（同时测试多少个代理）
 health_check_concurrency: 2000
@@ -286,8 +240,8 @@ ports:
 # 代理认证配置（可选）
 # 如果启用，username/password 必须同时设置
 auth:
-  username: "aoi"
-  password: "aoumoku"
+  username: 'aoi'
+  password: 'aoumoku'
 
 # Cloudflare 挑战可通过性检测（可选）
 cf_challenge_check:
@@ -301,4 +255,3 @@ cf_challenge_check:
     - 'cf-challenge'
     - 'captcha'
   timeout_seconds: 12
-
