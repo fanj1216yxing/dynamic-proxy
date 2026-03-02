@@ -209,6 +209,8 @@ var runtimeSidecarSupportedSchemes = map[string]bool{
 }
 
 var runtimeSidecarHealthCheckSchemes = map[string]bool{
+	"ss":        true,
+	"trojan":    true,
 	"vmess":     true,
 	"vless":     true,
 	"hy2":       true,
@@ -1021,6 +1023,8 @@ var httpSocksMixedSchemes = map[string]bool{
 }
 
 var mainstreamMixedPrimarySchemes = map[string]bool{
+	"ss":        true,
+	"trojan":    true,
 	"vmess":     true,
 	"vless":     true,
 	"hy2":       true,

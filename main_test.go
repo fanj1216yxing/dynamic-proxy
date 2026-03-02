@@ -527,6 +527,23 @@ func TestProtocolHealthyCounts(t *testing.T) {
 	}
 }
 
+func TestMainstreamMixedPrimarySchemesIncludesSSTrojan(t *testing.T) {
+	entries := []string{
+		"http://1.1.1.1:80",
+		"ss://aes-256-gcm:pass@ss.example.com:8388",
+		"trojan://pass@tr.example.com:443?sni=tr.example.com",
+		"vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?encryption=none&sni=vl.example.com",
+	}
+	filtered := filterMixedProxiesByScheme(entries, mainstreamMixedPrimarySchemes)
+	got := protocolHealthyCounts(filtered)
+	if got["ss"] != 1 || got["trojan"] != 1 || got["vless"] != 1 {
+		t.Fatalf("unexpected mainstream filtered protocols: %#v filtered=%v", got, filtered)
+	}
+	if got["http"] != 0 {
+		t.Fatalf("expected http excluded from mainstream filtered protocols: %#v filtered=%v", got, filtered)
+	}
+}
+
 func TestEvaluateMainstreamHealthAlertAndSLO(t *testing.T) {
 	config = Config{}
 	config.Alerting.ZeroMainstreamToleranceCycles = 1
@@ -679,6 +696,12 @@ func TestShouldUseRuntimeSidecarForScheme(t *testing.T) {
 	if !shouldUseRuntimeSidecarForScheme("vless") {
 		t.Fatalf("expected vless to use runtime sidecar when core=singbox")
 	}
+	if !shouldUseRuntimeSidecarForScheme("ss") {
+		t.Fatalf("expected ss to use runtime sidecar when core=singbox")
+	}
+	if !shouldUseRuntimeSidecarForScheme("trojan") {
+		t.Fatalf("expected trojan to use runtime sidecar when core=singbox")
+	}
 	if shouldUseRuntimeSidecarForScheme("http") {
 		t.Fatalf("did not expect http to use runtime sidecar")
 	}
@@ -698,6 +721,9 @@ func TestTryStage2NativeFallbackSkipsWhenRuntimeSidecarEnforced(t *testing.T) {
 
 	if _, ok := tryStage2NativeFallbackOnCoreUnavailable("vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&security=tls&sni=example.com", "vless", 2*time.Second, 0); ok {
 		t.Fatalf("expected native fallback to be skipped when runtime sidecar is enforced")
+	}
+	if _, ok := tryStage2NativeFallbackOnCoreUnavailable("ss://aes-256-gcm:pass@example.com:8388", "ss", 2*time.Second, 0); ok {
+		t.Fatalf("expected native fallback to be skipped for ss when runtime sidecar is enforced")
 	}
 }
 
@@ -1068,7 +1094,7 @@ func TestHealthCheckMixedProxiesTwoStageBoundaryInvalidProtocolFormat(t *testing
 	}
 }
 
-func TestCheckMainstreamProxyHealthStage2NativeFallbackOnCoreUnavailable(t *testing.T) {
+func TestCheckMainstreamProxyHealthStage2SSDoesNotPassOnRawTCPStub(t *testing.T) {
 	config = Config{}
 	config.Detector.Core = "singbox"
 
@@ -1107,8 +1133,11 @@ func TestCheckMainstreamProxyHealthStage2NativeFallbackOnCoreUnavailable(t *test
 	stageSettings := HealthCheckSettings{TotalTimeoutSeconds: 2, TLSHandshakeThresholdSeconds: 2}
 	entry := fmt.Sprintf("ss://aes-256-gcm:ss-pass@%s", ln.Addr().String())
 	result := checkMainstreamProxyHealthStage2(entry, false, stageSettings)
-	if !result.Status.Healthy {
-		t.Fatalf("expected stage2 fallback to pass, got status=%#v", result.Status)
+	if result.Status.Healthy {
+		t.Fatalf("expected stage2 to reject raw tcp stub for ss, got status=%#v", result.Status)
+	}
+	if result.Status.ErrorCode == "" {
+		t.Fatalf("expected non-empty error code for rejected ss stage2 result, got status=%#v", result.Status)
 	}
 }
 
