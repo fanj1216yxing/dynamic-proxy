@@ -76,3 +76,4 @@ https://raw.githubusercontent.com/wlunlocker/vpn-configs/main/blacklist_all.txt
 https://raw.githubusercontent.com/Danialsamadi/v2go/main/Sub9.txt
 https://raw.githubusercontent.com/WayhomeZ/v2ray_to_Clash/main/docs/proxies.yaml
 https://raw.githubusercontent.com/vien97/CONFIG-v2ray/main/configs/sg/all.txt
+https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_base64_Sub.txt
